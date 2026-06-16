@@ -1,0 +1,15 @@
+# GraphRAG Explorer — Dependencies
+# Install with: pip install -r requirements.txt
+
+# ── Backend CLI (backend_ingest.py) ──────────────────────────────────────────
+PyGithub>=2.3.0                  # GitHub API via Auth.Token
+neo4j>=5.20.0                    # Neo4j Python driver
+google-genai>=0.8.0              # Gemini embeddings + LLM summarization
+requests>=2.31.0                 # REST fallback for GitHub & Gemini APIs
+tqdm>=4.66.0                     # Terminal progress bars for the CLI pipeline
+python-dotenv>=1.0.0             # Load .env files for API keys
+
+# ── Frontend UI (frontend_chat.py) ───────────────────────────────────────────
+streamlit>=1.35.0                # Web UI framework
+neo4j-graphrag[google-genai]>=1.1.0  # VectorRetriever + GraphRAG pipeline
+langchain-google-genai>=1.0.0   # ChatGoogleGenerativeAI for answer generation
