@@ -42,7 +42,8 @@ import logging
 import os
 import re
 import time
-from datetime import datetime
+import ast
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import requests
@@ -51,8 +52,6 @@ from github import Auth, Github, GithubException
 from neo4j import GraphDatabase
 from tqdm import tqdm
 
-from neo4j_graphrag.retrievers import VectorRetriever
-from neo4j_graphrag.generation import GraphRAG
 
 # ── Google Gemini (google-genai SDK) ─────────────────────────────────────────
 try:
@@ -125,6 +124,28 @@ _GRAPH_FLUSH_BATCH = 50
 CYPHER_CREATE_REPO = """
 MERGE (repo:Repository {full_name: $repo_full_name})
   ON CREATE SET repo.name = $repo_name, repo.url = $repo_url
+"""
+
+CYPHER_INGEST_FUNCTION = """
+MERGE (file:File {path: $filepath})
+MERGE (func:Function {id: $func_id})
+  ON CREATE SET 
+    func.name = $func_name, 
+    func.filepath = $filepath, 
+    func.code = $func_code
+MERGE (file)-[:DECLARES]->(func)
+"""
+
+CYPHER_INGEST_CALLS = """
+MERGE (caller:Function {id: $caller_id})
+MERGE (callee:Function {name: $callee_name})
+MERGE (caller)-[:CALLS]->(callee)
+"""
+
+CYPHER_MODIFIED_FUNCTION = """
+MERGE (commit:Commit {sha: $commit_sha})
+MERGE (func:Function {id: $func_id})
+MERGE (commit)-[:MODIFIED]->(func)
 """
 
 CYPHER_INGEST_COMMIT = """
@@ -227,6 +248,44 @@ def _is_noise_file(filename: str) -> bool:
 # =============================================================================
 #  DEPENDENCY EXTRACTION UTILITIES
 # =============================================================================
+
+def parse_python_ast(filepath: str, source_code: str) -> dict:
+    """
+    Parses a Python file to extract functions, internal calls, and raw source code.
+    """
+    if not filepath.endswith(".py") or not source_code:
+        return {"functions": [], "calls": []}
+
+    functions = []
+    calls = []
+    
+    try:
+        tree = ast.parse(source_code)
+        
+        # 1. Extract Function Boundaries and Code
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Safely extract the raw code snippet
+                func_code = ast.get_source_segment(source_code, node) or ""
+                
+                functions.append({
+                    "name": node.name,
+                    "id": f"{filepath}::{node.name}",
+                    "start": node.lineno,
+                    "end": node.end_lineno,
+                    "code": func_code
+                })
+                
+                # 2. Extract Function Calls
+                for child in ast.walk(node):
+                    if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+                        calls.append((node.name, child.func.id))
+                        
+    except Exception:
+        # Broad catch to ignore any files with bad syntax that can't be parsed
+        pass
+        
+    return {"functions": functions, "calls": calls}
 
 def _append_dependency(dependencies: list, filepath: str, target_module: str):
     """Append a dependency edge, deduplicating by (file, module) pair."""
@@ -696,6 +755,33 @@ def phase1_scan_repo_tree(driver, repo_full_name: str, github_token: str) -> lis
     )
     return source_files
 
+def get_modified_functions(patch_text: str, filepath: str, ast_data:dict)->list:
+    """Reads a Git patch, extracts modified line numbers, and maps them to functions."""
+    if not patch_text or not ast_data.get("functions"):
+        return[]
+
+    modified_lines = set()
+
+    # Extract line numbers from git patch headers
+    for line in patch_text.split("\n"):
+        if line.startsWith("@@"):
+            # Example header: @@ -40,5 +40,8 @@
+            match = re.search(r'\+(\d+)(?:,\d+)? @@', line)
+            if match:
+                start_line = int(match.group(1))
+                line_count = int(match.group(2) or 1)
+                for i in range(start_line, start_line + line_count):
+                    modified_lines.add(i)
+    
+    # Cross-reference with AST function boundaries
+    modified_funcs = set()
+    for func in ast_data["functions"]:
+        func_range = set(range(func["start"], func["end"] + 1))
+        if modified_lines.intersection(func_range):
+            modified_funcs.add(func["id"])
+
+    return list(modified_funcs)
+
 
 # =============================================================================
 #  PHASE 2 — FILE CONTENT / DEPENDENCY SCAN
@@ -707,12 +793,6 @@ def phase2_scan_file_contents(
     file_paths: list,
     github_token: str,
 ) -> int:
-    """
-    Fetch raw content for each source file, extract import statements, and
-    write DEPENDS_ON edges to Neo4j.
-
-    Returns the number of files successfully processed.
-    """
     if not file_paths:
         return 0
 
@@ -740,16 +820,34 @@ def phase2_scan_file_contents(
                     continue
 
                 source_code = base64.b64decode(content_b64).decode("utf-8", errors="replace")
+                
+                # 1. Dependency Extraction
                 deps = extract_imports_from_source(path, source_code)
-
                 for source, _rel, target in deps:
                     batch_params.append((source, target))
+
+                # 2. NEW: AST Extraction and DB Write
+                ast_data = parse_python_ast(path, source_code)
+                with driver.session() as sess:
+                    # Write Functions
+                    for func in ast_data["functions"]:
+                        sess.run(CYPHER_INGEST_FUNCTION, 
+                                 filepath=path, 
+                                 func_id=func["id"], 
+                                 func_name=func["name"],
+                                 func_code=func.get("code", "")) # <--- FIXED: Safely accessing the dict
+                                 
+                    # Write Calls
+                    for caller, callee in ast_data["calls"]:
+                        caller_id = f"{path}::{caller}"
+                        sess.run(CYPHER_INGEST_CALLS, 
+                                 caller_id=caller_id, callee_name=callee)
 
                 scanned += 1
                 if scanned % _GRAPH_FLUSH_BATCH == 0:
                     _flush_batch()
 
-                time.sleep(0.1)  # gentle rate-limit buffer
+                time.sleep(0.1)
 
             except requests.exceptions.HTTPError as exc:
                 if exc.response is not None and exc.response.status_code == 403:
@@ -775,6 +873,7 @@ def phase3_backfill_commits(
     github_token: str,
     google_api_key: str,
     max_commits: int = 200,
+    deep_scan_days: int = 7,
 ) -> int:
     """
     Walk the repository's commit history via the GitHub REST API, generate an
@@ -825,6 +924,7 @@ def phase3_backfill_commits(
     logger.info("  Found %d commits to process.", total)
 
     # ── Step 2: process each commit with a tqdm progress bar ─────────────────
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=deep_scan_days)
     with tqdm(commit_shas, desc="  Backfilling commits", unit="commit", ncols=88,
                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
         for sha in pbar:
@@ -843,9 +943,17 @@ def phase3_backfill_commits(
                 commit_date = commit_info.get("author", {}).get("date", "")
                 commit_url  = commit_payload.get("html_url", "")
 
+                commit_dt = datetime.strptime(commit_date, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                is_deep_scan = commit_dt >= cutoff_date
+
                 modified_files_list = [item["filename"] for item in compact_files]
                 dependencies = extract_file_dependencies(compact_files)
                 raw_diff = render_diff_text(compact_files)
+
+                is_deep_scan = False
+                if commit_date:
+                    commit_dt = datetime.strptime(commit_date, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                    is_deep_scan = commit_dt >= cutoff_date
 
                 summary_text = summarize_with_llm(
                     repo_full_name=repo_full_name,
@@ -869,6 +977,29 @@ def phase3_backfill_commits(
                     commit_message=commit_msg,
                     commit_url=commit_url,
                 )
+
+                if is_deep_scan:
+                    for item in compact_files:
+                        filepath = item["filename"]
+                        patch = item.get("patch", "")
+
+                try:
+                    raw_url = f"{GITHUB_API_BASE}/repos/{repo_full_name}/contents/{filepath}?ref={sha}"
+                    raw_data = _fetch_json(raw_url, github_token=github_token)
+                    raw_code = base64.b64decode(raw_data["content"]).decode("utf-8")
+
+                    # Parse AST and map the diff
+                    historical_ast = parse_python_ast(filepath, raw_code)
+                    mod_funcs = get_modified_functions(patch, filepath, historical_ast)
+
+                    with driver.session() as sess:
+                        for func_id in mod_funcs:
+                            sess.run(CYPHER_MODIFIED_FUNCTION,
+                                     commit_sha = sha, func_id=func_id)
+                
+                except Excepton as e:
+                    # Skip the file was deleted or cannot be parsed
+                    pass
 
                 processed += 1
                 time.sleep(0.5)  # GitHub rate-limit courtesy pause

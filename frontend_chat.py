@@ -22,8 +22,13 @@
 # =============================================================================
 
 import logging
+import os
 import traceback
 from typing import Optional
+
+from dotenv import load_dotenv
+
+load_dotenv()  # Load variables from .env into os.environ
 
 import streamlit as st
 from neo4j import GraphDatabase, exceptions as neo4j_exc
@@ -413,24 +418,6 @@ def query_graph_cypher(
 ) -> str:
     """Translates natural language to Cypher, executes it, and returns the LLM's answer."""
 
-    CYPHER_GENERATION_TEMPLATE = """Task: Generate a Cypher statement to query a graph database.
-    Instructions:
-    1. Use ONLY the provided relationship types and properties in the schema.
-    2. Ensure your Cypher is syntactically valid for Neo4j v5.
-    3. CRITICAL: A 'WHERE' clause must immediately follow a 'MATCH', 'OPTIONAL MATCH', 'YIELD', or 'WITH' clause. Never place 'WHERE' randomly.
-    4. Do not include any explanations, apologies, or markdown formatting (like ```cypher). Return ONLY the raw query string.
-
-    Schema:
-    {schema}
-
-    The question is:
-    {question}"""
-
-    cypher_prompt = PromptTemplate(
-        template=CYPHER_GENERATION_TEMPLATE,
-        input_variables=["schema", "question"]
-    )
-    
     # 1. Connect directly to the Neo4j Graph to read the schema
     graph = Neo4jGraph(
         url=neo4j_uri,
@@ -446,18 +433,58 @@ def query_graph_cypher(
         temperature=0.0 
     )
 
-    # 3. Create the Cypher QA Chain
+    # 3. Define rules for Cypher Generation (Brain 1)
+    CYPHER_GENERATION_TEMPLATE = """Task: Generate a Cypher statement to query a graph database.
+    Instructions:
+    1. Use ONLY the provided relationship types and properties in the schema.
+    2. Ensure your Cypher is syntactically valid for Neo4j v5.
+    3. CRITICAL: A 'WHERE' clause must immediately follow a 'MATCH', 'OPTIONAL MATCH', 'YIELD', or 'WITH' clause. Never place 'WHERE' randomly.
+    4. CRITICAL: When filtering by file paths, module names, or author logins, ALWAYS use case-insensitive matching. Example: `WHERE toLower(f.path) CONTAINS toLower('readme.md')`. NEVER use exact `=` matching for strings.
+    5. Do not include any explanations, apologies, or markdown formatting (like ```cypher). Return ONLY the raw query string.
+
+    Schema:
+    {schema}
+
+    The question is:
+    {question}"""
+
+    cypher_prompt = PromptTemplate(
+        template=CYPHER_GENERATION_TEMPLATE,
+        input_variables=["schema", "question"]
+    )
+
+    # 4. Define rules for Answer Generation (Brain 2)
+    QA_GENERATION_TEMPLATE = """You are a senior software engineering assistant.
+    Use the following information retrieved from the codebase graph database to answer the user's question.
+    
+    If the user asks about how a function works, what a file does, or the hypothetical impact of modifying/removing code, YOU MUST analyze the provided source code and graph relationships to deduce the logical answer. Think step-by-step about what the code does and what depends on it.
+    
+    If the database results are completely empty or do not contain enough code/context to make an educated analysis, only then say you don't know.
+
+    Database Results:
+    {context}
+
+    User Question:
+    {question}"""
+
+    qa_prompt = PromptTemplate(
+        template=QA_GENERATION_TEMPLATE,
+        input_variables=["context", "question"]
+    )
+
+    # 5. Create the dual-prompt Chain
     chain = GraphCypherQAChain.from_llm(
         cypher_llm=llm,       
         qa_llm=llm,           
         graph=graph,          
-        verbose=True,         # Prints the generated Cypher to your terminal!
-        cypher_prompt=cypher_prompt,
+        verbose=True,         
+        cypher_prompt=cypher_prompt,  
+        qa_prompt=qa_prompt,          
         allow_dangerous_requests=True, 
         validate_cypher=True  
     )
 
-    # 4. Execute the chain
+    # 6. Execute
     try:
         response = chain.invoke({"query": question})
         return response.get("result", "I couldn't formulate an answer based on the database results.")
@@ -491,15 +518,21 @@ with st.sidebar:
     neo4j_user = st.text_input("Username",   value="neo4j",                   key="usr")
     neo4j_pwd  = st.text_input("Password",   type="password", placeholder="password123", key="pwd")
 
-    # ── Gemini API key ────────────────────────────────────────────────────────
+    # ── Gemini API key (loaded from .env) ────────────────────────────────────
     st.markdown('<div class="section-header">🔑 Google Gemini</div>', unsafe_allow_html=True)
-    google_api_key = st.text_input(
-        "Gemini API Key",
-        type="password",
-        placeholder="Enter key…",
-        help="Get yours at aistudio.google.com",
-        key="gkey",
-    )
+    google_api_key = os.getenv("GOOGLE_API_KEY", "")
+    if google_api_key:
+        st.markdown(
+            f'{_status_dot("green")}<span style="font-size:0.82rem; color:rgba(255,255,255,0.75);">'
+            'API key loaded from <code>.env</code></span>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f'{_status_dot("red")}<span style="font-size:0.82rem; color:rgba(255,100,100,0.9);">'
+            '<code>GOOGLE_API_KEY</code> not found in <code>.env</code></span>',
+            unsafe_allow_html=True,
+        )
 
     # ── Connection status ─────────────────────────────────────────────────────
     if neo4j_uri and neo4j_user and neo4j_pwd:
@@ -571,14 +604,7 @@ with st.sidebar:
     # ── RAG settings ──────────────────────────────────────────────────────────
     st.markdown('<div class="section-header">⚙️ RAG Settings</div>', unsafe_allow_html=True)
     top_k = st.slider("Top-K retrieval results", min_value=1, max_value=15, value=5, step=1)
-
-    st.markdown("---")
-
-    # ── Clear chat button ─────────────────────────────────────────────────────
-    if st.button("🗑️ Clear Chat History", use_container_width=True, key="clear_chat"):
-        st.session_state.messages = []
-        st.rerun()
-
+    
     # ── Pipeline info ─────────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown(
@@ -589,9 +615,6 @@ with st.sidebar:
             <span class="pipeline-badge">FullText</span>Commit search<br>
             <span class="pipeline-badge">Gemini 2.5</span>Answer generation<br>
             <br>
-            <div style="color:rgba(255,255,255,0.25); font-size:0.65rem; margin-top:4px;">
-                Run <code>backend_ingest.py</code> to populate the graph before chatting.
-            </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -646,7 +669,7 @@ if not (neo4j_uri and neo4j_user and neo4j_pwd):
         "Make sure `backend_ingest.py` has been run first to populate the graph."
     )
 elif not google_api_key:
-    st.warning("⚠️ Enter your **Gemini API key** in the sidebar to enable answer generation.")
+    st.warning("⚠️ **Gemini API key** not found. Set `GOOGLE_API_KEY` in your `.env` file and restart the app.")
 elif _nodes == 0:
     st.warning(
         "⚠️ The Neo4j graph appears to be **empty**. "
@@ -719,7 +742,7 @@ if user_input:
     answer: Optional[str] = None
 
     if not google_api_key:
-        answer = "❌ **Gemini API Key** is missing. Please enter it in the sidebar."
+        answer = "❌ **Gemini API Key** is missing. Set `GOOGLE_API_KEY` in your `.env` file and restart the app."
         with st.chat_message("assistant", avatar="🤖"):
             st.error(answer)
 
