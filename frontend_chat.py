@@ -2,24 +2,6 @@
 # =============================================================================
 # frontend_chat.py — Streamlit GraphRAG Chat UI
 # =============================================================================
-#
-# PURPOSE:
-#   A clean, lightweight Streamlit chatbot that queries a pre-built Neo4j
-#   GraphRAG knowledge graph.  Does NO data ingestion — run backend_ingest.py
-#   first to populate the database.
-#
-# RUN:
-#   streamlit run frontend_chat.py
-#
-# REQUIREMENTS:
-#   pip install streamlit neo4j neo4j-graphrag[google-genai] \
-#               google-genai langchain-google-genai
-#
-# SHARED SCHEMA (must match backend_ingest.py):
-#   Nodes   : Repository · File · Directory · Module · Commit · User · Issue
-#   Indexes : issue_embeddings (vector) · commit_summaries (fulltext)
-#
-# =============================================================================
 
 import logging
 import os
@@ -28,24 +10,21 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-load_dotenv()  # Load variables from .env into os.environ
+load_dotenv()
 
 import streamlit as st
 from neo4j import GraphDatabase, exceptions as neo4j_exc
 from langchain_core.prompts import PromptTemplate
 
-# ── Neo4j GraphRAG ────────────────────────────────────────────────────────────
 from langchain_neo4j import Neo4jGraph, GraphCypherQAChain
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-# ── Google Gemini (google-genai) ──────────────────────────────────────────────
 try:
     from google import genai as google_genai
     GENAI_AVAILABLE = True
 except ImportError:
     GENAI_AVAILABLE = False
 
-# ── LangChain Gemini bridge ───────────────────────────────────────────────────
 try:
     from langchain_google_genai import ChatGoogleGenerativeAI
     LANGCHAIN_GENAI_AVAILABLE = True
@@ -53,11 +32,6 @@ except ImportError:
     LANGCHAIN_GENAI_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-#  PAGE CONFIG & GLOBAL STYLES
-# =============================================================================
 
 st.set_page_config(
     page_title="GraphRAG Chat — Neo4j + Gemini",
@@ -73,13 +47,11 @@ st.markdown(
 
     html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
-    /* ── Background ──────────────────────────────────────── */
     .stApp {
         background: linear-gradient(135deg, #0d0d1a 0%, #0a1628 50%, #0d0d1a 100%);
         min-height: 100vh;
     }
 
-    /* ── Sidebar ─────────────────────────────────────────── */
     [data-testid="stSidebar"] {
         background: linear-gradient(180deg, #0f1923 0%, #0d1520 100%);
         border-right: 1px solid rgba(0, 212, 255, 0.15);
@@ -89,7 +61,6 @@ st.markdown(
         color: #00d4ff;
     }
 
-    /* ── Hero title ──────────────────────────────────────── */
     .hero-title {
         font-size: 2.6rem;
         font-weight: 700;
@@ -110,7 +81,6 @@ st.markdown(
         letter-spacing: 0.5px;
     }
 
-    /* ── Metric cards ────────────────────────────────────── */
     .metric-card {
         background: rgba(255,255,255,0.04);
         border: 1px solid rgba(0, 212, 255, 0.2);
@@ -140,7 +110,6 @@ st.markdown(
         margin-top: 0.2rem;
     }
 
-    /* ── Status dot ──────────────────────────────────────── */
     .status-dot {
         display: inline-block;
         width: 8px; height: 8px;
@@ -153,7 +122,6 @@ st.markdown(
     .status-dot.yellow { background: #ffd740; box-shadow: 0 0 6px #ffd740; }
     .status-dot.blue   { background: #448aff; box-shadow: 0 0 6px #448aff; }
 
-    /* ── Pipeline badge ──────────────────────────────────── */
     .pipeline-badge {
         display: inline-block;
         background: linear-gradient(90deg, #7b61ff22, #00d4ff22);
@@ -167,7 +135,6 @@ st.markdown(
         margin-right: 0.5rem;
     }
 
-    /* ── Section header ──────────────────────────────────── */
     .section-header {
         font-size: 0.7rem;
         font-weight: 600;
@@ -177,7 +144,6 @@ st.markdown(
         margin: 1.25rem 0 0.6rem 0;
     }
 
-    /* ── Chat messages ───────────────────────────────────── */
     [data-testid="stChatMessage"] {
         background: rgba(255,255,255,0.03) !important;
         border: 1px solid rgba(255,255,255,0.07) !important;
@@ -189,7 +155,6 @@ st.markdown(
         border-color: rgba(255,255,255,0.12) !important;
     }
 
-    /* ── Buttons ─────────────────────────────────────────── */
     .stButton > button {
         background: linear-gradient(135deg, #00d4ff, #7b61ff) !important;
         color: white !important;
@@ -205,7 +170,6 @@ st.markdown(
         box-shadow: 0 6px 20px rgba(0, 212, 255, 0.35) !important;
     }
 
-    /* ── Inputs ──────────────────────────────────────────── */
     .stTextInput > div > div > input,
     .stTextInput > div > div > input:focus {
         background: rgba(255,255,255,0.05) !important;
@@ -218,7 +182,6 @@ st.markdown(
         box-shadow: 0 0 0 2px rgba(0, 212, 255, 0.1) !important;
     }
 
-    /* ── Divider glow ────────────────────────────────────── */
     hr {
         border: none !important;
         height: 1px !important;
@@ -226,7 +189,6 @@ st.markdown(
         margin: 1.5rem 0 !important;
     }
 
-    /* ── Code ────────────────────────────────────────────── */
     code {
         background: rgba(0, 212, 255, 0.08) !important;
         color: #00d4ff !important;
@@ -235,7 +197,6 @@ st.markdown(
         font-size: 0.85em !important;
     }
 
-    /* ── Graph stats grid ────────────────────────────────── */
     .stats-grid {
         display: grid;
         grid-template-columns: 1fr 1fr;
@@ -262,7 +223,6 @@ st.markdown(
         letter-spacing: 0.8px;
     }
 
-    /* ── Suggestion chips ────────────────────────────────── */
     .suggestion-chip {
         display: inline-block;
         background: rgba(123,97,255,0.12);
@@ -285,16 +245,13 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
-# =============================================================================
-#  SESSION STATE
-# =============================================================================
-
 def _init_session():
     defaults = {
-        "messages":     [],
-        "neo4j_driver": None,
-        "graph_stats":  None,   # cached { nodes: int, rels: int, ... }
+        "messages":        [],
+        "neo4j_driver":    None,
+        "graph_stats":     None,
+        "available_repos": [],
+        "selected_repos":  [],
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -302,14 +259,8 @@ def _init_session():
 
 _init_session()
 
-
-# =============================================================================
-#  NEO4J HELPERS
-# =============================================================================
-
 def _status_dot(color: str) -> str:
     return f'<span class="status-dot {color}"></span>'
-
 
 def _check_neo4j(uri: str, user: str, pwd: str) -> tuple[bool, str]:
     try:
@@ -320,13 +271,10 @@ def _check_neo4j(uri: str, user: str, pwd: str) -> tuple[bool, str]:
     except Exception as exc:
         return False, str(exc)
 
-
 def _get_driver(uri: str, user: str, pwd: str):
-    """Return a cached Neo4j driver (creates one if needed)."""
     if st.session_state.neo4j_driver is None:
         st.session_state.neo4j_driver = GraphDatabase.driver(uri, auth=(user, pwd))
     return st.session_state.neo4j_driver
-
 
 def _close_driver():
     if st.session_state.neo4j_driver is not None:
@@ -336,13 +284,7 @@ def _close_driver():
             pass
         st.session_state.neo4j_driver = None
 
-
 def _query_graph_stats(driver) -> dict:
-    """
-    Return graph statistics from Neo4j:
-      nodes, relationships, commits, files, issues, repositories
-    Gracefully returns zeros on any error.
-    """
     stats = {
         "nodes": 0, "relationships": 0,
         "commits": 0, "files": 0,
@@ -370,26 +312,107 @@ def _query_graph_stats(driver) -> dict:
         logger.warning("Could not fetch graph stats: %s", exc)
     return stats
 
-
-def _fetch_commit_context(driver, question: str, limit: int = 3) -> str:
-    """Full-text search on commit_summaries index for additional RAG context."""
+def _fetch_available_repos(driver) -> list:
     try:
         with driver.session() as session:
             result = session.run(
-                """
-                CALL db.index.fulltext.queryNodes('commit_summaries', $query)
-                YIELD node, score
-                WHERE score > 0
-                RETURN node.sha       AS sha,
-                       node.summary_text AS summary,
-                       node.message   AS message,
-                       node.timestamp AS ts
-                ORDER BY score DESC
-                LIMIT $limit
-                """,
-                query=question,
-                limit=limit,
+                "MATCH (r:Repository) RETURN r.full_name AS full_name ORDER BY r.full_name"
             )
+            return [rec["full_name"] for rec in result if rec["full_name"]]
+    except Exception as exc:
+        logger.warning("Could not fetch available repos: %s", exc)
+        return []
+
+def _fetch_commit_context(
+    driver,
+    question: str,
+    selected_repos: Optional[list] = None,
+    limit: int = 3,
+    deep_scan_days: int = 30,
+) -> str:
+    try:
+        from datetime import datetime, timezone, timedelta
+        cutoff_iso = (
+            (datetime.now(timezone.utc) - timedelta(days=deep_scan_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if deep_scan_days > 0 else None
+        )
+        use_repo_filter = bool(selected_repos)
+
+        with driver.session() as session:
+            if use_repo_filter and cutoff_iso:
+                result = session.run(
+                    """
+                    CALL db.index.fulltext.queryNodes('commit_summaries', $query)
+                    YIELD node, score
+                    WHERE score > 0 AND node.timestamp >= $cutoff
+                    WITH node, score
+                    MATCH (node)-[:BELONGS_TO]->(r:Repository)
+                    WHERE r.full_name IN $selected_repos
+                    RETURN node.sha          AS sha,
+                           node.summary_text AS summary,
+                           node.message      AS message,
+                           node.timestamp    AS ts
+                    ORDER BY score DESC
+                    LIMIT $limit
+                    """,
+                    query=question,
+                    cutoff=cutoff_iso,
+                    selected_repos=selected_repos,
+                    limit=limit,
+                )
+            elif use_repo_filter:
+                result = session.run(
+                    """
+                    CALL db.index.fulltext.queryNodes('commit_summaries', $query)
+                    YIELD node, score
+                    WHERE score > 0
+                    WITH node, score
+                    MATCH (node)-[:BELONGS_TO]->(r:Repository)
+                    WHERE r.full_name IN $selected_repos
+                    RETURN node.sha          AS sha,
+                           node.summary_text AS summary,
+                           node.message      AS message,
+                           node.timestamp    AS ts
+                    ORDER BY score DESC
+                    LIMIT $limit
+                    """,
+                    query=question,
+                    selected_repos=selected_repos,
+                    limit=limit,
+                )
+            elif cutoff_iso:
+                result = session.run(
+                    """
+                    CALL db.index.fulltext.queryNodes('commit_summaries', $query)
+                    YIELD node, score
+                    WHERE score > 0 AND node.timestamp >= $cutoff
+                    RETURN node.sha          AS sha,
+                           node.summary_text AS summary,
+                           node.message      AS message,
+                           node.timestamp    AS ts
+                    ORDER BY score DESC
+                    LIMIT $limit
+                    """,
+                    query=question,
+                    cutoff=cutoff_iso,
+                    limit=limit,
+                )
+            else:
+                result = session.run(
+                    """
+                    CALL db.index.fulltext.queryNodes('commit_summaries', $query)
+                    YIELD node, score
+                    WHERE score > 0
+                    RETURN node.sha          AS sha,
+                           node.summary_text AS summary,
+                           node.message      AS message,
+                           node.timestamp    AS ts
+                    ORDER BY score DESC
+                    LIMIT $limit
+                    """,
+                    query=question,
+                    limit=limit,
+                )
             rows = result.data()
             if not rows:
                 return ""
@@ -404,10 +427,96 @@ def _fetch_commit_context(driver, question: str, limit: int = 3) -> str:
     except Exception:
         return ""
 
+def analyze_cross_repo_impact(
+    driver,
+    helper_repo: str,
+    parent_repo: str,
+    commit_sha: str,
+    google_api_key: str,
+    neo4j_uri: str,
+    neo4j_user: str,
+    neo4j_pwd: str,
+) -> str:
+    affected_rows = []
+    try:
+        with driver.session() as session:
+            result = session.run(
+                """
+                MATCH (helperCommit:Commit {sha: $commit_sha})-[:MODIFIED]->(changed)
+                WHERE changed:Function OR changed:File
+                WITH collect(changed) AS changedNodes
+                MATCH (parentFile:File {repo: $parent_repo})-[:USES_REPO]->
+                      (helperRepo:Repository {full_name: $helper_repo})
+                OPTIONAL MATCH (parentFunc:Function)-[:CALLS]->(helperFunc:Function)
+                WHERE parentFunc.repo = $parent_repo AND helperFunc IN changedNodes
+                RETURN DISTINCT
+                    parentFile.path      AS affected_file,
+                    parentFunc.name      AS affected_function,
+                    parentFunc.code      AS affected_code
+                ORDER BY affected_file
+                """,
+                commit_sha=commit_sha,
+                parent_repo=parent_repo,
+                helper_repo=helper_repo,
+            )
+            affected_rows = result.data()
+    except Exception as exc:
+        return f"❌ **Graph query failed:** {exc}"
 
-# =============================================================================
-#  CYPHER QA PIPELINE
-# =============================================================================
+    if not affected_rows:
+        return (
+            f"✅ No direct impact detected in `{parent_repo}` "
+            f"from commit `{commit_sha[:8]}` in `{helper_repo}`. "
+            "Either the cross-repo edges haven't been resolved yet "
+            "(run `resolve_cross_repo_edges` in the backend), "
+            "or this commit doesn't touch anything the parent imports."
+        )
+
+    context_lines = [f"Helper repo: {helper_repo}", f"Parent repo: {parent_repo}",
+                     f"Commit: {commit_sha[:8]}", "", "Affected parent-repo code:"]
+    for row in affected_rows:
+        context_lines.append(f"\nFile: {row.get('affected_file', '?')}")
+        if row.get("affected_function"):
+            context_lines.append(f"Function: {row['affected_function']}")
+        if row.get("affected_code"):
+            snippet = (row["affected_code"] or "")[:800]
+            context_lines.append(f"Code:\n{snippet}")
+    context = "\n".join(context_lines)
+
+    commit_summary = ""
+    try:
+        with driver.session() as session:
+            rec = session.run(
+                "MATCH (c:Commit {sha: $sha}) RETURN c.summary_text AS s, c.message AS m",
+                sha=commit_sha,
+            ).single()
+            if rec:
+                commit_summary = rec.get("s") or rec.get("m") or ""
+    except Exception:
+        pass
+
+    prompt = (
+        f"A commit was made to the helper library `{helper_repo}`.\n"
+        f"Commit summary: {commit_summary[:400]}\n\n"
+        f"The following code in the parent repo `{parent_repo}` directly "
+        f"depends on what changed:\n\n{context}\n\n"
+        "For each affected file and function:\n"
+        "1. Explain what might break and why.\n"
+        "2. Suggest the minimal code change needed to fix or adapt it.\n"
+        "Be specific and concise. Do not repeat the full code back."
+    )
+
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        google_api_key=google_api_key,
+        temperature=0.2,
+    )
+    try:
+        response = llm.invoke(prompt)
+        return response.content
+    except Exception as exc:
+        return f"❌ **LLM call failed:** {exc}"
 
 def query_graph_cypher(
     question: str,
@@ -415,51 +524,87 @@ def query_graph_cypher(
     neo4j_user: str,
     neo4j_pwd: str,
     google_api_key: str,
+    selected_repos: Optional[list] = None,
+    deep_scan_days: int = 30,
 ) -> str:
-    """Translates natural language to Cypher, executes it, and returns the LLM's answer."""
-
-    # 1. Connect directly to the Neo4j Graph to read the schema
     graph = Neo4jGraph(
         url=neo4j_uri,
         username=neo4j_user,
         password=neo4j_pwd
     )
 
-    # 2. Initialize the Gemini LLM
-    # Temperature is 0.0 because generating Cypher requires strict deterministic logic
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash",
         google_api_key=google_api_key,
         temperature=0.0 
     )
 
-    # 3. Define rules for Cypher Generation (Brain 1)
-    CYPHER_GENERATION_TEMPLATE = """Task: Generate a Cypher statement to query a graph database.
-    Instructions:
-    1. Use ONLY the provided relationship types and properties in the schema.
-    2. Ensure your Cypher is syntactically valid for Neo4j v5.
-    3. CRITICAL: A 'WHERE' clause must immediately follow a 'MATCH', 'OPTIONAL MATCH', 'YIELD', or 'WITH' clause. Never place 'WHERE' randomly.
-    4. CRITICAL: When filtering by file paths, module names, or author logins, ALWAYS use case-insensitive matching. Example: `WHERE toLower(f.path) CONTAINS toLower('readme.md')`. NEVER use exact `=` matching for strings.
-    5. Do not include any explanations, apologies, or markdown formatting (like ```cypher). Return ONLY the raw query string.
+    from datetime import datetime, timezone, timedelta as _td
+    if deep_scan_days > 0:
+        _cutoff_str = (datetime.now(timezone.utc) - _td(days=deep_scan_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _time_hint = (
+            f"6. RETRIEVAL DEPTH: The user set a {deep_scan_days}-day window. "
+            f"When querying Commit nodes by recency, prefer filtering with "
+            f"`WHERE c.timestamp >= '{_cutoff_str}'` unless the question asks for older history."
+        )
+    else:
+        _time_hint = "6. RETRIEVAL DEPTH: No time limit — search the full commit history."
 
-    Schema:
-    {schema}
+    if selected_repos:
+        _repo_list = "[" + ", ".join(f'"{r}"' for r in selected_repos) + "]"
+        _repo_hint = (
+            f"7. REPO SCOPE & CROSS-REPO: The user has selected {len(selected_repos)} repositories: {_repo_list}. "
+            f"When filtering File, Directory, or Function nodes, use `WHERE n.repo IN {_repo_list}`. "
+            f"CRITICAL: `Module` nodes do NOT have a `repo` property. To find shared dependencies, you must traverse "
+            f"from Files to Modules (e.g., `(f:File)-[:DEPENDS_ON]->(m:Module)`)."
+        )
+    else:
+        _repo_hint = (
+            "7. REPO SCOPE: All repositories are in scope. "
+            "No repository filtering is needed — search the full graph."
+        )
 
-    The question is:
-    {question}"""
+    CYPHER_GENERATION_TEMPLATE = (
+        "Task: Generate a Cypher statement to query a graph database.\n"
+        "    Instructions:\n"
+        "    1. Use ONLY the provided relationship types and properties explicitly listed in the schema. Do NOT hallucinate or invent properties.\n"
+        "    2. Ensure your Cypher is syntactically valid for Neo4j v5.\n"
+        "    3. CRITICAL: A 'WHERE' clause must immediately follow a 'MATCH', 'OPTIONAL MATCH', 'YIELD', or 'WITH' clause. Never place 'WHERE' randomly.\n"
+        "    4. CRITICAL: When filtering by ANY string property (file paths, modules, authors, or repo names), ALWAYS use case-insensitive `CONTAINS`. Example: `WHERE toLower(f.repo) CONTAINS toLower('tqdm')`. NEVER use exact `=` matching for strings.\n"
+        "    5. Do not include any explanations, apologies, or markdown formatting (like ```cypher). Return ONLY the raw query string.\n"
+        f"    {_time_hint}\n"
+        f"    {_repo_hint}\n"
+        "    8. RETURN CLAUSES: When asked about relationships (dependencies, calls, imports), return the connected node properties. Only return relationship properties if they actually exist in the provided schema.\n"
+        "    9. SYMBOL & BLAST-RADIUS ANALYSIS: The graph tracks module-level edges (`File-[:DEPENDS_ON]->Module`, `Function-[:CALLS]->Function`), NOT individual imported names "
+        "(e.g. there is no node for `init()` or `Fore` themselves — only for the `colorama` module and the functions whose code happens to mention it). "
+        "For 'what breaks if symbol/function X changes', 'where would a bug in module Y surface', or any other symbol-level or blast-radius question, use this general two-hop pattern: "
+        "(a) match the dependency edge from the target module/file, (b) walk to the functions declared in or calling from the dependent file, and fetch their `code` "
+        "so the symbol-level filtering (does this function actually reference `init` or `Fore`?) happens by reading source text, not by the graph schema. "
+        "Module-import template: `MATCH (f:File)-[:DEPENDS_ON]->(m:Module), (f)-[:DECLARES]->(fn:Function) WHERE toLower(m.name) CONTAINS toLower('<module>') RETURN f.path, fn.name, fn.code`. "
+        "Function-call template: `MATCH (caller:Function)-[:CALLS]->(callee:Function) WHERE toLower(callee.name) CONTAINS toLower('<symbol>') RETURN caller.name, caller.code, callee.name`. "
+        "Always prefer returning `fn.code` / `caller.code` over names alone when the question asks 'where', 'how', or 'what would break' — the answer step needs the source text to reason about specific symbols.\n"
+        "    10. SPARSE-PROPERTY FALLBACK: Some properties (e.g. a commit's summary vs. its raw message) may only be populated on a subset of nodes. When a question could be answered by either of two known alternate properties, "
+        "use `coalesce()` across them (e.g. `coalesce(c.summary_text, c.message)`) instead of querying only one and risking an empty result. "
+        "Do not let a narrow property choice cause a false 'no data' answer when a broader, still-schema-valid query would have found it.\n\n"
+        "    Schema:\n"
+        "    {schema}\n\n"
+        "    The question is:\n"
+        "    {question}"
+    )
 
     cypher_prompt = PromptTemplate(
         template=CYPHER_GENERATION_TEMPLATE,
-        input_variables=["schema", "question"]
+        input_variables=["schema", "question"],
     )
 
-    # 4. Define rules for Answer Generation (Brain 2)
     QA_GENERATION_TEMPLATE = """You are a senior software engineering assistant.
     Use the following information retrieved from the codebase graph database to answer the user's question.
     
-    If the user asks about how a function works, what a file does, or the hypothetical impact of modifying/removing code, YOU MUST analyze the provided source code and graph relationships to deduce the logical answer. Think step-by-step about what the code does and what depends on it.
-    
-    If the database results are completely empty or do not contain enough code/context to make an educated analysis, only then say you don't know.
+    IMPORTANT INSTRUCTIONS:
+    1. The `Database Results` provided below are the direct output of a strict database query designed to answer the user's exact question. 
+    2. TRUST THE DATA: If the user asks "what files depend on X" and the results yield a list of files, you must confidently state that those files depend on X. 
+    3. Do NOT claim you lack information just because the results only contain names/paths instead of full source code or explicit relationship labels.
+    4. If the database results are completely empty (`[]`), only then say you don't have the data to answer.
 
     Database Results:
     {context}
@@ -472,7 +617,6 @@ def query_graph_cypher(
         input_variables=["context", "question"]
     )
 
-    # 5. Create the dual-prompt Chain
     chain = GraphCypherQAChain.from_llm(
         cypher_llm=llm,       
         qa_llm=llm,           
@@ -484,7 +628,6 @@ def query_graph_cypher(
         validate_cypher=True  
     )
 
-    # 6. Execute
     try:
         response = chain.invoke({"query": question})
         return response.get("result", "I couldn't formulate an answer based on the database results.")
@@ -494,11 +637,6 @@ def query_graph_cypher(
         raise exc
     except Exception as exc:
         return f"❌ **Query Execution Failed:**\n```\n{str(exc)}\n```"
-
-
-# =============================================================================
-#  SIDEBAR
-# =============================================================================
 
 with st.sidebar:
     st.markdown(
@@ -512,13 +650,11 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    # ── Neo4j credentials ─────────────────────────────────────────────────────
     st.markdown('<div class="section-header">🗄️ Neo4j Connection</div>', unsafe_allow_html=True)
     neo4j_uri  = st.text_input("Neo4j URI",  value="neo4j://localhost:7687", key="uri")
     neo4j_user = st.text_input("Username",   value="neo4j",                   key="usr")
     neo4j_pwd  = st.text_input("Password",   type="password", placeholder="password123", key="pwd")
 
-    # ── Gemini API key (loaded from .env) ────────────────────────────────────
     st.markdown('<div class="section-header">🔑 Google Gemini</div>', unsafe_allow_html=True)
     google_api_key = os.getenv("GOOGLE_API_KEY", "")
     if google_api_key:
@@ -534,7 +670,6 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
 
-    # ── Connection status ─────────────────────────────────────────────────────
     if neo4j_uri and neo4j_user and neo4j_pwd:
         ok, msg = _check_neo4j(neo4j_uri, neo4j_user, neo4j_pwd)
         dot = _status_dot("green") if ok else _status_dot("red")
@@ -545,7 +680,6 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
 
-        # ── Load graph stats on connect ────────────────────────────────────────
         if ok and st.session_state.graph_stats is None:
             try:
                 drv = _get_driver(neo4j_uri, neo4j_user, neo4j_pwd)
@@ -553,19 +687,22 @@ with st.sidebar:
             except Exception:
                 st.session_state.graph_stats = {}
 
-    # ── Refresh stats button ──────────────────────────────────────────────────
     if st.button("🔄 Refresh Graph Stats", use_container_width=True, key="refresh_stats"):
         if neo4j_uri and neo4j_user and neo4j_pwd:
             try:
-                # Force a new driver on refresh
                 _close_driver()
                 drv = _get_driver(neo4j_uri, neo4j_user, neo4j_pwd)
                 st.session_state.graph_stats = _query_graph_stats(drv)
-                st.toast("Graph stats refreshed!", icon="✅")
+                new_repos = _fetch_available_repos(drv)
+                st.session_state.available_repos = new_repos
+                existing = set(st.session_state.selected_repos)
+                for r in new_repos:
+                    if r not in existing:
+                        st.session_state.selected_repos.append(r)
+                st.toast("Graph stats and repository list refreshed!", icon="✅")
             except Exception as exc:
                 st.error(f"Could not refresh stats: {exc}")
 
-    # ── Graph metrics display ─────────────────────────────────────────────────
     stats = st.session_state.graph_stats
     if stats:
         st.markdown('<div class="section-header">📊 Graph Metrics</div>', unsafe_allow_html=True)
@@ -601,11 +738,91 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
 
-    # ── RAG settings ──────────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">📦 Active Repositories</div>', unsafe_allow_html=True)
+    if neo4j_uri and neo4j_user and neo4j_pwd:
+        if not st.session_state.available_repos:
+            try:
+                drv = _get_driver(neo4j_uri, neo4j_user, neo4j_pwd)
+                st.session_state.available_repos = _fetch_available_repos(drv)
+                if not st.session_state.selected_repos:
+                    st.session_state.selected_repos = list(st.session_state.available_repos)
+            except Exception:
+                pass
+
+        available_repos = st.session_state.available_repos
+        if available_repos:
+            _col_all, _col_none = st.columns(2)
+            with _col_all:
+                if st.button("All", key="repo_sel_all", use_container_width=True):
+                    st.session_state.selected_repos = list(available_repos)
+                    st.rerun()
+            with _col_none:
+                if st.button("None", key="repo_clr_all", use_container_width=True):
+                    st.session_state.selected_repos = []
+                    st.rerun()
+
+            selected_repos_widget = st.multiselect(
+                label="Repositories in scope",
+                options=available_repos,
+                default=st.session_state.selected_repos,
+                key="repo_multiselect",
+                label_visibility="collapsed",
+                placeholder="Empty = all repositories in scope",
+            )
+            st.session_state.selected_repos = selected_repos_widget
+
+            n_sel, n_total = len(selected_repos_widget), len(available_repos)
+            if n_sel == 0 or n_sel == n_total:
+                _scope_txt   = "🌐 All repositories in scope"
+                _scope_color = "#00d4ff"
+            else:
+                _scope_txt   = f"🎯 {n_sel} / {n_total} repos selected"
+                _scope_color = "#7b61ff"
+            st.markdown(
+                f'<div style="font-size:0.73rem; color:{_scope_color}; '
+                f'margin-top:-2px; margin-bottom:6px;">{_scope_txt}</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div style="font-size:0.73rem; color:rgba(255,255,255,0.3);">'  
+                'No repos found. Run <code>backend_ingest.py</code> first.</div>',
+                unsafe_allow_html=True,
+            )
+
     st.markdown('<div class="section-header">⚙️ RAG Settings</div>', unsafe_allow_html=True)
     top_k = st.slider("Top-K retrieval results", min_value=1, max_value=15, value=5, step=1)
-    
-    # ── Pipeline info ─────────────────────────────────────────────────────────
+
+    deep_scan_days = st.slider(
+        "Retrieval depth (days)",
+        min_value=0,
+        max_value=365,
+        value=30,
+        step=1,
+        help=(
+            "Limits commit context to the last N days.\n\n"
+            "**0** = no limit (search all history)\n"
+            "**7** = last week only (fast / recent)\n"
+            "**365** = full year of commits"
+        ),
+        key="deep_scan_days",
+    )
+    if deep_scan_days == 0:
+        _depth_label = "🌐 All history"
+    elif deep_scan_days <= 7:
+        _depth_label = f"⚡ Last {deep_scan_days}d — recent only"
+    elif deep_scan_days <= 30:
+        _depth_label = f"📅 Last {deep_scan_days}d — balanced"
+    elif deep_scan_days <= 90:
+        _depth_label = f"🗂️ Last {deep_scan_days}d — broad"
+    else:
+        _depth_label = f"📜 Last {deep_scan_days}d — deep history"
+    st.markdown(
+        f'<div style="font-size:0.75rem; color:rgba(255,255,255,0.45); margin-top:-6px;">'
+        f'{_depth_label}</div>',
+        unsafe_allow_html=True,
+    )
+
     st.markdown("---")
     st.markdown(
         """
@@ -620,11 +837,6 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-
-# =============================================================================
-#  MAIN PANEL
-# =============================================================================
-
 st.markdown(
     '<h1 class="hero-title">🕸️ GraphRAG Chat</h1>'
     '<p class="hero-sub">Query your Neo4j knowledge graph with natural language, '
@@ -632,7 +844,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ── Architecture overview ─────────────────────────────────────────────────────
 with st.expander("📐 Pipeline Overview", expanded=False):
     cols = st.columns(5)
     steps = [
@@ -657,7 +868,44 @@ with st.expander("📐 Pipeline Overview", expanded=False):
 
 st.markdown("---")
 
-# ── Readiness / status banner ─────────────────────────────────────────────────
+with st.expander("🔍 Cross-Repo Impact Analysis", expanded=False):
+    st.markdown(
+        "Paste a **commit SHA** from the helper repo to find what breaks in the parent repo.",
+        unsafe_allow_html=False,
+    )
+    col_helper, col_parent = st.columns(2)
+    with col_helper:
+        impact_helper = st.text_input("Helper repo (owner/repo)", key="impact_helper",
+                                      placeholder="acme/mylib")
+    with col_parent:
+        impact_parent = st.text_input("Parent repo (owner/repo)", key="impact_parent",
+                                      placeholder="acme/product")
+    impact_sha = st.text_input("Commit SHA from helper repo", key="impact_sha",
+                                placeholder="abc1234...")
+
+    if st.button("Analyze Impact", key="btn_impact"):
+        if not (impact_helper and impact_parent and impact_sha):
+            st.warning("Fill in both repo names and the commit SHA.")
+        elif not google_api_key:
+            st.error("Gemini API key required.")
+        else:
+            with st.spinner("Tracing impact across repos…"):
+                try:
+                    drv = _get_driver(neo4j_uri, neo4j_user, neo4j_pwd)
+                    impact_result = analyze_cross_repo_impact(
+                        driver=drv,
+                        helper_repo=impact_helper,
+                        parent_repo=impact_parent,
+                        commit_sha=impact_sha,
+                        google_api_key=google_api_key,
+                        neo4j_uri=neo4j_uri,
+                        neo4j_user=neo4j_user,
+                        neo4j_pwd=neo4j_pwd,
+                    )
+                    st.markdown(impact_result)
+                except Exception as exc:
+                    st.error(f"Error: {exc}")
+
 stats = st.session_state.graph_stats or {}
 _nodes = stats.get("nodes", 0)
 _rels  = stats.get("relationships", 0)
@@ -697,7 +945,6 @@ else:
         unsafe_allow_html=True,
     )
 
-# ── Suggested questions ───────────────────────────────────────────────────────
 if _ready and not st.session_state.messages:
     st.markdown(
         '<div style="font-size:0.78rem; color:rgba(255,255,255,0.4); margin-bottom:8px;">💡 Try asking…</div>',
@@ -706,10 +953,10 @@ if _ready and not st.session_state.messages:
     suggestions = [
         "What are the most critical open issues?",
         "Summarise recent bug reports",
-        "Which issues mention performance problems?",
         "What files were changed most frequently?",
         "Which commits touched authentication code?",
-        "What feature requests are open?",
+        "Which parent-repo files import from the helper repo?",
+        "What functions in the parent repo call helper repo functions?",
     ]
     suggestion_cols = st.columns(3)
     for i, suggestion in enumerate(suggestions):
@@ -718,13 +965,11 @@ if _ready and not st.session_state.messages:
                 st.session_state.messages.append({"role": "user", "content": suggestion})
                 st.rerun()
 
-# ── Chat history ──────────────────────────────────────────────────────────────
 for msg in st.session_state.messages:
     avatar = "🧑‍💻" if msg["role"] == "user" else "🤖"
     with st.chat_message(msg["role"], avatar=avatar):
         st.markdown(msg["content"])
 
-# ── Chat input ────────────────────────────────────────────────────────────────
 chat_placeholder = (
     "Ask a question about the repository issues or codebase…"
     if _ready else
@@ -738,7 +983,6 @@ if user_input:
     with st.chat_message("user", avatar="🧑‍💻"):
         st.markdown(user_input)
 
-    # ── Validate credentials before querying ──────────────────────────────────
     answer: Optional[str] = None
 
     if not google_api_key:
@@ -755,12 +999,18 @@ if user_input:
         with st.chat_message("assistant", avatar="🤖"):
             with st.spinner("🔍 Searching knowledge graph and generating answer…"):
                 try:
+                    _sel = st.session_state.get("selected_repos") or []
+                    _available = st.session_state.get("available_repos") or []
+                    _active_repos = _sel if (_sel and len(_sel) < len(_available)) else None
+
                     answer = query_graph_cypher(
                         question=user_input,
                         neo4j_uri=neo4j_uri,
                         neo4j_user=neo4j_user,
                         neo4j_pwd=neo4j_pwd,
                         google_api_key=google_api_key,
+                        selected_repos=_active_repos,
+                        deep_scan_days=deep_scan_days,
                     )
                 except neo4j_exc.ServiceUnavailable:
                     answer = (

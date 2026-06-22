@@ -37,12 +37,14 @@
 # =============================================================================
 
 import base64
-import json
+
 import logging
 import os
 import re
 import time
 import ast
+import httpx
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -79,7 +81,6 @@ logger = logging.getLogger("backend_ingest")
 
 GITHUB_API_BASE = "https://api.github.com"
 
-# File/directory filters
 SOURCE_EXTENSIONS = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".java", ".rs",
     ".rb", ".php", ".c", ".cpp", ".h", ".hpp", ".cs", ".swift",
@@ -113,12 +114,11 @@ IGNORED_SUFFIXES = (
     ".tgz", ".ttf", ".woff", ".woff2", ".zip",
 )
 
-# Neo4j batch flush size
 _GRAPH_FLUSH_BATCH = 50
 
 
 # =============================================================================
-#  NEO4J CYPHER TEMPLATES  (shared schema with frontend_chat.py)
+#  NEO4J CYPHER TEMPLATES
 # =============================================================================
 
 CYPHER_CREATE_REPO = """
@@ -127,18 +127,22 @@ MERGE (repo:Repository {full_name: $repo_full_name})
 """
 
 CYPHER_INGEST_FUNCTION = """
-MERGE (file:File {path: $filepath})
+MERGE (repo:Repository {full_name: $repo_full_name})
+MERGE (file:File {path: $filepath, repo: $repo_full_name})
 MERGE (func:Function {id: $func_id})
-  ON CREATE SET 
-    func.name = $func_name, 
-    func.filepath = $filepath, 
-    func.code = $func_code
+  ON CREATE SET
+    func.name     = $func_name,
+    func.filepath = $filepath,
+    func.repo     = $repo_full_name,
+    func.code     = $func_code
 MERGE (file)-[:DECLARES]->(func)
+MERGE (repo)-[:DECLARES]->(func)
 """
 
 CYPHER_INGEST_CALLS = """
-MERGE (caller:Function {id: $caller_id})
-MERGE (callee:Function {name: $callee_name})
+MATCH (caller:Function {id: $caller_id})
+OPTIONAL MATCH (callee:Function {name: $callee_name, repo: $repo_full_name})
+WITH caller, callee WHERE callee IS NOT NULL
 MERGE (caller)-[:CALLS]->(callee)
 """
 
@@ -164,25 +168,27 @@ MERGE (commit)-[:BELONGS_TO]->(repo)
 
 CYPHER_INGEST_FILE = """
 MERGE (repo:Repository {full_name: $repo_full_name})
-MERGE (file:File {path: $filepath})
+MERGE (file:File {path: $filepath, repo: $repo_full_name})
   ON CREATE SET file.repo = $repo_full_name
 MERGE (commit:Commit {sha: $commit_sha})
 MERGE (commit)-[:MODIFIED]->(file)
+MERGE (repo)-[:CONTAINS_FILE]->(file)
 """
 
 CYPHER_INGEST_DEPENDENCY = """
-MERGE (file:File {path: $filepath})
+MERGE (file:File {path: $filepath, repo: $repo_full_name})
 MERGE (module:Module {name: $target_module})
 MERGE (file)-[:DEPENDS_ON]->(module)
 """
 
 CYPHER_TREE_FILE = """
 MERGE (repo:Repository {full_name: $repo_full_name})
-MERGE (file:File {path: $child_path})
-  ON CREATE SET file.repo = $repo_full_name,
+MERGE (file:File {path: $child_path, repo: $repo_full_name})
+  ON CREATE SET file.repo        = $repo_full_name,
                 file.entry_point = $entry_point
-WITH file
-OPTIONAL MATCH (parent:Directory {path: $parent_path})
+MERGE (repo)-[:CONTAINS_FILE]->(file)
+WITH file, repo
+OPTIONAL MATCH (parent:Directory {path: $parent_path, repo: $repo_full_name})
 FOREACH (_ IN CASE WHEN parent IS NOT NULL THEN [1] ELSE [] END |
   MERGE (parent)-[:CONTAINS]->(file)
 )
@@ -190,17 +196,38 @@ FOREACH (_ IN CASE WHEN parent IS NOT NULL THEN [1] ELSE [] END |
 
 CYPHER_TREE_DIR = """
 MERGE (repo:Repository {full_name: $repo_full_name})
-MERGE (dir:Directory {path: $child_path})
-  ON CREATE SET dir.repo = $repo_full_name,
+MERGE (dir:Directory {path: $child_path, repo: $repo_full_name})
+  ON CREATE SET dir.repo    = $repo_full_name,
                 dir.utility = $utility
-WITH dir
-OPTIONAL MATCH (parent:Directory {path: $parent_path})
+MERGE (repo)-[:CONTAINS_DIR]->(dir)
+WITH dir, repo
+OPTIONAL MATCH (parent:Directory {path: $parent_path, repo: $repo_full_name})
 FOREACH (_ IN CASE WHEN parent IS NOT NULL THEN [1] ELSE [] END |
   MERGE (parent)-[:CONTAINS]->(dir)
 )
 """
 
-# Vector index on Issue.embedding (3 072 dims — gemini-embedding-2-preview)
+CYPHER_LINK_REPO_DEPENDENCY = """
+MATCH (f:File {repo: $parent_repo})-[:DEPENDS_ON]->(m:Module)
+WHERE toLower(m.name) CONTAINS toLower($helper_repo_name)
+MERGE (r:Repository {full_name: $helper_repo})
+MERGE (f)-[:USES_REPO]->(r)
+"""
+
+CYPHER_CROSS_REPO_IMPACT = """
+MATCH (helperCommit:Commit {sha: $commit_sha})-[:MODIFIED]->(changed)
+WHERE changed:Function OR changed:File
+WITH collect(changed) AS changedNodes
+MATCH (parentFile:File {repo: $parent_repo})-[:USES_REPO]->(helperRepo:Repository {full_name: $helper_repo})
+OPTIONAL MATCH (parentFunc:Function {repo: $parent_repo})-[:CALLS]->(helperFunc:Function)
+WHERE helperFunc IN changedNodes
+RETURN DISTINCT
+  parentFile.path      AS affected_file,
+  parentFunc.name      AS affected_function,
+  parentFunc.filepath  AS affected_in_file
+ORDER BY affected_file
+"""
+
 CYPHER_VECTOR_INDEX = """
 CREATE VECTOR INDEX issue_embeddings IF NOT EXISTS
 FOR (i:Issue) ON (i.embedding)
@@ -212,13 +239,11 @@ OPTIONS {
 }
 """
 
-# Full-text index for commit-level RAG retrieval
 CYPHER_FULLTEXT_INDEX = """
 CREATE FULLTEXT INDEX commit_summaries IF NOT EXISTS
 FOR (c:Commit) ON EACH [c.summary_text, c.diff_text, c.message]
 """
 
-# Bootstrap status tracking node
 CYPHER_UPSERT_STATUS = """
 MERGE (bs:BootstrapStatus {repo: $repo_full_name})
 SET bs.status            = $status,
@@ -228,13 +253,22 @@ SET bs.status            = $status,
     bs.updated_at        = $updated_at
 """
 
+CYPHER_CONSTRAINT_FILE_REPO = """
+CREATE CONSTRAINT file_repo_unique IF NOT EXISTS
+FOR (f:File) REQUIRE (f.path, f.repo) IS UNIQUE
+"""
 
-# =============================================================================
-#  FILE FILTER UTILITIES
-# =============================================================================
+CYPHER_CONSTRAINT_FUNC_ID = """
+CREATE CONSTRAINT func_id_unique IF NOT EXISTS
+FOR (f:Function) REQUIRE f.id IS UNIQUE
+"""
+
+CYPHER_CLEANUP_UNSCOPED_FILES = "MATCH (f:File)      WHERE f.repo IS NULL DETACH DELETE f"
+CYPHER_CLEANUP_UNSCOPED_DIRS  = "MATCH (d:Directory) WHERE d.repo IS NULL DETACH DELETE d"
+CYPHER_CLEANUP_UNSCOPED_FUNCS = "MATCH (f:Function)  WHERE f.repo IS NULL DETACH DELETE f"
+
 
 def _is_noise_file(filename: str) -> bool:
-    """Return True if this file should be skipped during ingestion."""
     lower_path = filename.lower().replace("\\", "/")
     path_parts = set(lower_path.split("/"))
     if path_parts.intersection(IGNORED_DIRECTORIES):
@@ -245,14 +279,7 @@ def _is_noise_file(filename: str) -> bool:
     return name.endswith(IGNORED_SUFFIXES)
 
 
-# =============================================================================
-#  DEPENDENCY EXTRACTION UTILITIES
-# =============================================================================
-
 def parse_python_ast(filepath: str, source_code: str) -> dict:
-    """
-    Parses a Python file to extract functions, internal calls, and raw source code.
-    """
     if not filepath.endswith(".py") or not source_code:
         return {"functions": [], "calls": []}
 
@@ -261,13 +288,9 @@ def parse_python_ast(filepath: str, source_code: str) -> dict:
     
     try:
         tree = ast.parse(source_code)
-        
-        # 1. Extract Function Boundaries and Code
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                # Safely extract the raw code snippet
                 func_code = ast.get_source_segment(source_code, node) or ""
-                
                 functions.append({
                     "name": node.name,
                     "id": f"{filepath}::{node.name}",
@@ -275,20 +298,16 @@ def parse_python_ast(filepath: str, source_code: str) -> dict:
                     "end": node.end_lineno,
                     "code": func_code
                 })
-                
-                # 2. Extract Function Calls
                 for child in ast.walk(node):
                     if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
                         calls.append((node.name, child.func.id))
-                        
     except Exception:
-        # Broad catch to ignore any files with bad syntax that can't be parsed
         pass
         
     return {"functions": functions, "calls": calls}
 
+
 def _append_dependency(dependencies: list, filepath: str, target_module: str):
-    """Append a dependency edge, deduplicating by (file, module) pair."""
     if not target_module:
         return
     edge = (filepath, "DEPENDS_ON", target_module)
@@ -305,7 +324,6 @@ def _go_file_kind(filepath: str) -> Optional[str]:
 
 
 def _extract_go_dependencies(filepath: str, lines: list, patch_mode: bool = False) -> list:
-    """Parse Go import / require / use / replace statements."""
     dependencies = []
     in_import_block = in_require_block = in_use_block = in_replace_block = False
 
@@ -345,13 +363,11 @@ def _extract_go_dependencies(filepath: str, lines: list, patch_mode: bool = Fals
             parts = stripped.split()
             if len(parts) >= 2: _append_dependency(dependencies, filepath, parts[0])
             continue
-
         if in_use_block:
             if stripped.startswith(")"):
                 in_use_block = False; continue
             _append_dependency(dependencies, filepath, stripped)
             continue
-
         if in_replace_block:
             if stripped.startswith(")"):
                 in_replace_block = False; continue
@@ -361,7 +377,6 @@ def _extract_go_dependencies(filepath: str, lines: list, patch_mode: bool = Fals
                 _append_dependency(dependencies, filepath, right.split()[0] if right else "")
             continue
 
-        # single-line forms
         if stripped.startswith("require "):
             parts = stripped.split()
             if len(parts) >= 3: _append_dependency(dependencies, filepath, parts[1])
@@ -378,7 +393,6 @@ def _extract_go_dependencies(filepath: str, lines: list, patch_mode: bool = Fals
 
 
 def _extract_generic_dependencies(filepath: str, lines: list, patch_mode: bool = False) -> list:
-    """Parse Python / JS / TS / Ruby / C++ / Rust import statements."""
     dependencies = []
     patterns = [
         r"^\s*from\s+([a-zA-Z0-9_./@+-]+)\s+import",
@@ -405,7 +419,6 @@ def _extract_generic_dependencies(filepath: str, lines: list, patch_mode: bool =
 
 
 def extract_imports_from_source(filepath: str, source_code: str) -> list:
-    """Extract import/require statements from full source text (not a diff patch)."""
     kind = _go_file_kind(filepath)
     lines = source_code.split("\n")
     if kind in {"go_mod", "go_work", "go_source"}:
@@ -414,7 +427,6 @@ def extract_imports_from_source(filepath: str, source_code: str) -> list:
 
 
 def extract_file_dependencies(compact_files: list) -> list:
-    """Extract dependencies from diff patches of a list of changed files."""
     dependencies = []
     for item in compact_files:
         source_file = item.get("filename")
@@ -433,10 +445,6 @@ def extract_file_dependencies(compact_files: list) -> list:
     return dependencies
 
 
-# =============================================================================
-#  DIFF UTILITIES
-# =============================================================================
-
 def _truncate(text: str, limit: int = 5000) -> str:
     if not text:
         return ""
@@ -444,7 +452,6 @@ def _truncate(text: str, limit: int = 5000) -> str:
 
 
 def build_compact_diff(files: list, max_files: int = 12) -> list:
-    """Filter noise files, truncate patches, and rank by change size."""
     filtered = []
     for item in files:
         filename = item.get("filename") or item.get("path") or "unknown"
@@ -466,7 +473,6 @@ def build_compact_diff(files: list, max_files: int = 12) -> list:
 
 
 def render_diff_text(files: list) -> str:
-    """Convert compact diff list into a single human-readable block."""
     sections = []
     for item in files:
         sections.append("\n".join([
@@ -480,12 +486,7 @@ def render_diff_text(files: list) -> str:
     return "\n\n".join(sections)
 
 
-# =============================================================================
-#  LLM SUMMARIZATION
-# =============================================================================
-
 def _heuristic_summary(repo_full_name: str, compact_files: list, commit_msg: str) -> str:
-    """Fallback summary when no LLM is available."""
     if not compact_files:
         return f"Commit in {repo_full_name}: {commit_msg[:200]}"
     parts = [
@@ -508,11 +509,6 @@ def summarize_with_llm(
     raw_diff: str,
     google_api_key: Optional[str] = None,
 ) -> str:
-    """
-    Generate an LLM summary of a commit diff using google-genai.
-
-    Falls back to a REST call, then to a heuristic summary if both fail.
-    """
     if not google_api_key:
         return _heuristic_summary(repo_full_name, compact_files, commit_msg)
 
@@ -537,12 +533,11 @@ def summarize_with_llm(
         f"Diff:\n{_truncate(raw_diff, 20000)}"
     )
 
-    # ── Attempt 1: google-genai SDK ───────────────────────────────────────────
     if GENAI_AVAILABLE:
         try:
             client = google_genai.Client(api_key=google_api_key)
             response = client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-3.5-flash",
                 contents=user_prompt,
                 config=genai_types.GenerateContentConfig(
                     system_instruction=system_instruction,
@@ -556,8 +551,7 @@ def summarize_with_llm(
         except Exception as exc:
             logger.debug("google-genai SDK failed: %s", exc)
 
-    # ── Attempt 2: REST fallback ──────────────────────────────────────────────
-    model = "gemini-2.0-flash"
+    model = "gemini-2.5-flash"
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{model}:generateContent?key={google_api_key}"
@@ -596,10 +590,6 @@ def summarize_with_llm(
     return _heuristic_summary(repo_full_name, compact_files, commit_msg)
 
 
-# =============================================================================
-#  GITHUB API HELPERS
-# =============================================================================
-
 def _github_headers(github_token: str) -> dict:
     headers = {
         "Accept": "application/vnd.github+json",
@@ -616,15 +606,46 @@ def _fetch_json(url: str, params=None, github_token: str = "") -> dict:
     return resp.json()
 
 
-def _fetch_commit_files(repo_full_name: str, sha: str, github_token: str):
-    url = f"{GITHUB_API_BASE}/repos/{repo_full_name}/commits/{sha}"
-    payload = _fetch_json(url, github_token=github_token)
-    return payload, payload.get("files", []) or []
+async def _fetch_commit_async(
+    client: httpx.AsyncClient,
+    repo_full_name: str,
+    sha: str,
+    semaphore: asyncio.Semaphore,
+) -> tuple[str, dict, list]:
+    async with semaphore:
+        try:
+            url = f"{GITHUB_API_BASE}/repos/{repo_full_name}/commits/{sha}"
+            resp = await client.get(url, timeout=30)
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 60))
+                await asyncio.sleep(retry_after)
+                resp = await client.get(url, timeout=30)
+            resp.raise_for_status()
+            payload = resp.json()
+            return sha, payload, payload.get("files", []) or []
+        except Exception as exc:
+            logger.warning("Async fetch failed for commit %s: %s", sha[:8], exc)
+            return sha, {}, []
 
 
-# =============================================================================
-#  NEO4J GRAPH WRITE HELPERS
-# =============================================================================
+async def _fetch_all_commits_async(
+    repo_full_name: str,
+    commit_shas: list,
+    github_token: str,
+    max_concurrent: int = 8,
+) -> dict:
+    semaphore = asyncio.Semaphore(max_concurrent)
+    headers = _github_headers(github_token)
+
+    async with httpx.AsyncClient(headers=headers) as client:
+        tasks = [
+            _fetch_commit_async(client, repo_full_name, sha, semaphore)
+            for sha in commit_shas
+        ]
+        results = await asyncio.gather(*tasks)
+
+    return {sha: (payload, files) for sha, payload, files in results}
+
 
 def _write_commit_to_graph(
     driver,
@@ -640,7 +661,6 @@ def _write_commit_to_graph(
     commit_message: str = "",
     commit_url: str = "",
 ):
-    """Write a single Commit node plus its edges to Neo4j."""
     with driver.session() as session:
         session.run(
             CYPHER_INGEST_COMMIT,
@@ -665,12 +685,28 @@ def _write_commit_to_graph(
                 CYPHER_INGEST_DEPENDENCY,
                 filepath=source,
                 target_module=target,
+                repo_full_name=repo_full_name,
             )
 
+def resolve_cross_repo_edges(driver, parent_repo: str, helper_repo: str):
+    helper_repo_name = helper_repo.split("/")[-1]
+    with driver.session() as session:
+        result = session.run(
+            CYPHER_LINK_REPO_DEPENDENCY,
+            parent_repo=parent_repo,
+            helper_repo=helper_repo,
+            helper_repo_name=helper_repo_name,
+        )
+        summary = result.consume()
+        logger.info(
+            "Cross-repo edges: %d USES_REPO relationships created (%s → %s)",
+            summary.counters.relationships_created,
+            parent_repo,
+            helper_repo,
+        )
 
 def _set_status(driver, repo_full_name: str, status: str, detail: str = "",
                 commits_processed: int = 0, files_scanned: int = 0):
-    """Persist bootstrap progress as a BootstrapStatus node in Neo4j."""
     try:
         with driver.session() as session:
             session.run(
@@ -686,17 +722,7 @@ def _set_status(driver, repo_full_name: str, status: str, detail: str = "",
         logger.warning("Could not persist bootstrap status: %s", exc)
 
 
-# =============================================================================
-#  PHASE 1 — REPOSITORY FILE TREE SCAN
-# =============================================================================
-
 def phase1_scan_repo_tree(driver, repo_full_name: str, github_token: str) -> list:
-    """
-    Fetch the full file tree from GitHub via PyGithub and write
-    Directory / File nodes + CONTAINS edges into Neo4j.
-
-    Returns the list of source-file paths suitable for full-content scanning.
-    """
     logger.info("Phase 1 — Fetching repository file tree for %s …", repo_full_name)
 
     auth = Auth.Token(github_token)
@@ -708,13 +734,12 @@ def phase1_scan_repo_tree(driver, repo_full_name: str, github_token: str) -> lis
     source_files = []
     dirs_seen = set()
 
-    # Wrap the tree iterator with tqdm for real-time terminal progress
     with tqdm(tree, desc="  Scanning file tree", unit="item", ncols=88,
                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]") as pbar:
         with driver.session() as session:
             for item in pbar:
                 path = item.path
-                item_type = item.type  # "blob" or "tree"
+                item_type = item.type 
                 pbar.set_postfix_str(path[-50:] if len(path) > 50 else path, refresh=False)
 
                 if _is_noise_file(path):
@@ -756,24 +781,20 @@ def phase1_scan_repo_tree(driver, repo_full_name: str, github_token: str) -> lis
     return source_files
 
 def get_modified_functions(patch_text: str, filepath: str, ast_data:dict)->list:
-    """Reads a Git patch, extracts modified line numbers, and maps them to functions."""
     if not patch_text or not ast_data.get("functions"):
         return[]
 
     modified_lines = set()
 
-    # Extract line numbers from git patch headers
     for line in patch_text.split("\n"):
-        if line.startsWith("@@"):
-            # Example header: @@ -40,5 +40,8 @@
-            match = re.search(r'\+(\d+)(?:,\d+)? @@', line)
+        if line.startswith("@@"):
+            match = re.search(r'\+(\d+)(?:,(\d+))? @@', line)
             if match:
                 start_line = int(match.group(1))
                 line_count = int(match.group(2) or 1)
                 for i in range(start_line, start_line + line_count):
                     modified_lines.add(i)
     
-    # Cross-reference with AST function boundaries
     modified_funcs = set()
     for func in ast_data["functions"]:
         func_range = set(range(func["start"], func["end"] + 1))
@@ -782,10 +803,6 @@ def get_modified_functions(patch_text: str, filepath: str, ast_data:dict)->list:
 
     return list(modified_funcs)
 
-
-# =============================================================================
-#  PHASE 2 — FILE CONTENT / DEPENDENCY SCAN
-# =============================================================================
 
 def phase2_scan_file_contents(
     driver,
@@ -804,8 +821,13 @@ def phase2_scan_file_contents(
         if not batch_params:
             return
         with driver.session() as sess:
-            for filepath, target_module in batch_params:
-                sess.run(CYPHER_INGEST_DEPENDENCY, filepath=filepath, target_module=target_module)
+            for filepath, target_module, repo_fn in batch_params:
+                sess.run(
+                    CYPHER_INGEST_DEPENDENCY,
+                    filepath=filepath,
+                    target_module=target_module,
+                    repo_full_name=repo_fn,
+                )
         batch_params.clear()
 
     with tqdm(file_paths, desc="  Dependency scan", unit="file", ncols=88,
@@ -821,27 +843,30 @@ def phase2_scan_file_contents(
 
                 source_code = base64.b64decode(content_b64).decode("utf-8", errors="replace")
                 
-                # 1. Dependency Extraction
                 deps = extract_imports_from_source(path, source_code)
                 for source, _rel, target in deps:
-                    batch_params.append((source, target))
+                    batch_params.append((source, target, repo_full_name))
 
-                # 2. NEW: AST Extraction and DB Write
                 ast_data = parse_python_ast(path, source_code)
                 with driver.session() as sess:
-                    # Write Functions
                     for func in ast_data["functions"]:
-                        sess.run(CYPHER_INGEST_FUNCTION, 
-                                 filepath=path, 
-                                 func_id=func["id"], 
-                                 func_name=func["name"],
-                                 func_code=func.get("code", "")) # <--- FIXED: Safely accessing the dict
-                                 
-                    # Write Calls
+                        prefixed_id = f"{repo_full_name}::{func['id']}"
+                        sess.run(
+                            CYPHER_INGEST_FUNCTION,
+                            repo_full_name=repo_full_name,
+                            filepath=path,
+                            func_id=prefixed_id,
+                            func_name=func["name"],
+                            func_code=func.get("code", ""),
+                        )
                     for caller, callee in ast_data["calls"]:
-                        caller_id = f"{path}::{caller}"
-                        sess.run(CYPHER_INGEST_CALLS, 
-                                 caller_id=caller_id, callee_name=callee)
+                        caller_id = f"{repo_full_name}::{path}::{caller}"
+                        sess.run(
+                            CYPHER_INGEST_CALLS,
+                            caller_id=caller_id,
+                            callee_name=callee,
+                            repo_full_name=repo_full_name,
+                        )
 
                 scanned += 1
                 if scanned % _GRAPH_FLUSH_BATCH == 0:
@@ -863,10 +888,6 @@ def phase2_scan_file_contents(
     return scanned
 
 
-# =============================================================================
-#  PHASE 3 — COMMIT HISTORY BACKFILL
-# =============================================================================
-
 def phase3_backfill_commits(
     driver,
     repo_full_name: str,
@@ -874,14 +895,8 @@ def phase3_backfill_commits(
     google_api_key: str,
     max_commits: int = 200,
     deep_scan_days: int = 7,
+    skip_llm: bool = False
 ) -> int:
-    """
-    Walk the repository's commit history via the GitHub REST API, generate an
-    LLM summary for each commit diff, and write Commit / User / File nodes
-    and AUTHORED / MODIFIED / DEPENDS_ON edges to Neo4j.
-
-    Returns the total number of commits processed.
-    """
     logger.info(
         "Phase 3 — Backfilling up to %d commits for %s …", max_commits, repo_full_name
     )
@@ -891,7 +906,6 @@ def phase3_backfill_commits(
     per_page = 100
     commit_shas: list[str] = []
 
-    # ── Step 1: collect commit SHAs up to the max ────────────────────────────
     print("\n  Collecting commit list …")
     while len(commit_shas) < max_commits:
         try:
@@ -920,17 +934,43 @@ def phase3_backfill_commits(
             logger.warning("Error fetching commit page %d: %s", page, exc)
             break
 
-    total = len(commit_shas)
-    logger.info("  Found %d commits to process.", total)
+    # --- INCREMENTAL INGESTION FIX ---
+    print("\n  Checking Neo4j for existing commits to save tokens …")
+    existing_shas = set()
+    try:
+        with driver.session() as session:
+            result = session.run("MATCH (c:Commit) RETURN c.sha AS sha")
+            existing_shas = {record["sha"] for record in result}
+    except Exception as exc:
+        logger.warning("Could not fetch existing commits: %s", exc)
 
-    # ── Step 2: process each commit with a tqdm progress bar ─────────────────
+    new_commit_shas = [sha for sha in commit_shas if sha not in existing_shas]
+    skipped = len(commit_shas) - len(new_commit_shas)
+    
+    logger.info("  Skipping %d already ingested commits.", skipped)
+    logger.info("  Proceeding with %d new commits.", len(new_commit_shas))
+    
+    commit_shas = new_commit_shas
+    
+    if not commit_shas:
+        logger.info("  No new commits to process. Exiting Phase 3 early.")
+        return 0
+    # ---------------------------------
+
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=deep_scan_days)
+    print("\n  Fetching commit diffs concurrently…")
+    commit_data = asyncio.run(
+        _fetch_all_commits_async(repo_full_name, commit_shas, github_token)
+    )
+
     with tqdm(commit_shas, desc="  Backfilling commits", unit="commit", ncols=88,
                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
         for sha in pbar:
             pbar.set_postfix_str(sha[:8], refresh=False)
             try:
-                commit_payload, files = _fetch_commit_files(repo_full_name, sha, github_token)
+                commit_payload, files = commit_data.get(sha, ({}, []))
+                if not commit_payload:
+                    continue
                 compact_files = build_compact_diff(files)
 
                 commit_info = commit_payload.get("commit", {})
@@ -955,13 +995,17 @@ def phase3_backfill_commits(
                     commit_dt = datetime.strptime(commit_date, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
                     is_deep_scan = commit_dt >= cutoff_date
 
-                summary_text = summarize_with_llm(
-                    repo_full_name=repo_full_name,
-                    actor_login=actor_login,
-                    commit_msg=commit_msg,
-                    compact_files=compact_files,
-                    raw_diff=raw_diff,
-                    google_api_key=google_api_key,
+                summary_text = (
+                    _heuristic_summary(repo_full_name, compact_files, commit_msg)
+                    if skip_llm
+                    else summarize_with_llm(
+                        repo_full_name=repo_full_name,
+                        actor_login=actor_login,
+                        commit_msg=commit_msg,
+                        compact_files=compact_files,
+                        raw_diff=raw_diff,
+                        google_api_key=google_api_key,
+                    )
                 )
 
                 _write_commit_to_graph(
@@ -982,27 +1026,22 @@ def phase3_backfill_commits(
                     for item in compact_files:
                         filepath = item["filename"]
                         patch = item.get("patch", "")
-
-                try:
-                    raw_url = f"{GITHUB_API_BASE}/repos/{repo_full_name}/contents/{filepath}?ref={sha}"
-                    raw_data = _fetch_json(raw_url, github_token=github_token)
-                    raw_code = base64.b64decode(raw_data["content"]).decode("utf-8")
-
-                    # Parse AST and map the diff
-                    historical_ast = parse_python_ast(filepath, raw_code)
-                    mod_funcs = get_modified_functions(patch, filepath, historical_ast)
-
-                    with driver.session() as sess:
-                        for func_id in mod_funcs:
-                            sess.run(CYPHER_MODIFIED_FUNCTION,
-                                     commit_sha = sha, func_id=func_id)
-                
-                except Excepton as e:
-                    # Skip the file was deleted or cannot be parsed
-                    pass
+                        try:
+                            raw_url = f"{GITHUB_API_BASE}/repos/{repo_full_name}/contents/{filepath}?ref={sha}"
+                            raw_data = _fetch_json(raw_url, github_token=github_token)
+                            raw_code = base64.b64decode(raw_data["content"]).decode("utf-8")
+                            historical_ast = parse_python_ast(filepath, raw_code)
+                            mod_funcs = get_modified_functions(patch, filepath, historical_ast)
+                            with driver.session() as sess:
+                                for func_id in mod_funcs:
+                                    prefixed_id = f"{repo_full_name}::{func_id}"
+                                    sess.run(CYPHER_MODIFIED_FUNCTION,
+                                             commit_sha=sha, func_id=prefixed_id)
+                        except Exception:
+                            pass
 
                 processed += 1
-                time.sleep(0.5)  # GitHub rate-limit courtesy pause
+                time.sleep(0.5)
 
             except requests.exceptions.HTTPError as exc:
                 if exc.response is not None and exc.response.status_code == 403:
@@ -1014,13 +1053,9 @@ def phase3_backfill_commits(
                 tqdm.write(f"[WARN] Failed to process commit {sha[:8]}: {exc}")
                 continue
 
-    logger.info("Phase 3 complete — %d/%d commits ingested.", processed, total)
+    logger.info("Phase 3 complete — %d/%d commits ingested.", processed, len(commit_shas))
     return processed
 
-
-# =============================================================================
-#  MAIN BOOTSTRAP PIPELINE
-# =============================================================================
 
 def bootstrap(
     repo_full_name: str,
@@ -1030,19 +1065,12 @@ def bootstrap(
     neo4j_user: str,
     neo4j_password: str,
     max_commits: int = 200,
+    skip_llm: bool = False,
 ):
-    """
-    Full end-to-end bootstrap pipeline:
-      1. Connect to Neo4j and create indexes
-      2. Phase 1 — Scan repository file tree  → Directory / File nodes
-      3. Phase 2 — Scan file contents         → DEPENDS_ON Module edges
-      4. Phase 3 — Backfill commit history    → Commit / User nodes + summaries
-    """
     print("=" * 70)
     print(f"  GraphRAG Ingest Pipeline — {repo_full_name}")
     print("=" * 70)
 
-    # ── Connect to Neo4j ──────────────────────────────────────────────────────
     logger.info("Connecting to Neo4j at %s …", neo4j_uri)
     driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
     try:
@@ -1052,7 +1080,6 @@ def bootstrap(
         logger.error("Cannot connect to Neo4j: %s", exc)
         raise SystemExit(1) from exc
 
-    # ── Create repository node ────────────────────────────────────────────────
     auth = Auth.Token(github_token)
     gh = Github(auth=auth)
     try:
@@ -1069,29 +1096,43 @@ def bootstrap(
             repo_url=repo.html_url,
         )
 
-    # ── Create indexes ────────────────────────────────────────────────────────
-    logger.info("Creating Neo4j indexes …")
+    logger.info("Creating Neo4j indexes and constraints …")
     for cypher, label in [
-        (CYPHER_VECTOR_INDEX,   "vector index issue_embeddings"),
-        (CYPHER_FULLTEXT_INDEX, "fulltext index commit_summaries"),
+        (CYPHER_VECTOR_INDEX,         "vector index issue_embeddings"),
+        (CYPHER_FULLTEXT_INDEX,       "fulltext index commit_summaries"),
+        (CYPHER_CONSTRAINT_FILE_REPO, "composite uniqueness: File(path, repo)"),
+        (CYPHER_CONSTRAINT_FUNC_ID,   "uniqueness: Function(id)"),
     ]:
         try:
             with driver.session() as session:
                 session.run(cypher)
             logger.info("  ✓ %s", label)
         except Exception as exc:
-            logger.warning("  Index note (%s): %s", label, exc)
+            logger.warning("  Index/constraint note (%s): %s", label, exc)
+
+    logger.info("Pre-flight orphan cleanup …")
+    for cypher, label in [
+        (CYPHER_CLEANUP_UNSCOPED_FILES, "unscoped File nodes"),
+        (CYPHER_CLEANUP_UNSCOPED_DIRS,  "unscoped Directory nodes"),
+        (CYPHER_CLEANUP_UNSCOPED_FUNCS, "unscoped Function nodes"),
+    ]:
+        try:
+            with driver.session() as session:
+                result  = session.run(cypher)
+                deleted = result.consume().counters.nodes_deleted
+                if deleted:
+                    logger.info("  ✓ Cleaned up %d %s", deleted, label)
+        except Exception as exc:
+            logger.warning("  Cleanup note (%s): %s", label, exc)
 
     _set_status(driver, repo_full_name, "in_progress", "Starting Phase 1 …")
 
-    # ── Phase 1: File tree ────────────────────────────────────────────────────
     print()
     source_files = phase1_scan_repo_tree(driver, repo_full_name, github_token)
     _set_status(driver, repo_full_name, "in_progress",
                 f"Phase 1 done — {len(source_files)} source files indexed.",
                 files_scanned=len(source_files))
 
-    # ── Phase 2: File content / dependency scan ───────────────────────────────
     print()
     files_scanned = phase2_scan_file_contents(
         driver, repo_full_name, source_files, github_token
@@ -1100,13 +1141,11 @@ def bootstrap(
                 f"Phase 2 done — {files_scanned} files scanned for imports.",
                 files_scanned=files_scanned)
 
-    # ── Phase 3: Commit backfill ──────────────────────────────────────────────
     print()
     commits_processed = phase3_backfill_commits(
-        driver, repo_full_name, github_token, google_api_key, max_commits
+        driver, repo_full_name, github_token, google_api_key, max_commits, skip_llm=skip_llm,
     )
 
-    # ── Finalise ──────────────────────────────────────────────────────────────
     _set_status(
         driver,
         repo_full_name,
@@ -1128,16 +1167,9 @@ def bootstrap(
     print(f"      Commits stored : {commits_processed}")
     print("=" * 70)
 
-
-# =============================================================================
-#  ENTRY POINT
-# =============================================================================
-
 if __name__ == "__main__":
-    # Load .env if present
     load_dotenv()
 
-    # ── Read configuration from environment ───────────────────────────────────
     GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN", "")
     GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
     NEO4J_URI      = os.environ.get("NEO4J_URI",      "neo4j://localhost:7687")
@@ -1145,8 +1177,8 @@ if __name__ == "__main__":
     NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "")
     TARGET_REPO    = os.environ.get("TARGET_REPO",    "neo4j/neo4j-graphrag-python")
     MAX_COMMITS    = int(os.environ.get("MAX_COMMITS", "200"))
+    SKIP_LLM       = os.environ.get("SKIP_LLM", "false").lower() == "true"
 
-    # ── Validate required variables ───────────────────────────────────────────
     missing = []
     if not GITHUB_TOKEN:   missing.append("GITHUB_TOKEN")
     if not NEO4J_PASSWORD: missing.append("NEO4J_PASSWORD")
@@ -1159,7 +1191,6 @@ if __name__ == "__main__":
     if not GOOGLE_API_KEY:
         print("[WARN] GOOGLE_API_KEY not set — LLM summaries will use heuristics.")
 
-    # ── Run the pipeline ──────────────────────────────────────────────────────
     bootstrap(
         repo_full_name=TARGET_REPO,
         github_token=GITHUB_TOKEN,
@@ -1168,4 +1199,5 @@ if __name__ == "__main__":
         neo4j_user=NEO4J_USER,
         neo4j_password=NEO4J_PASSWORD,
         max_commits=MAX_COMMITS,
+        skip_llm=SKIP_LLM,
     )
