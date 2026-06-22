@@ -18,6 +18,8 @@
 #   NEO4J_PASSWORD    — Neo4j password
 #   TARGET_REPO       — "owner/repo" to ingest  (default: neo4j/neo4j-graphrag-python)
 #   MAX_COMMITS       — Maximum commits to backfill (default: 200)
+#   FORCE_LLM_UPDATE  — If "true", re-process all commits through the LLM even if
+#                       they already exist in Neo4j (overwrites heuristic summaries)
 #
 # DOCKER (quick Neo4j setup):
 #   docker run --name neo4j-graphrag \
@@ -54,6 +56,18 @@ from github import Auth, Github, GithubException
 from neo4j import GraphDatabase
 from tqdm import tqdm
 
+# ── AST Parsing Dependencies ───────────────────────────────────────────────
+
+try:
+    import tree_sitter_go as tsgo
+    from tree_sitter import Language, Parser
+    
+    GO_LANGUAGE = Language(tsgo.language())
+    go_parser = Parser(GO_LANGUAGE)
+    TREE_SITTER_AVAILABLE = True
+except ImportError:
+    TREE_SITTER_AVAILABLE = False
+    print("[WARN] tree-sitter or tree-sitter-go not installed. Go function parsing will be skipped.")
 
 # ── Google Gemini (google-genai SDK) ─────────────────────────────────────────
 try:
@@ -156,7 +170,7 @@ CYPHER_INGEST_COMMIT = """
 MERGE (repo:Repository {full_name: $repo_full_name})
 MERGE (author:User {login: $actor_login})
 MERGE (commit:Commit {sha: $commit_sha})
-  ON CREATE SET
+SET
     commit.timestamp    = $committed_at,
     commit.summary_text = $summary_text,
     commit.diff_text    = $diff_text,
@@ -267,6 +281,8 @@ CYPHER_CLEANUP_UNSCOPED_FILES = "MATCH (f:File)      WHERE f.repo IS NULL DETACH
 CYPHER_CLEANUP_UNSCOPED_DIRS  = "MATCH (d:Directory) WHERE d.repo IS NULL DETACH DELETE d"
 CYPHER_CLEANUP_UNSCOPED_FUNCS = "MATCH (f:Function)  WHERE f.repo IS NULL DETACH DELETE f"
 
+CYPHER_MARK_FILE_SCANNED = "MATCH (file:File {path: $filepath, repo: $repo_full_name}) SET file.content_scanned = true"
+
 
 def _is_noise_file(filename: str) -> bool:
     lower_path = filename.lower().replace("\\", "/")
@@ -304,6 +320,68 @@ def parse_python_ast(filepath: str, source_code: str) -> dict:
     except Exception:
         pass
         
+    return {"functions": functions, "calls": calls}
+
+def parse_go_ast(filepath: str, source_code: str) -> dict:
+    if not TREE_SITTER_AVAILABLE or not filepath.endswith(".go") or not source_code:
+        return {"functions": [], "calls": []}
+
+    try:
+        tree = go_parser.parse(bytes(source_code, "utf8"))
+    except Exception as exc:
+        logger.debug("Failed to parse Go AST for %s: %s", filepath, exc)
+        return {"functions": [], "calls": []}
+
+    functions = []
+    calls = []
+
+    def get_text(node):
+        return source_code[node.start_byte:node.end_byte]
+
+    def walk(node, current_func=None):
+        new_func = current_func
+        
+        # 1. Identify Function and Method Declarations
+        if node.type in ['function_declaration', 'method_declaration']:
+            name_node = None
+            for child in node.children:
+                if child.type in ['identifier', 'field_identifier']:
+                    name_node = child
+                    break
+            
+            if name_node:
+                name = get_text(name_node)
+                new_func = name
+                functions.append({
+                    "name": name,
+                    "id": f"{filepath}::{name}",
+                    # Tree-sitter lines are 0-indexed, we convert to 1-indexed
+                    "start": node.start_point[0] + 1, 
+                    "end": node.end_point[0] + 1,
+                    "code": get_text(node)
+                })
+
+        # 2. Identify Function Calls within a function
+        elif node.type == 'call_expression' and current_func:
+            func_node = node.children[0]
+            callee_name = None
+            
+            if func_node.type == 'identifier': # e.g., foo()
+                callee_name = get_text(func_node)
+            elif func_node.type == 'selector_expression': # e.g., pkg.foo() or obj.foo()
+                for child in func_node.children:
+                    if child.type == 'field_identifier':
+                        callee_name = get_text(child)
+                        break
+            
+            if callee_name:
+                calls.append((current_func, callee_name))
+
+        # Recurse through children
+        for child in node.children:
+            walk(child, new_func)
+
+    walk(tree.root_node)
     return {"functions": functions, "calls": calls}
 
 
@@ -847,7 +925,10 @@ def phase2_scan_file_contents(
                 for source, _rel, target in deps:
                     batch_params.append((source, target, repo_full_name))
 
-                ast_data = parse_python_ast(path, source_code)
+                if path.endswith(".go"):
+                    ast_data = parse_go_ast(path, source_code)
+                else:
+                    ast_data = parse_python_ast(path, source_code)
                 with driver.session() as sess:
                     for func in ast_data["functions"]:
                         prefixed_id = f"{repo_full_name}::{func['id']}"
@@ -867,6 +948,11 @@ def phase2_scan_file_contents(
                             callee_name=callee,
                             repo_full_name=repo_full_name,
                         )
+                    sess.run(
+                        CYPHER_MARK_FILE_SCANNED,
+                        filepath=path,
+                        repo_full_name=repo_full_name,
+                    )
 
                 scanned += 1
                 if scanned % _GRAPH_FLUSH_BATCH == 0:
@@ -895,7 +981,8 @@ def phase3_backfill_commits(
     google_api_key: str,
     max_commits: int = 200,
     deep_scan_days: int = 7,
-    skip_llm: bool = False
+    skip_llm: bool = False,
+    force_llm_update: bool = False,
 ) -> int:
     logger.info(
         "Phase 3 — Backfilling up to %d commits for %s …", max_commits, repo_full_name
@@ -934,7 +1021,7 @@ def phase3_backfill_commits(
             logger.warning("Error fetching commit page %d: %s", page, exc)
             break
 
-    # --- INCREMENTAL INGESTION FIX ---
+    # --- INCREMENTAL INGESTION ---
     print("\n  Checking Neo4j for existing commits to save tokens …")
     existing_shas = set()
     try:
@@ -944,18 +1031,23 @@ def phase3_backfill_commits(
     except Exception as exc:
         logger.warning("Could not fetch existing commits: %s", exc)
 
-    new_commit_shas = [sha for sha in commit_shas if sha not in existing_shas]
-    skipped = len(commit_shas) - len(new_commit_shas)
-    
-    logger.info("  Skipping %d already ingested commits.", skipped)
-    logger.info("  Proceeding with %d new commits.", len(new_commit_shas))
-    
-    commit_shas = new_commit_shas
-    
-    if not commit_shas:
-        logger.info("  No new commits to process. Exiting Phase 3 early.")
-        return 0
-    # ---------------------------------
+    if force_llm_update and existing_shas:
+        logger.info(
+            "  FORCE_LLM_UPDATE=true — re-processing all %d commits through the LLM "
+            "to overwrite heuristic summaries (skipping none).",
+            len(commit_shas),
+        )
+    else:
+        new_commit_shas = [sha for sha in commit_shas if sha not in existing_shas]
+        skipped = len(commit_shas) - len(new_commit_shas)
+        logger.info("  Skipping %d already ingested commits.", skipped)
+        logger.info("  Proceeding with %d new commits.", len(new_commit_shas))
+        commit_shas = new_commit_shas
+
+        if not commit_shas:
+            logger.info("  No new commits to process. Exiting Phase 3 early.")
+            return 0
+    # --------------------------------
 
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=deep_scan_days)
     print("\n  Fetching commit diffs concurrently…")
@@ -1030,7 +1122,10 @@ def phase3_backfill_commits(
                             raw_url = f"{GITHUB_API_BASE}/repos/{repo_full_name}/contents/{filepath}?ref={sha}"
                             raw_data = _fetch_json(raw_url, github_token=github_token)
                             raw_code = base64.b64decode(raw_data["content"]).decode("utf-8")
-                            historical_ast = parse_python_ast(filepath, raw_code)
+                            if filepath.endswith(".go"):
+                                historical_ast = parse_go_ast(filepath, raw_code)
+                            else:
+                                historical_ast = parse_python_ast(filepath, raw_code)
                             mod_funcs = get_modified_functions(patch, filepath, historical_ast)
                             with driver.session() as sess:
                                 for func_id in mod_funcs:
@@ -1057,6 +1152,29 @@ def phase3_backfill_commits(
     return processed
 
 
+def get_unprocessed_files(driver, repo_full_name: str, source_files: list) -> list:
+    """Return only the files that have not yet been fully scanned in Phase 2."""
+    already_scanned: set[str] = set()
+    try:
+        with driver.session() as session:
+            result = session.run(
+                "MATCH (f:File {repo: $repo, content_scanned: true}) RETURN f.path AS path",
+                repo=repo_full_name,
+            )
+            already_scanned = {record["path"] for record in result}
+    except Exception as exc:
+        logger.warning("Could not fetch already-scanned files: %s", exc)
+
+    unprocessed = [f for f in source_files if f not in already_scanned]
+    skipped = len(source_files) - len(unprocessed)
+    if skipped:
+        logger.info(
+            "  Resuming Phase 2 — skipping %d already-scanned file(s), %d remaining.",
+            skipped, len(unprocessed),
+        )
+    return unprocessed
+
+
 def bootstrap(
     repo_full_name: str,
     github_token: str,
@@ -1066,6 +1184,7 @@ def bootstrap(
     neo4j_password: str,
     max_commits: int = 200,
     skip_llm: bool = False,
+    force_llm_update: bool = False,
 ):
     print("=" * 70)
     print(f"  GraphRAG Ingest Pipeline — {repo_full_name}")
@@ -1134,8 +1253,9 @@ def bootstrap(
                 files_scanned=len(source_files))
 
     print()
+    unscanned_files = get_unprocessed_files(driver, repo_full_name, source_files)
     files_scanned = phase2_scan_file_contents(
-        driver, repo_full_name, source_files, github_token
+        driver, repo_full_name, unscanned_files, github_token
     )
     _set_status(driver, repo_full_name, "in_progress",
                 f"Phase 2 done — {files_scanned} files scanned for imports.",
@@ -1143,7 +1263,9 @@ def bootstrap(
 
     print()
     commits_processed = phase3_backfill_commits(
-        driver, repo_full_name, github_token, google_api_key, max_commits, skip_llm=skip_llm,
+        driver, repo_full_name, github_token, google_api_key, max_commits,
+        skip_llm=skip_llm,
+        force_llm_update=force_llm_update,
     )
 
     _set_status(
@@ -1175,9 +1297,10 @@ if __name__ == "__main__":
     NEO4J_URI      = os.environ.get("NEO4J_URI",      "neo4j://localhost:7687")
     NEO4J_USER     = os.environ.get("NEO4J_USER",     "neo4j")
     NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "")
-    TARGET_REPO    = os.environ.get("TARGET_REPO",    "neo4j/neo4j-graphrag-python")
-    MAX_COMMITS    = int(os.environ.get("MAX_COMMITS", "200"))
-    SKIP_LLM       = os.environ.get("SKIP_LLM", "false").lower() == "true"
+    TARGET_REPO       = os.environ.get("TARGET_REPO",       "neo4j/neo4j-graphrag-python")
+    MAX_COMMITS       = int(os.environ.get("MAX_COMMITS", "200"))
+    SKIP_LLM          = os.environ.get("SKIP_LLM",          "false").lower() == "true"
+    FORCE_LLM_UPDATE  = os.environ.get("FORCE_LLM_UPDATE",  "false").lower() == "true"
 
     missing = []
     if not GITHUB_TOKEN:   missing.append("GITHUB_TOKEN")
@@ -1200,4 +1323,5 @@ if __name__ == "__main__":
         neo4j_password=NEO4J_PASSWORD,
         max_commits=MAX_COMMITS,
         skip_llm=SKIP_LLM,
+        force_llm_update=FORCE_LLM_UPDATE,
     )

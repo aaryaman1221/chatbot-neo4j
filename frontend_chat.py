@@ -6,6 +6,7 @@
 import logging
 import os
 import traceback
+import re
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -427,96 +428,48 @@ def _fetch_commit_context(
     except Exception:
         return ""
 
-def analyze_cross_repo_impact(
-    driver,
-    helper_repo: str,
-    parent_repo: str,
-    commit_sha: str,
-    google_api_key: str,
-    neo4j_uri: str,
-    neo4j_user: str,
-    neo4j_pwd: str,
-) -> str:
-    affected_rows = []
-    try:
-        with driver.session() as session:
-            result = session.run(
-                """
-                MATCH (helperCommit:Commit {sha: $commit_sha})-[:MODIFIED]->(changed)
-                WHERE changed:Function OR changed:File
-                WITH collect(changed) AS changedNodes
-                MATCH (parentFile:File {repo: $parent_repo})-[:USES_REPO]->
-                      (helperRepo:Repository {full_name: $helper_repo})
-                OPTIONAL MATCH (parentFunc:Function)-[:CALLS]->(helperFunc:Function)
-                WHERE parentFunc.repo = $parent_repo AND helperFunc IN changedNodes
-                RETURN DISTINCT
-                    parentFile.path      AS affected_file,
-                    parentFunc.name      AS affected_function,
-                    parentFunc.code      AS affected_code
-                ORDER BY affected_file
-                """,
-                commit_sha=commit_sha,
-                parent_repo=parent_repo,
-                helper_repo=helper_repo,
-            )
-            affected_rows = result.data()
-    except Exception as exc:
-        return f"❌ **Graph query failed:** {exc}"
 
-    if not affected_rows:
-        return (
-            f"✅ No direct impact detected in `{parent_repo}` "
-            f"from commit `{commit_sha[:8]}` in `{helper_repo}`. "
-            "Either the cross-repo edges haven't been resolved yet "
-            "(run `resolve_cross_repo_edges` in the backend), "
-            "or this commit doesn't touch anything the parent imports."
-        )
+# def extract_evidence(text):
+#     evidence = set()
 
-    context_lines = [f"Helper repo: {helper_repo}", f"Parent repo: {parent_repo}",
-                     f"Commit: {commit_sha[:8]}", "", "Affected parent-repo code:"]
-    for row in affected_rows:
-        context_lines.append(f"\nFile: {row.get('affected_file', '?')}")
-        if row.get("affected_function"):
-            context_lines.append(f"Function: {row['affected_function']}")
-        if row.get("affected_code"):
-            snippet = (row["affected_code"] or "")[:800]
-            context_lines.append(f"Code:\n{snippet}")
-    context = "\n".join(context_lines)
+#     # Fixed: Removed capturing groups or converted them to non-capturing (?:...)
+#     # so re.findall returns the entire match instead of just the extension/name.
+#     patterns = [
+#         r'[\w/\-]+\.(?:py|js|ts|go|java|cpp)', 
+#         r'Commit\s+[a-f0-9]{7,40}',
+#         r'Function:\s*[A-Za-z_][A-Za-z0-9_]*',
+#         r'Module:\s*[A-Za-z0-9_\-.]+'
+#     ]
 
-    commit_summary = ""
-    try:
-        with driver.session() as session:
-            rec = session.run(
-                "MATCH (c:Commit {sha: $sha}) RETURN c.summary_text AS s, c.message AS m",
-                sha=commit_sha,
-            ).single()
-            if rec:
-                commit_summary = rec.get("s") or rec.get("m") or ""
-    except Exception:
-        pass
+#     for pattern in patterns:
+#         for match in re.findall(pattern, text):
+#             evidence.add(str(match))
 
-    prompt = (
-        f"A commit was made to the helper library `{helper_repo}`.\n"
-        f"Commit summary: {commit_summary[:400]}\n\n"
-        f"The following code in the parent repo `{parent_repo}` directly "
-        f"depends on what changed:\n\n{context}\n\n"
-        "For each affected file and function:\n"
-        "1. Explain what might break and why.\n"
-        "2. Suggest the minimal code change needed to fix or adapt it.\n"
-        "Be specific and concise. Do not repeat the full code back."
-    )
+#     return sorted(list(evidence))
+def extract_evidence_count(text: str) -> int:
+    """Counts the bullet points in the LLM's Evidence section to drive the confidence score."""
+    if "## Evidence" in text:
+        # Split the text at the Evidence header and count the bullets in that section
+        evidence_section = text.split("## Evidence")[-1]
+        return evidence_section.count("- ") + evidence_section.count("* ")
+    return 0
 
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        google_api_key=google_api_key,
-        temperature=0.2,
-    )
-    try:
-        response = llm.invoke(prompt)
-        return response.content
-    except Exception as exc:
-        return f"❌ **LLM call failed:** {exc}"
+def fetch_impact_analysis(driver, module_name):
+    
+    query="""
+    MATCH (f:File)-[:DEPENDS_ON]->(m:Module)
+    WHERE toLower(m.name) CONTAINS toLower($module)
+    
+    OPTIONAL MATCH (f)-[:DECLARES]->(fn:Function)
+    
+    RETURN
+        f.path AS file,
+        collect(fn.name) AS functions
+    LIMIT 20
+    """
+
+    with driver.session() as session:
+        return session.run(query, module=module_name).data()
 
 def query_graph_cypher(
     question: str,
@@ -524,8 +477,9 @@ def query_graph_cypher(
     neo4j_user: str,
     neo4j_pwd: str,
     google_api_key: str,
+    driver,
     selected_repos: Optional[list] = None,
-    deep_scan_days: int = 30,
+    top_k: int = 5,
 ) -> str:
     graph = Neo4jGraph(
         url=neo4j_uri,
@@ -536,31 +490,26 @@ def query_graph_cypher(
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash",
         google_api_key=google_api_key,
-        temperature=0.0 
+        temperature=0.0,
     )
 
-    from datetime import datetime, timezone, timedelta as _td
-    if deep_scan_days > 0:
-        _cutoff_str = (datetime.now(timezone.utc) - _td(days=deep_scan_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        _time_hint = (
-            f"6. RETRIEVAL DEPTH: The user set a {deep_scan_days}-day window. "
-            f"When querying Commit nodes by recency, prefer filtering with "
-            f"`WHERE c.timestamp >= '{_cutoff_str}'` unless the question asks for older history."
-        )
-    else:
-        _time_hint = "6. RETRIEVAL DEPTH: No time limit — search the full commit history."
+    qa_llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        google_api_key=google_api_key,
+        temperature=0.0,
+    )
 
     if selected_repos:
         _repo_list = "[" + ", ".join(f'"{r}"' for r in selected_repos) + "]"
         _repo_hint = (
-            f"7. REPO SCOPE & CROSS-REPO: The user has selected {len(selected_repos)} repositories: {_repo_list}. "
+            f"6. REPO SCOPE & CROSS-REPO: The user has selected {len(selected_repos)} repositories: {_repo_list}. "
             f"When filtering File, Directory, or Function nodes, use `WHERE n.repo IN {_repo_list}`. "
             f"CRITICAL: `Module` nodes do NOT have a `repo` property. To find shared dependencies, you must traverse "
             f"from Files to Modules (e.g., `(f:File)-[:DEPENDS_ON]->(m:Module)`)."
         )
     else:
         _repo_hint = (
-            "7. REPO SCOPE: All repositories are in scope. "
+            "6. REPO SCOPE: All repositories are in scope. "
             "No repository filtering is needed — search the full graph."
         )
 
@@ -572,10 +521,9 @@ def query_graph_cypher(
         "    3. CRITICAL: A 'WHERE' clause must immediately follow a 'MATCH', 'OPTIONAL MATCH', 'YIELD', or 'WITH' clause. Never place 'WHERE' randomly.\n"
         "    4. CRITICAL: When filtering by ANY string property (file paths, modules, authors, or repo names), ALWAYS use case-insensitive `CONTAINS`. Example: `WHERE toLower(f.repo) CONTAINS toLower('tqdm')`. NEVER use exact `=` matching for strings.\n"
         "    5. Do not include any explanations, apologies, or markdown formatting (like ```cypher). Return ONLY the raw query string.\n"
-        f"    {_time_hint}\n"
         f"    {_repo_hint}\n"
-        "    8. RETURN CLAUSES: When asked about relationships (dependencies, calls, imports), return the connected node properties. Only return relationship properties if they actually exist in the provided schema.\n"
-        "    9. SYMBOL & BLAST-RADIUS ANALYSIS: The graph tracks module-level edges (`File-[:DEPENDS_ON]->Module`, `Function-[:CALLS]->Function`), NOT individual imported names "
+        "    7. RETURN CLAUSES: When asked about relationships (dependencies, calls, imports), return the connected node properties. Only return relationship properties if they actually exist in the provided schema.\n"
+        "    8. SYMBOL & BLAST-RADIUS ANALYSIS: The graph tracks module-level edges (`File-[:DEPENDS_ON]->Module`, `Function-[:CALLS]->Function`), NOT individual imported names "
         "(e.g. there is no node for `init()` or `Fore` themselves — only for the `colorama` module and the functions whose code happens to mention it). "
         "For 'what breaks if symbol/function X changes', 'where would a bug in module Y surface', or any other symbol-level or blast-radius question, use this general two-hop pattern: "
         "(a) match the dependency edge from the target module/file, (b) walk to the functions declared in or calling from the dependent file, and fetch their `code` "
@@ -583,7 +531,7 @@ def query_graph_cypher(
         "Module-import template: `MATCH (f:File)-[:DEPENDS_ON]->(m:Module), (f)-[:DECLARES]->(fn:Function) WHERE toLower(m.name) CONTAINS toLower('<module>') RETURN f.path, fn.name, fn.code`. "
         "Function-call template: `MATCH (caller:Function)-[:CALLS]->(callee:Function) WHERE toLower(callee.name) CONTAINS toLower('<symbol>') RETURN caller.name, caller.code, callee.name`. "
         "Always prefer returning `fn.code` / `caller.code` over names alone when the question asks 'where', 'how', or 'what would break' — the answer step needs the source text to reason about specific symbols.\n"
-        "    10. SPARSE-PROPERTY FALLBACK: Some properties (e.g. a commit's summary vs. its raw message) may only be populated on a subset of nodes. When a question could be answered by either of two known alternate properties, "
+        "    9. SPARSE-PROPERTY FALLBACK: Some properties (e.g. a commit's summary vs. its raw message) may only be populated on a subset of nodes. When a question could be answered by either of two known alternate properties, "
         "use `coalesce()` across them (e.g. `coalesce(c.summary_text, c.message)`) instead of querying only one and risking an empty result. "
         "Do not let a narrow property choice cause a false 'no data' answer when a broader, still-schema-valid query would have found it.\n\n"
         "    Schema:\n"
@@ -597,20 +545,25 @@ def query_graph_cypher(
         input_variables=["schema", "question"],
     )
 
-    QA_GENERATION_TEMPLATE = """You are a senior software engineering assistant.
-    Use the following information retrieved from the codebase graph database to answer the user's question.
-    
-    IMPORTANT INSTRUCTIONS:
-    1. The `Database Results` provided below are the direct output of a strict database query designed to answer the user's exact question. 
-    2. TRUST THE DATA: If the user asks "what files depend on X" and the results yield a list of files, you must confidently state that those files depend on X. 
-    3. Do NOT claim you lack information just because the results only contain names/paths instead of full source code or explicit relationship labels.
-    4. If the database results are completely empty (`[]`), only then say you don't have the data to answer.
+    QA_GENERATION_TEMPLATE = """
+    You are a senior software architect performing repository analysis.
 
     Database Results:
     {context}
 
     User Question:
-    {question}"""
+    {question}
+
+    Instructions for Formatting:
+    - Write like a senior engineer explaining a codebase.
+    - Start with a "### Summary" section.
+    - Include a "### Impact Analysis" ONLY if there are tangible impacts. DO NOT list empty impacts.
+    - Use `###` (H3) or inline bold text (e.g., `**Summary:**`) for all section headers — do NOT use `##` (H2) headers, as they render too large in the chat UI.
+    - Include a confidence section at the end.
+    - End with a "### Evidence" section listing the specific files, functions, modules, or commits referenced in your answer as bullet points.
+    - Never invent evidence.
+    - CRITICAL: If the database results are empty or lack the required context to answer the user's question, strictly reply that you do not have the data. Do not hallucinate, invent, or assume any information.
+    """
 
     qa_prompt = PromptTemplate(
         template=QA_GENERATION_TEMPLATE,
@@ -618,25 +571,69 @@ def query_graph_cypher(
     )
 
     chain = GraphCypherQAChain.from_llm(
-        cypher_llm=llm,       
-        qa_llm=llm,           
-        graph=graph,          
-        verbose=True,         
-        cypher_prompt=cypher_prompt,  
-        qa_prompt=qa_prompt,          
-        allow_dangerous_requests=True, 
-        validate_cypher=True  
+        cypher_llm=llm,
+        qa_llm=qa_llm,
+        graph=graph,
+        verbose=True,
+        cypher_prompt=cypher_prompt,
+        qa_prompt=qa_prompt,
+        allow_dangerous_requests=True,
+        validate_cypher=True,
+        top_k=top_k,
     )
 
     try:
         response = chain.invoke({"query": question})
-        return response.get("result", "I couldn't formulate an answer based on the database results.")
+
+        answer = response.get("result", "")
+        target = None
+        target = None
+        if any(keyword in question.lower() for keyword in ["impact", "break", "affected"]):
+            # This regex looks for text that might be a module name (e.g., "in pandas")
+            match = re.search(r'(?:in|for|of)\s+([a-zA-Z0-9_\-\.]+)', question.lower())
+            if match:
+                target = match.group(1)
+
+        if target:
+            impacts = fetch_impact_analysis(driver, target)
+            # You can append this to your answer string here
+            answer += f"\n\n### Additional Impact Data for {target}\n{impacts}"
+
+        evidence_count= extract_evidence_count(answer)
+        repo_count = len(selected_repos) if selected_repos else 1
+        exact_matches = 1
+
+        confidence = calculate_confidence(
+            evidence_count=evidence_count,
+            repo_count=repo_count,
+            exact_matches=exact_matches
+        )
+
+        formatted = f"""
+        {answer}
+        """
+
+        return formatted
     except ValueError as exc:
         if "No tools" in str(exc) or "OutputParserException" in str(exc):
             return "❌ **Query Generation Failed:** The LLM couldn't map that question to the database schema."
         raise exc
     except Exception as exc:
         return f"❌ **Query Execution Failed:**\n```\n{str(exc)}\n```"
+    
+def calculate_confidence(
+        evidence_count: int,
+        repo_count: int,
+        exact_matches: int
+) -> float:
+    
+    score = 0
+
+    score += min(evidence_count * 10, 40)
+    score += min(repo_count * 10, 30)
+    score += min(exact_matches * 5, 30)
+
+    return min(score, 100)
 
 with st.sidebar:
     st.markdown(
@@ -646,7 +643,7 @@ with st.sidebar:
             <div style="font-size:1.1rem; font-weight:700; color:#00d4ff; letter-spacing:0.5px;">GraphRAG Chat</div>
             <div style="font-size:0.72rem; color:rgba(255,255,255,0.4); margin-top:2px;">Neo4j · Gemini · Query-Only</div>
         </div>
-        """,
+        """, # <--- ADD THIS COMMA
         unsafe_allow_html=True,
     )
 
@@ -791,36 +788,13 @@ with st.sidebar:
             )
 
     st.markdown('<div class="section-header">⚙️ RAG Settings</div>', unsafe_allow_html=True)
-    top_k = st.slider("Top-K retrieval results", min_value=1, max_value=15, value=5, step=1)
-
-    deep_scan_days = st.slider(
-        "Retrieval depth (days)",
-        min_value=0,
-        max_value=365,
-        value=30,
+    top_k = st.slider(
+        "Top-K retrieval results",
+        min_value=1,
+        max_value=15,
+        value=5,
         step=1,
-        help=(
-            "Limits commit context to the last N days.\n\n"
-            "**0** = no limit (search all history)\n"
-            "**7** = last week only (fast / recent)\n"
-            "**365** = full year of commits"
-        ),
-        key="deep_scan_days",
-    )
-    if deep_scan_days == 0:
-        _depth_label = "🌐 All history"
-    elif deep_scan_days <= 7:
-        _depth_label = f"⚡ Last {deep_scan_days}d — recent only"
-    elif deep_scan_days <= 30:
-        _depth_label = f"📅 Last {deep_scan_days}d — balanced"
-    elif deep_scan_days <= 90:
-        _depth_label = f"🗂️ Last {deep_scan_days}d — broad"
-    else:
-        _depth_label = f"📜 Last {deep_scan_days}d — deep history"
-    st.markdown(
-        f'<div style="font-size:0.75rem; color:rgba(255,255,255,0.45); margin-top:-6px;">'
-        f'{_depth_label}</div>',
-        unsafe_allow_html=True,
+        help="Controls how many relevant graph items are retrieved for context. A higher number gives the AI more background knowledge but consumes more API tokens.",
     )
 
     st.markdown("---")
@@ -865,46 +839,6 @@ with st.expander("📐 Pipeline Overview", expanded=False):
                 """,
                 unsafe_allow_html=True,
             )
-
-st.markdown("---")
-
-with st.expander("🔍 Cross-Repo Impact Analysis", expanded=False):
-    st.markdown(
-        "Paste a **commit SHA** from the helper repo to find what breaks in the parent repo.",
-        unsafe_allow_html=False,
-    )
-    col_helper, col_parent = st.columns(2)
-    with col_helper:
-        impact_helper = st.text_input("Helper repo (owner/repo)", key="impact_helper",
-                                      placeholder="acme/mylib")
-    with col_parent:
-        impact_parent = st.text_input("Parent repo (owner/repo)", key="impact_parent",
-                                      placeholder="acme/product")
-    impact_sha = st.text_input("Commit SHA from helper repo", key="impact_sha",
-                                placeholder="abc1234...")
-
-    if st.button("Analyze Impact", key="btn_impact"):
-        if not (impact_helper and impact_parent and impact_sha):
-            st.warning("Fill in both repo names and the commit SHA.")
-        elif not google_api_key:
-            st.error("Gemini API key required.")
-        else:
-            with st.spinner("Tracing impact across repos…"):
-                try:
-                    drv = _get_driver(neo4j_uri, neo4j_user, neo4j_pwd)
-                    impact_result = analyze_cross_repo_impact(
-                        driver=drv,
-                        helper_repo=impact_helper,
-                        parent_repo=impact_parent,
-                        commit_sha=impact_sha,
-                        google_api_key=google_api_key,
-                        neo4j_uri=neo4j_uri,
-                        neo4j_user=neo4j_user,
-                        neo4j_pwd=neo4j_pwd,
-                    )
-                    st.markdown(impact_result)
-                except Exception as exc:
-                    st.error(f"Error: {exc}")
 
 stats = st.session_state.graph_stats or {}
 _nodes = stats.get("nodes", 0)
@@ -1002,6 +936,7 @@ if user_input:
                     _sel = st.session_state.get("selected_repos") or []
                     _available = st.session_state.get("available_repos") or []
                     _active_repos = _sel if (_sel and len(_sel) < len(_available)) else None
+                    drv = _get_driver(neo4j_uri, neo4j_user, neo4j_pwd)
 
                     answer = query_graph_cypher(
                         question=user_input,
@@ -1009,8 +944,9 @@ if user_input:
                         neo4j_user=neo4j_user,
                         neo4j_pwd=neo4j_pwd,
                         google_api_key=google_api_key,
+                        driver=drv,
                         selected_repos=_active_repos,
-                        deep_scan_days=deep_scan_days,
+                        top_k=top_k,
                     )
                 except neo4j_exc.ServiceUnavailable:
                     answer = (
