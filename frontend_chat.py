@@ -455,21 +455,21 @@ def extract_evidence_count(text: str) -> int:
     return 0
 
 def fetch_impact_analysis(driver, module_name):
-    
-    query="""
-    MATCH (f:File)-[:DEPENDS_ON]->(m:Module)
-    WHERE toLower(m.name) CONTAINS toLower($module)
-    
+    query = """
+    MATCH (f:File)-[r:DEPENDS_ON]->(m:Module)
+    WHERE r.is_active = true
+      AND toLower(m.name) CONTAINS toLower($module)
     OPTIONAL MATCH (f)-[:DECLARES]->(fn:Function)
-    
-    RETURN
-        f.path AS file,
-        collect(fn.name) AS functions
-    LIMIT 20
+    RETURN 
+        "File: " + f.path + " depends on module: " + m.name + 
+        ". It declares functions: " + coalesce(apoc.text.join(collect(fn.name), ", "), "None") AS impact_data
+    LIMIT 30
     """
-
     with driver.session() as session:
-        return session.run(query, module=module_name).data()
+        results = session.run(query, module=module_name).data()
+        if not results:
+            return "No direct dependencies found."
+        return "\n".join([row["impact_data"] for row in results])
 
 def query_graph_cypher(
     question: str,
@@ -505,7 +505,7 @@ def query_graph_cypher(
             f"6. REPO SCOPE & CROSS-REPO: The user has selected {len(selected_repos)} repositories: {_repo_list}. "
             f"When filtering File, Directory, or Function nodes, use `WHERE n.repo IN {_repo_list}`. "
             f"CRITICAL: `Module` nodes do NOT have a `repo` property. To find shared dependencies, you must traverse "
-            f"from Files to Modules (e.g., `(f:File)-[:DEPENDS_ON]->(m:Module)`)."
+            f"from Files to Modules (e.g., `(f:File)-[r:DEPENDS_ON]->(m:Module)`)."
         )
     else:
         _repo_hint = (
@@ -522,18 +522,18 @@ def query_graph_cypher(
         "    4. CRITICAL: When filtering by ANY string property (file paths, modules, authors, or repo names), ALWAYS use case-insensitive `CONTAINS`. Example: `WHERE toLower(f.repo) CONTAINS toLower('tqdm')`. NEVER use exact `=` matching for strings.\n"
         "    5. Do not include any explanations, apologies, or markdown formatting (like ```cypher). Return ONLY the raw query string.\n"
         f"    {_repo_hint}\n"
-        "    7. RETURN CLAUSES: When asked about relationships (dependencies, calls, imports), return the connected node properties. Only return relationship properties if they actually exist in the provided schema.\n"
+        "    7. RETURN CLAUSES: Always return meaningful context. If asked \"Which files depend on X?\", do NOT just return `f.path`. Return `f.path`, `m.name`, and any relevant function names.\n"
         "    8. SYMBOL & BLAST-RADIUS ANALYSIS: The graph tracks module-level edges (`File-[:DEPENDS_ON]->Module`, `Function-[:CALLS]->Function`), NOT individual imported names "
-        "(e.g. there is no node for `init()` or `Fore` themselves — only for the `colorama` module and the functions whose code happens to mention it). "
         "For 'what breaks if symbol/function X changes', 'where would a bug in module Y surface', or any other symbol-level or blast-radius question, use this general two-hop pattern: "
         "(a) match the dependency edge from the target module/file, (b) walk to the functions declared in or calling from the dependent file, and fetch their `code` "
         "so the symbol-level filtering (does this function actually reference `init` or `Fore`?) happens by reading source text, not by the graph schema. "
-        "Module-import template: `MATCH (f:File)-[:DEPENDS_ON]->(m:Module), (f)-[:DECLARES]->(fn:Function) WHERE toLower(m.name) CONTAINS toLower('<module>') RETURN f.path, fn.name, fn.code`. "
+        "Module-import template: `MATCH (f:File)-[r:DEPENDS_ON]->(m:Module), (f)-[:DECLARES]->(fn:Function) WHERE r.is_active = true AND toLower(m.name) CONTAINS toLower('<module>') RETURN f.path, fn.name, fn.code`. "
         "Function-call template: `MATCH (caller:Function)-[:CALLS]->(callee:Function) WHERE toLower(callee.name) CONTAINS toLower('<symbol>') RETURN caller.name, caller.code, callee.name`. "
         "Always prefer returning `fn.code` / `caller.code` over names alone when the question asks 'where', 'how', or 'what would break' — the answer step needs the source text to reason about specific symbols.\n"
         "    9. SPARSE-PROPERTY FALLBACK: Some properties (e.g. a commit's summary vs. its raw message) may only be populated on a subset of nodes. When a question could be answered by either of two known alternate properties, "
         "use `coalesce()` across them (e.g. `coalesce(c.summary_text, c.message)`) instead of querying only one and risking an empty result. "
-        "Do not let a narrow property choice cause a false 'no data' answer when a broader, still-schema-valid query would have found it.\n\n"
+        "Do not let a narrow property choice cause a false 'no data' answer when a broader, still-schema-valid query would have found it.\n"
+        "    10. TEMPORAL FILTERING: The graph tracks historical code changes. Relationships like `DEPENDS_ON` have an `is_active` boolean property. By default, you MUST append `WHERE r.is_active = true` to your queries to ensure you only return current, active codebase architecture. ONLY omit this filter if the user explicitly asks about 'deleted', 'historical', or 'removed' code.\n\n"
         "    Schema:\n"
         "    {schema}\n\n"
         "    The question is:\n"
@@ -554,15 +554,16 @@ def query_graph_cypher(
     User Question:
     {question}
 
-    Instructions for Formatting:
+    Instructions for Formatting & Interpretation:
+    - CRITICAL GRAPH READING RULE: If the Database Results contain file paths (e.g., `f.path`, `file`) alongside module names (e.g., `m.name`, `module`), it strictly means the FILE depends on (imports) the MODULE. Do not incorrectly claim the files "belong" to the module.
+    - REPOSITORY RECOGNITION: The user might use shorthand like "bubbles". If the Database Results return file paths matching the query, assume those files belong to the requested repository. Do not claim you lack data just because the exact repository name isn't appended to every file string.
     - Write like a senior engineer explaining a codebase.
     - Start with a "### Summary" section.
     - Include a "### Impact Analysis" ONLY if there are tangible impacts. DO NOT list empty impacts.
-    - Use `###` (H3) or inline bold text (e.g., `**Summary:**`) for all section headers — do NOT use `##` (H2) headers, as they render too large in the chat UI.
-    - Include a confidence section at the end.
+    - Use `###` (H3) or inline bold text (e.g., `**Summary:**`) for all section headers — do NOT use `##` (H2) headers.
     - End with a "### Evidence" section listing the specific files, functions, modules, or commits referenced in your answer as bullet points.
     - Never invent evidence.
-    - CRITICAL: If the database results are empty or lack the required context to answer the user's question, strictly reply that you do not have the data. Do not hallucinate, invent, or assume any information.
+    - If the database results are truly empty, strictly reply that you do not have the data.
     """
 
     qa_prompt = PromptTemplate(

@@ -192,7 +192,14 @@ MERGE (repo)-[:CONTAINS_FILE]->(file)
 CYPHER_INGEST_DEPENDENCY = """
 MERGE (file:File {path: $filepath, repo: $repo_full_name})
 MERGE (module:Module {name: $target_module})
-MERGE (file)-[:DEPENDS_ON]->(module)
+MERGE (file)-[r:DEPENDS_ON]->(module)
+  ON CREATE SET r.added_in_commit = $commit_sha, r.is_active = true
+  ON MATCH  SET r.is_active = true
+"""
+
+CYPHER_REMOVE_DEPENDENCY = """
+MATCH (file:File {path: $filepath, repo: $repo_full_name})-[r:DEPENDS_ON]->(module:Module {name: $target_module})
+SET r.is_active = false, r.deleted_in_commit = $commit_sha
 """
 
 CYPHER_TREE_FILE = """
@@ -505,6 +512,7 @@ def extract_imports_from_source(filepath: str, source_code: str) -> list:
 
 
 def extract_file_dependencies(compact_files: list) -> list:
+    """Legacy additive-only extraction. Kept for backwards compatibility."""
     dependencies = []
     for item in compact_files:
         source_file = item.get("filename")
@@ -521,6 +529,63 @@ def extract_file_dependencies(compact_files: list) -> list:
             if dep not in dependencies:
                 dependencies.append(dep)
     return dependencies
+
+
+def extract_temporal_dependencies(compact_files: list) -> dict:
+    """Split a git diff into added and removed import dependencies.
+
+    For each changed file in *compact_files* the patch lines are partitioned
+    into two buckets:
+
+    * **additions** – lines that start with ``+`` (but are NOT the ``+++``
+      hunk header).  The ``+`` prefix is stripped before parsing.
+    * **deletions** – lines that start with ``-`` (but are NOT the ``---``
+      hunk header).  The ``-`` prefix is stripped before parsing.
+
+    Context lines (starting with a space) and hunk headers are ignored.
+
+    Returns::
+
+        {
+            "added":   [(source_filepath, "DEPENDS_ON", target_module), ...],
+            "removed": [(source_filepath, "DEPENDS_ON", target_module), ...],
+        }
+    """
+    added: list = []
+    removed: list = []
+
+    for item in compact_files:
+        source_file = item.get("filename")
+        patch = item.get("patch", "")
+        if not patch or not source_file:
+            continue
+
+        kind = _go_file_kind(source_file)
+        extractor = (
+            _extract_go_dependencies
+            if kind in {"go_mod", "go_work", "go_source"}
+            else _extract_generic_dependencies
+        )
+
+        addition_lines: list[str] = []
+        deletion_lines: list[str] = []
+
+        for raw_line in patch.split("\n"):
+            # Skip hunk headers (+++ / ---) and context lines
+            if raw_line.startswith("+") and not raw_line.startswith("+++"):
+                addition_lines.append(raw_line[1:])  # strip the leading +
+            elif raw_line.startswith("-") and not raw_line.startswith("---"):
+                deletion_lines.append(raw_line[1:])  # strip the leading -
+
+        for dep in extractor(source_file, addition_lines, patch_mode=False):
+            if dep not in added:
+                added.append(dep)
+
+        for dep in extractor(source_file, deletion_lines, patch_mode=False):
+            if dep not in removed:
+                removed.append(dep)
+
+    return {"added": added, "removed": removed}
 
 
 def _truncate(text: str, limit: int = 5000) -> str:
@@ -731,7 +796,7 @@ def _write_commit_to_graph(
     repo_full_name: str,
     commit_sha: str,
     modified_files: list,
-    dependencies: list,
+    dependencies: dict,
     actor_login: str = "unknown",
     committed_at: str = "",
     summary_text: str = "",
@@ -739,6 +804,20 @@ def _write_commit_to_graph(
     commit_message: str = "",
     commit_url: str = "",
 ):
+    """Write a single commit and its temporal dependency changes to Neo4j.
+
+    *dependencies* must be a dict with the shape returned by
+    :func:`extract_temporal_dependencies`::
+
+        {
+            "added":   [(source_filepath, rel, target_module), ...],
+            "removed": [(source_filepath, rel, target_module), ...],
+        }
+
+    Added edges are MERGEd and marked ``is_active = true``.  Removed edges are
+    matched and soft-deleted by setting ``is_active = false`` plus
+    ``deleted_in_commit``.
+    """
     with driver.session() as session:
         session.run(
             CYPHER_INGEST_COMMIT,
@@ -758,12 +837,23 @@ def _write_commit_to_graph(
                 commit_sha=commit_sha,
                 filepath=filepath,
             )
-        for source, _rel, target in dependencies:
+        # --- Temporal dependency upserts (added imports) ---
+        for source, _rel, target in dependencies.get("added", []):
             session.run(
                 CYPHER_INGEST_DEPENDENCY,
                 filepath=source,
                 target_module=target,
                 repo_full_name=repo_full_name,
+                commit_sha=commit_sha,
+            )
+        # --- Temporal dependency soft-deletes (removed imports) ---
+        for source, _rel, target in dependencies.get("removed", []):
+            session.run(
+                CYPHER_REMOVE_DEPENDENCY,
+                filepath=source,
+                target_module=target,
+                repo_full_name=repo_full_name,
+                commit_sha=commit_sha,
             )
 
 def resolve_cross_repo_edges(driver, parent_repo: str, helper_repo: str):
@@ -905,6 +995,9 @@ def phase2_scan_file_contents(
                     filepath=filepath,
                     target_module=target_module,
                     repo_full_name=repo_fn,
+                    # Phase 2 scans HEAD without a specific commit reference;
+                    # use a sentinel so the temporal property is still populated.
+                    commit_sha="initial_scan",
                 )
         batch_params.clear()
 
@@ -1079,7 +1172,7 @@ def phase3_backfill_commits(
                 is_deep_scan = commit_dt >= cutoff_date
 
                 modified_files_list = [item["filename"] for item in compact_files]
-                dependencies = extract_file_dependencies(compact_files)
+                dependencies = extract_temporal_dependencies(compact_files)
                 raw_diff = render_diff_text(compact_files)
 
                 is_deep_scan = False
