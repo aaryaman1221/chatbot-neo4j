@@ -630,6 +630,7 @@ def render_diff_text(files: list) -> str:
 
 
 def _heuristic_summary(repo_full_name: str, compact_files: list, commit_msg: str) -> str:
+    logging.info("heuristic summary used")
     if not compact_files:
         return f"Commit in {repo_full_name}: {commit_msg[:200]}"
     parts = [
@@ -694,7 +695,7 @@ def summarize_with_llm(
         except Exception as exc:
             logger.debug("google-genai SDK failed: %s", exc)
 
-    model = "gemini-2.5-flash"
+    model = "gemini-3.5-flash"
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{model}:generateContent?key={google_api_key}"

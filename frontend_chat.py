@@ -460,9 +460,10 @@ def fetch_impact_analysis(driver, module_name):
     WHERE r.is_active = true
       AND toLower(m.name) CONTAINS toLower($module)
     OPTIONAL MATCH (f)-[:DECLARES]->(fn:Function)
+    WITH f, m, collect(fn.name) AS funcs
     RETURN 
         "File: " + f.path + " depends on module: " + m.name + 
-        ". It declares functions: " + coalesce(apoc.text.join(collect(fn.name), ", "), "None") AS impact_data
+        ". It declares functions: " + coalesce(apoc.text.join(funcs, ", "), "None") AS impact_data
     LIMIT 30
     """
     with driver.session() as session:
@@ -534,6 +535,7 @@ def query_graph_cypher(
         "use `coalesce()` across them (e.g. `coalesce(c.summary_text, c.message)`) instead of querying only one and risking an empty result. "
         "Do not let a narrow property choice cause a false 'no data' answer when a broader, still-schema-valid query would have found it.\n"
         "    10. TEMPORAL FILTERING: The graph tracks historical code changes. Relationships like `DEPENDS_ON` have an `is_active` boolean property. By default, you MUST append `WHERE r.is_active = true` to your queries to ensure you only return current, active codebase architecture. ONLY omit this filter if the user explicitly asks about 'deleted', 'historical', or 'removed' code.\n\n"
+        "    11. COMMIT SEARCHES: When searching for concepts in commit history, DO NOT use `CONTAINS`. You MUST use the fulltext index: `CALL db.index.fulltext.queryNodes('commit_summaries', '<search terms>') YIELD node AS c, score ...` "
         "    Schema:\n"
         "    {schema}\n\n"
         "    The question is:\n"
