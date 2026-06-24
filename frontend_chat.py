@@ -3,11 +3,15 @@
 # frontend_chat.py — Streamlit GraphRAG Chat UI
 # =============================================================================
 
+import json
 import logging
 import os
 import traceback
-import re
 from typing import Optional
+
+from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import tool
 
 from dotenv import load_dotenv
 
@@ -324,128 +328,7 @@ def _fetch_available_repos(driver) -> list:
         logger.warning("Could not fetch available repos: %s", exc)
         return []
 
-def _fetch_commit_context(
-    driver,
-    question: str,
-    selected_repos: Optional[list] = None,
-    limit: int = 3,
-    deep_scan_days: int = 30,
-) -> str:
-    try:
-        from datetime import datetime, timezone, timedelta
-        cutoff_iso = (
-            (datetime.now(timezone.utc) - timedelta(days=deep_scan_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            if deep_scan_days > 0 else None
-        )
-        use_repo_filter = bool(selected_repos)
 
-        with driver.session() as session:
-            if use_repo_filter and cutoff_iso:
-                result = session.run(
-                    """
-                    CALL db.index.fulltext.queryNodes('commit_summaries', $query)
-                    YIELD node, score
-                    WHERE score > 0 AND node.timestamp >= $cutoff
-                    WITH node, score
-                    MATCH (node)-[:BELONGS_TO]->(r:Repository)
-                    WHERE r.full_name IN $selected_repos
-                    RETURN node.sha          AS sha,
-                           node.summary_text AS summary,
-                           node.message      AS message,
-                           node.timestamp    AS ts
-                    ORDER BY score DESC
-                    LIMIT $limit
-                    """,
-                    query=question,
-                    cutoff=cutoff_iso,
-                    selected_repos=selected_repos,
-                    limit=limit,
-                )
-            elif use_repo_filter:
-                result = session.run(
-                    """
-                    CALL db.index.fulltext.queryNodes('commit_summaries', $query)
-                    YIELD node, score
-                    WHERE score > 0
-                    WITH node, score
-                    MATCH (node)-[:BELONGS_TO]->(r:Repository)
-                    WHERE r.full_name IN $selected_repos
-                    RETURN node.sha          AS sha,
-                           node.summary_text AS summary,
-                           node.message      AS message,
-                           node.timestamp    AS ts
-                    ORDER BY score DESC
-                    LIMIT $limit
-                    """,
-                    query=question,
-                    selected_repos=selected_repos,
-                    limit=limit,
-                )
-            elif cutoff_iso:
-                result = session.run(
-                    """
-                    CALL db.index.fulltext.queryNodes('commit_summaries', $query)
-                    YIELD node, score
-                    WHERE score > 0 AND node.timestamp >= $cutoff
-                    RETURN node.sha          AS sha,
-                           node.summary_text AS summary,
-                           node.message      AS message,
-                           node.timestamp    AS ts
-                    ORDER BY score DESC
-                    LIMIT $limit
-                    """,
-                    query=question,
-                    cutoff=cutoff_iso,
-                    limit=limit,
-                )
-            else:
-                result = session.run(
-                    """
-                    CALL db.index.fulltext.queryNodes('commit_summaries', $query)
-                    YIELD node, score
-                    WHERE score > 0
-                    RETURN node.sha          AS sha,
-                           node.summary_text AS summary,
-                           node.message      AS message,
-                           node.timestamp    AS ts
-                    ORDER BY score DESC
-                    LIMIT $limit
-                    """,
-                    query=question,
-                    limit=limit,
-                )
-            rows = result.data()
-            if not rows:
-                return ""
-            parts = []
-            for row in rows:
-                sha_short = (row.get("sha") or "")[:8]
-                msg       = (row.get("message") or "").split("\n")[0][:100]
-                summary   = (row.get("summary") or "").strip()
-                ts        = row.get("ts", "")
-                parts.append(f"Commit {sha_short} ({ts}): {msg}\nSummary: {summary}")
-            return "\n\n---\n\n".join(parts)
-    except Exception:
-        return ""
-
-
-# def extract_evidence(text):
-#     evidence = set()
-
-#     # Fixed: Removed capturing groups or converted them to non-capturing (?:...)
-#     # so re.findall returns the entire match instead of just the extension/name.
-#     patterns = [
-#         r'[\w/\-]+\.(?:py|js|ts|go|java|cpp)', 
-#         r'Commit\s+[a-f0-9]{7,40}',
-#         r'Function:\s*[A-Za-z_][A-Za-z0-9_]*',
-#         r'Module:\s*[A-Za-z0-9_\-.]+'
-#     ]
-
-#     for pattern in patterns:
-#         for match in re.findall(pattern, text):
-#             evidence.add(str(match))
-
-#     return sorted(list(evidence))
 def extract_evidence_count(text: str) -> int:
     """Counts the bullet points in the LLM's Evidence section to drive the confidence score."""
     if "## Evidence" in text:
@@ -454,51 +337,494 @@ def extract_evidence_count(text: str) -> int:
         return evidence_section.count("- ") + evidence_section.count("* ")
     return 0
 
-def fetch_impact_analysis(driver, module_name):
-    query = """
-    MATCH (f:File)-[r:DEPENDS_ON]->(m:Module)
-    WHERE r.is_active = true
-      AND toLower(m.name) CONTAINS toLower($module)
-    OPTIONAL MATCH (f)-[:DECLARES]->(fn:Function)
-    WITH f, m, collect(fn.name) AS funcs
-    RETURN 
-        "File: " + f.path + " depends on module: " + m.name + 
-        ". It declares functions: " + coalesce(apoc.text.join(funcs, ", "), "None") AS impact_data
-    LIMIT 30
-    """
-    with driver.session() as session:
-        results = session.run(query, module=module_name).data()
-        if not results:
-            return "No direct dependencies found."
-        return "\n".join([row["impact_data"] for row in results])
 
-def query_graph_cypher(
-    question: str,
+# =============================================================================
+# Intent Classification — runs BEFORE the agent, decouples routing from keywords
+# =============================================================================
+
+# Canonical intent labels the classifier must choose from.
+INTENT_LABELS = [
+    "DEPENDENCY_TRAVERSAL",  # who calls/uses/imports X; what depends on X
+    "BUG_SURFACE_ANALYSIS",  # where a bug/change in X would propagate / surface
+    "BLAST_RADIUS",          # what breaks if X changes; downstream impact
+    "COMMIT_SEARCH",         # git history, why was X changed, recent commits
+    "GENERAL_GRAPH_QUERY",   # architecture overview, file locations, open-ended
+]
+
+_INTENT_SYSTEM = """\
+You are a query-intent classifier for a code-repository knowledge graph.
+Classify the user's question into EXACTLY ONE of these intents:
+
+  DEPENDENCY_TRAVERSAL  — asks which files/functions/components call, use,
+                          import, or depend on a module, function, or symbol.
+                          Signals: "what calls X", "which functions use X",
+                          "what imports X", "depends on X", "references X",
+                          "uses X", "invokes X", cross-repo usage questions.
+
+  BUG_SURFACE_ANALYSIS  — asks where a bug or defect in X would show up,
+                          propagate, or be visible in the codebase.
+                          Signals: "where would a bug surface", "where does X
+                          affect", "if X is broken what fails", "rendering bug",
+                          "error in X would appear in".
+
+  BLAST_RADIUS          — asks what breaks / is at risk if X is changed,
+                          removed, or refactored. Forward-impact questions.
+                          Signals: "blast radius", "what breaks if", "impact of
+                          changing", "downstream effects", "what would break".
+
+  COMMIT_SEARCH         — asks about git history, commit messages, why/when a
+                          change was made, recent fixes, PR history.
+                          Signals: "commit", "git log", "when was X changed",
+                          "who changed", "recent fix", "history of".
+
+  GENERAL_GRAPH_QUERY   — everything else: architecture overviews, file
+                          locations, listing nodes, open-ended questions.
+
+Also extract these three fields. Read the rules carefully:
+
+  module  — the primary library / package being asked ABOUT (the dependency
+             being analysed). Must be a bare package/repo name, lowercase.
+             Examples: "lipgloss", "tqdm", "colorama".
+             Empty string if none.
+
+  symbol  — a SPECIFIC, LITERAL function name, type name, or method name that
+             appears as an identifier in source code. Must look like valid code:
+             "Color", "NewStyle", "Render", "Init", "Fore.RED".
+             CRITICAL: if the user describes behaviour in plain English
+             (e.g. "color rendering logic", "authentication flow", "error
+             handling") that is NOT a symbol — set symbol to "".
+             Only populate symbol when you can point to an actual identifier.
+
+  repo    — the repository the question is scoped TO (the consumer/caller side).
+             Must be the TOP-LEVEL repository name only — never a sub-path.
+             Examples: "bubbles", "tqdm", "faker".
+             If the user says "bubbles/progress", repo = "bubbles" (the repo
+             name); the sub-component "progress" is a path hint, not a repo.
+             Empty string if none / same as module.
+
+  path_hint — an optional sub-directory or component path within repo that
+              the user mentioned (e.g. "progress" from "bubbles/progress").
+              Empty string if none.
+
+Respond with ONLY a JSON object, no markdown, no explanation:
+{"intent": "<LABEL>", "module": "<str>", "symbol": "<str>", "repo": "<str>", "path_hint": "<str>"}
+"""
+
+def classify_intent(question: str, llm) -> dict:
+    """
+    Call the LLM once to classify the question into a canonical intent and
+    extract key entities. Falls back to GENERAL_GRAPH_QUERY on any error.
+
+    Returns a dict: {intent, module, symbol, repo, path_hint}
+    """
+    try:
+        from langchain_core.messages import HumanMessage, SystemMessage
+        response = llm.invoke([
+            SystemMessage(content=_INTENT_SYSTEM),
+            HumanMessage(content=question),
+        ])
+        raw = response.content
+        # Strip accidental markdown fences
+        raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        parsed = json.loads(raw)
+        intent = parsed.get("intent", "GENERAL_GRAPH_QUERY")
+        if intent not in INTENT_LABELS:
+            intent = "GENERAL_GRAPH_QUERY"
+        return {
+            "intent":    intent,
+            "module":    parsed.get("module", ""),
+            "symbol":    parsed.get("symbol", ""),
+            "repo":      parsed.get("repo", ""),
+            "path_hint": parsed.get("path_hint", ""),
+        }
+    except Exception as exc:
+        logger.warning("Intent classification failed (%s), falling back to GENERAL_GRAPH_QUERY", exc)
+        return {"intent": "GENERAL_GRAPH_QUERY", "module": "", "symbol": "", "repo": "", "path_hint": ""}
+
+
+# =============================================================================
+# GraphRAGToolkit — Structured Cypher tools, no keyword-based routing
+# =============================================================================
+
+class GraphRAGToolkit:
+    """Encapsulates Neo4j driver + GraphCypherQAChain.
+    Tools now have precise Cypher for every intent; routing is done by the
+    intent classifier, not by LLM keyword matching on docstrings."""
+
+    def __init__(self, driver, cypher_qa_chain):
+        self.driver = driver
+        self.cypher_qa_chain = cypher_qa_chain
+
+    # ------------------------------------------------------------------
+    # Direct Cypher tools (called by create_and_run_agent after intent
+    # classification, so docstrings describe the graph pattern, not the
+    # user's vocabulary — the agent never has to guess which to call).
+    # ------------------------------------------------------------------
+
+    def run_dependency_traversal(self, module: str, symbol: str = "", repo: str = "", path_hint: str = "") -> str:
+        """
+        Two-pass approach:
+          Pass 1 — Function-[:CALLS]->Function for direct call-graph edges
+                   (only when a real code symbol is given).
+          Pass 2 — File-[:DEPENDS_ON]->Module + File-[:DECLARES]->Function,
+                   filtered by repo name on f.repo, and path_hint on f.path.
+                   Symbol filter applies only when symbol looks like a code
+                   identifier (short, no spaces).
+        Returns the union of both passes.
+        """
+        # Only use symbol as a source-text filter when it's a plausible
+        # code identifier — short and contains no spaces.
+        code_symbol = symbol if (symbol and len(symbol) < 40 and " " not in symbol) else ""
+
+        results = []
+
+        # Pass 1: direct Function-[:CALLS]->Function edges (needs a real symbol)
+        if code_symbol:
+            cypher_fn_calls = """
+            MATCH (caller:Function)-[:CALLS]->(callee:Function)
+            WHERE toLower(callee.name) CONTAINS toLower($symbol)
+            OPTIONAL MATCH (caller_file:File)-[:DECLARES]->(caller)
+            WITH caller_file, caller, callee
+            WHERE $repo = "" OR toLower(coalesce(caller_file.repo, "")) CONTAINS toLower($repo)
+            WITH caller_file, caller, callee
+            WHERE $path_hint = "" OR toLower(coalesce(caller_file.path, "")) CONTAINS toLower($path_hint)
+            RETURN
+                coalesce(caller_file.path, "<unknown file>") AS file,
+                caller.name  AS caller_fn,
+                callee.name  AS callee_fn,
+                caller.code  AS code
+            LIMIT 30
+            """
+            try:
+                with self.driver.session() as session:
+                    rows = session.run(cypher_fn_calls, {"symbol": code_symbol, "repo": repo, "path_hint": path_hint}).data()
+                    results.extend(rows)
+            except Exception as exc:
+                logger.warning("Pass-1 (CALLS) query failed: %s", exc)
+
+        # Pass 2: module-import-level callers
+        if module:
+            cypher_module_import = """
+            MATCH (f:File)-[r:DEPENDS_ON]->(m:Module)
+            WHERE r.is_active = true
+              AND toLower(m.name) CONTAINS toLower($module)
+            WITH f, m
+            WHERE $repo = "" OR toLower(coalesce(f.repo, "")) CONTAINS toLower($repo)
+            WITH f, m
+            WHERE $path_hint = "" OR toLower(f.path) CONTAINS toLower($path_hint)
+            MATCH (f)-[:DECLARES]->(fn:Function)
+            WITH f, m, fn
+            WHERE $symbol = "" OR fn.code CONTAINS $symbol
+            RETURN
+                f.path    AS file,
+                fn.name   AS caller_fn,
+                ""        AS callee_fn,
+                fn.code   AS code,
+                m.name    AS module_name
+            LIMIT 30
+            """
+            try:
+                with self.driver.session() as session:
+                    rows = session.run(cypher_module_import, {"module": module, "symbol": code_symbol, "repo": repo, "path_hint": path_hint}).data()
+                    results.extend(rows)
+            except Exception as exc:
+                logger.warning("Pass-2 (DEPENDS_ON) query failed: %s", exc)
+
+        if not results:
+            return (
+                f"No callers found for"
+                + (f" symbol '{symbol}'" if symbol else "")
+                + (f" in module '{module}'" if module else "")
+                + (f" scoped to repo '{repo}'" if repo else "")
+                + (f" path '{path_hint}'" if path_hint else "")
+                + "."
+            )
+        return json.dumps(results, default=str, indent=2)
+
+    def run_blast_radius(self, module: str, symbol: str = "", repo: str = "", path_hint: str = "") -> str:
+        """
+        Forward-impact analysis: which files/functions are at risk if `module`
+        (or a specific `symbol` within it) changes. Uses DEPENDS_ON + DECLARES
+        with source-text filtering only when symbol is a real code identifier.
+        """
+        code_symbol = symbol if (symbol and len(symbol) < 40 and " " not in symbol) else ""
+
+        cypher_statement = """
+        MATCH (f:File)-[r:DEPENDS_ON]->(m:Module)
+        WHERE r.is_active = true
+          AND toLower(m.name) CONTAINS toLower($module)
+        WITH f, m
+        WHERE $repo = "" OR toLower(coalesce(f.repo, "")) CONTAINS toLower($repo)
+        WITH f, m
+        WHERE $path_hint = "" OR toLower(f.path) CONTAINS toLower($path_hint)
+        OPTIONAL MATCH (f)-[:DECLARES]->(fn:Function)
+        WITH f, m, fn
+        WHERE $symbol = "" OR fn.code CONTAINS $symbol
+        WITH f, m, collect(fn.name) AS funcs
+        WHERE size(funcs) > 0 OR $symbol = ""
+        RETURN
+            f.path   AS file,
+            m.name   AS module_name,
+            funcs    AS at_risk_functions
+        LIMIT 40
+        """
+        try:
+            with self.driver.session() as session:
+                results = session.run(cypher_statement, {"module": module, "symbol": code_symbol, "repo": repo, "path_hint": path_hint}).data()
+            if not results:
+                return (
+                    f"No blast-radius results for module '{module}'"
+                    + (f" / symbol '{symbol}'" if symbol else "")
+                    + "."
+                )
+            return json.dumps(results, default=str, indent=2)
+        except Exception as exc:
+            return f"Error running blast-radius query: {exc}"
+
+    def run_bug_surface_analysis(self, module: str, symbol: str = "", repo: str = "", path_hint: str = "") -> str:
+        """
+        Surface analysis: finds all files that import the module, then for each
+        finds the functions that reference the symbol (or all functions if no
+        real symbol), returning fn.code for the QA LLM to reason about.
+        Wider net than blast-radius — no grouping/aggregation.
+        """
+        code_symbol = symbol if (symbol and len(symbol) < 40 and " " not in symbol) else ""
+
+        cypher_statement = """
+        MATCH (f:File)-[r:DEPENDS_ON]->(m:Module)
+        WHERE r.is_active = true
+          AND toLower(m.name) CONTAINS toLower($module)
+        WITH f, m
+        WHERE $repo = "" OR toLower(coalesce(f.repo, "")) CONTAINS toLower($repo)
+        WITH f, m
+        WHERE $path_hint = "" OR toLower(f.path) CONTAINS toLower($path_hint)
+        MATCH (f)-[:DECLARES]->(fn:Function)
+        WITH f, m, fn
+        WHERE $symbol = "" OR fn.code CONTAINS $symbol
+        RETURN
+            f.path   AS file,
+            m.name   AS source_module,
+            fn.name  AS function_name,
+            fn.code  AS function_code
+        ORDER BY f.path, fn.name
+        LIMIT 40
+        """
+        try:
+            with self.driver.session() as session:
+                results = session.run(cypher_statement, {"module": module, "symbol": code_symbol, "repo": repo, "path_hint": path_hint}).data()
+            if not results:
+                return (
+                    f"No surface-analysis results for module '{module}'"
+                    + (f" / symbol '{symbol}'" if symbol else "")
+                    + "."
+                )
+            return json.dumps(results, default=str, indent=2)
+        except Exception as exc:
+            return f"Error running bug-surface analysis: {exc}"
+
+    def run_commit_search(self, query: str) -> str:
+        cypher_statement = """
+        CALL db.index.fulltext.queryNodes('commit_summaries', $query)
+        YIELD node, score
+        WHERE score > 0
+        RETURN node.sha       AS sha,
+               coalesce(node.summary_text, node.message) AS message,
+               node.timestamp AS timestamp
+        ORDER BY score DESC
+        LIMIT 8
+        """
+        try:
+            with self.driver.session() as session:
+                results = session.run(cypher_statement, {"query": query}).data()
+            if not results:
+                return "No matching commits found."
+            return json.dumps(results, default=str, indent=2)
+        except Exception as exc:
+            return f"Error searching commit history: {exc}"
+
+    def run_generic_query(self, question: str) -> str:
+        try:
+            response = self.cypher_qa_chain.invoke({"query": question})
+            return response.get("result", "No result returned from the graph.")
+        except Exception as exc:
+            return f"Error querying knowledge graph: {exc}"
+
+    def get_tools(self) -> list:
+        """Expose LangChain @tool wrappers for the agent.
+        Docstrings here describe graph patterns, not user vocabulary — routing
+        is handled upstream by classify_intent() before the agent is invoked."""
+        driver = self.driver
+        cypher_qa_chain = self.cypher_qa_chain
+        toolkit = self
+
+        @tool
+        def analyze_blast_radius(target_module: str, symbol: str = "", repo: str = "", path_hint: str = "") -> str:
+            """Forward-impact analysis: given a module (and optional symbol),
+            return all files and functions that depend on it and would be broken
+            if it changed. Use when intent is BLAST_RADIUS."""
+            return toolkit.run_blast_radius(module=target_module, symbol=symbol, repo=repo, path_hint=path_hint)
+
+        @tool
+        def find_callers_and_dependents(target_module: str, symbol: str = "", repo: str = "", path_hint: str = "") -> str:
+            """Find all files and functions that call, import, or reference the
+            given module or symbol. Covers both Function-[:CALLS]->Function edges
+            and File-[:DEPENDS_ON]->Module edges. Use when intent is
+            DEPENDENCY_TRAVERSAL."""
+            return toolkit.run_dependency_traversal(module=target_module, symbol=symbol, repo=repo, path_hint=path_hint)
+
+        @tool
+        def surface_bug_impact(target_module: str, symbol: str = "", repo: str = "", path_hint: str = "") -> str:
+            """Return every file and function that imports a module and references
+            a given symbol, including their source code, so the LLM can reason
+            about where a bug in that module/symbol would surface. Use when intent
+            is BUG_SURFACE_ANALYSIS."""
+            return toolkit.run_bug_surface_analysis(module=target_module, symbol=symbol, repo=repo, path_hint=path_hint)
+
+        @tool
+        def search_commit_history(semantic_query: str) -> str:
+            """Search the fulltext index over commit messages and summaries.
+            Accepts ONLY semantic_query. Do not pass target_module, repo, or
+            any other argument to this tool."""
+            return toolkit.run_commit_search(query=semantic_query)
+
+        @tool
+        def generic_graph_query(question: str) -> str:
+            """General-purpose graph query via GraphCypherQAChain.
+            Accepts ONLY question. Do not pass any other arguments."""
+            return toolkit.run_generic_query(question=question)
+
+        return [
+            analyze_blast_radius,
+            find_callers_and_dependents,
+            surface_bug_impact,
+            search_commit_history,
+            generic_graph_query,
+        ]
+
+
+# Intent → tool name mapping used by create_and_run_agent to prime the agent
+# with the correct tool before it reasons, eliminating keyword-based guessing.
+_INTENT_TO_TOOL = {
+    "DEPENDENCY_TRAVERSAL": "find_callers_and_dependents",
+    "BUG_SURFACE_ANALYSIS": "surface_bug_impact",
+    "BLAST_RADIUS":         "analyze_blast_radius",
+    "COMMIT_SEARCH":        "search_commit_history",
+    "GENERAL_GRAPH_QUERY":  "generic_graph_query",
+}
+
+
+def create_and_run_agent(
+    user_input: str,
+    llm,
+    toolkit: GraphRAGToolkit,
+    intent_data: Optional[dict] = None,
+) -> str:
+    """
+    1. Classify intent and extract entities — skipped when intent_data is
+       pre-computed by route_and_answer() (saves one LLM call).
+    2. Build a system prompt that names the correct tool and passes the
+       extracted entities, so the agent never has to guess from vocabulary.
+    3. Run the agent.
+
+    Returns the agent's final answer string.
+    """
+    # ── Step 1: classify (skip if already done upstream) ──────────────────────
+    if intent_data is None:
+        intent_data = classify_intent(user_input, llm)
+    intent      = intent_data["intent"]
+    module      = intent_data["module"]
+    symbol      = intent_data["symbol"]
+    repo        = intent_data["repo"]
+    path_hint   = intent_data["path_hint"]
+    tool_name   = _INTENT_TO_TOOL.get(intent, "generic_graph_query")
+
+    logger.info("Intent: %s | module=%s | symbol=%s | repo=%s | path_hint=%s → tool=%s",
+                intent, module, symbol, repo, path_hint, tool_name)
+
+    # ── Step 2: build a per-tool-aware system prompt ─────────────────────────
+    # Each intent gets a call instruction that names ONLY the arguments that
+    # tool actually accepts, preventing kwargs bleed across tools.
+    if intent == "COMMIT_SEARCH":
+        # Derive a compact search phrase from the raw question — don't pass
+        # repo/module/symbol as args since the tool only takes semantic_query.
+        call_instruction = (
+            f"Call `search_commit_history` with:\n"
+            f"  semantic_query: a concise phrase capturing the key concepts "
+            f"from the user's question (e.g. 'lipgloss API migration', "
+            f"'color rendering fix'). Do NOT pass any other arguments."
+        )
+    elif intent == "GENERAL_GRAPH_QUERY":
+        call_instruction = (
+            f"Call `generic_graph_query` with:\n"
+            f"  question: the user's full question verbatim. "
+            f"Do NOT pass any other arguments."
+        )
+    else:
+        # Graph traversal tools: build the argument block from extracted entities
+        arg_lines = [f"  target_module: \"{module}\"" if module else "  target_module: \"\""]
+        if symbol:
+            arg_lines.append(f"  symbol: \"{symbol}\"  # literal code identifier")
+        else:
+            arg_lines.append("  symbol: \"\"  # omit — no specific identifier extracted")
+        if repo:
+            arg_lines.append(f"  repo: \"{repo}\"")
+        if path_hint:
+            arg_lines.append(f"  path_hint: \"{path_hint}\"")
+        arg_block = "\n".join(arg_lines)
+        call_instruction = (
+            f"Call `{tool_name}` with these exact arguments:\n{arg_block}\n"
+            f"Do NOT add extra arguments. Do NOT change these values."
+        )
+
+    system_msg = (
+        "You are a senior software architect analyzing a repository knowledge graph.\n\n"
+        f"The user's question has been classified as: **{intent}**.\n\n"
+        f"{call_instruction}\n\n"
+        "After the tool returns results, synthesise a clear answer with:\n"
+        "  ### Summary\n"
+        "  ### Impact Analysis  (only if there are real impacts)\n"
+        "  ### Evidence  (bullet list of specific files / functions / commits)\n"
+        "Never invent evidence. If results are empty, say so."
+    )
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_msg),
+        ("human", "{input}"),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
+    ])
+
+    # ── Step 3: run agent ─────────────────────────────────────────────────────
+    tools    = toolkit.get_tools()
+    agent    = create_tool_calling_agent(llm, tools, prompt)
+    executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+    result   = executor.invoke({"input": user_input})
+
+    content = result.get("output", "The agent did not produce a final answer.")
+
+    # Handle Google GenAI mixed-list outputs
+    if isinstance(content, list):
+        parsed_text = []
+        for block in content:
+            if isinstance(block, str):
+                parsed_text.append(block)
+            elif isinstance(block, dict) and "text" in block:
+                parsed_text.append(block["text"])
+        return "".join(parsed_text)
+
+    return str(content)
+
+def _build_cypher_chain(
     neo4j_uri: str,
     neo4j_user: str,
     neo4j_pwd: str,
-    google_api_key: str,
-    driver,
+    llm,
     selected_repos: Optional[list] = None,
     top_k: int = 5,
-) -> str:
-    graph = Neo4jGraph(
-        url=neo4j_uri,
-        username=neo4j_user,
-        password=neo4j_pwd
-    )
-
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        google_api_key=google_api_key,
-        temperature=0.0,
-    )
-
-    qa_llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        google_api_key=google_api_key,
-        temperature=0.0,
-    )
+):
+    """Build and return a GraphCypherQAChain with the shared prompt templates.
+    Single source of truth — replaces the two duplicate chain constructions
+    that previously existed in query_graph_cypher() and the inline block."""
+    graph = Neo4jGraph(url=neo4j_uri, username=neo4j_user, password=neo4j_pwd)
 
     if selected_repos:
         _repo_list = "[" + ", ".join(f'"{r}"' for r in selected_repos) + "]"
@@ -573,9 +899,9 @@ def query_graph_cypher(
         input_variables=["context", "question"]
     )
 
-    chain = GraphCypherQAChain.from_llm(
+    return GraphCypherQAChain.from_llm(
         cypher_llm=llm,
-        qa_llm=qa_llm,
+        qa_llm=llm,
         graph=graph,
         verbose=True,
         cypher_prompt=cypher_prompt,
@@ -585,45 +911,86 @@ def query_graph_cypher(
         top_k=top_k,
     )
 
-    try:
-        response = chain.invoke({"query": question})
+def route_and_answer(
+    user_input: str,
+    neo4j_uri: str,
+    neo4j_user: str,
+    neo4j_pwd: str,
+    google_api_key: str,
+    driver,
+    selected_repos: Optional[list] = None,
+    top_k: int = 5,
+) -> str:
+    """
+    Single-pass token-efficient router.
 
-        answer = response.get("result", "")
-        target = None
-        target = None
-        if any(keyword in question.lower() for keyword in ["impact", "break", "affected"]):
-            # This regex looks for text that might be a module name (e.g., "in pandas")
-            match = re.search(r'(?:in|for|of)\s+([a-zA-Z0-9_\-\.]+)', question.lower())
-            if match:
-                target = match.group(1)
+    Flow:
+      1. classify_intent()  — 1 cheap LLM call (~150 input tokens, JSON only).
+      2a. GENERAL_GRAPH_QUERY → GraphCypherQAChain directly (no agent overhead).
+           Total: 2 LLM calls (Cypher gen + QA answer).
+      2b. Specific intent    → Agent with pre-wired intent_data (no re-classify).
+           Total: 2-3 LLM calls (agent + tool round-trip).
 
-        if target:
-            impacts = fetch_impact_analysis(driver, target)
-            # You can append this to your answer string here
-            answer += f"\n\n### Additional Impact Data for {target}\n{impacts}"
+    Replaces the old dual-path that always ran both the QA chain AND the agent
+    (4 LLM calls, with the QA result silently discarded).
+    """
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        google_api_key=google_api_key,
+        temperature=0.0,
+    )
 
-        evidence_count= extract_evidence_count(answer)
-        repo_count = len(selected_repos) if selected_repos else 1
-        exact_matches = 1
+    # ── Step 1: classify once ─────────────────────────────────────────────────
+    intent_data = classify_intent(user_input, llm)
+    intent = intent_data["intent"]
+    logger.info("route_and_answer: intent=%s | query=%.80s", intent, user_input)
 
-        confidence = calculate_confidence(
-            evidence_count=evidence_count,
-            repo_count=repo_count,
-            exact_matches=exact_matches
+    # ── Step 2a: simple path — QA chain only ─────────────────────────────────
+    if intent == "GENERAL_GRAPH_QUERY":
+        chain = _build_cypher_chain(
+            neo4j_uri=neo4j_uri,
+            neo4j_user=neo4j_user,
+            neo4j_pwd=neo4j_pwd,
+            llm=llm,
+            selected_repos=selected_repos,
+            top_k=top_k,
         )
+        try:
+            response = chain.invoke({"query": user_input})
+            answer = response.get("result", "")
+            if not answer:
+                return "I couldn't find relevant data in the knowledge graph for that query."
+            # Compute confidence (available for future display use)
+            calculate_confidence(
+                evidence_count=extract_evidence_count(answer),
+                repo_count=len(selected_repos) if selected_repos else 1,
+                exact_matches=1,
+            )
+            return answer
+        except ValueError as exc:
+            if "No tools" in str(exc) or "OutputParserException" in str(exc):
+                return "❌ **Query Generation Failed:** The LLM couldn't map that question to the database schema."
+            raise
+        except Exception as exc:
+            return f"❌ **Query Execution Failed:**\n```\n{str(exc)}\n```"
 
-        formatted = f"""
-        {answer}
-        """
+    # ── Step 2b: complex path — agent with pre-wired intent ───────────────────
+    chain = _build_cypher_chain(
+        neo4j_uri=neo4j_uri,
+        neo4j_user=neo4j_user,
+        neo4j_pwd=neo4j_pwd,
+        llm=llm,
+        selected_repos=selected_repos,
+        top_k=top_k,
+    )
+    toolkit = GraphRAGToolkit(driver=driver, cypher_qa_chain=chain)
+    return create_and_run_agent(
+        user_input=user_input,
+        llm=llm,
+        toolkit=toolkit,
+        intent_data=intent_data,   # ← skips a second classify_intent() call
+    )
 
-        return formatted
-    except ValueError as exc:
-        if "No tools" in str(exc) or "OutputParserException" in str(exc):
-            return "❌ **Query Generation Failed:** The LLM couldn't map that question to the database schema."
-        raise exc
-    except Exception as exc:
-        return f"❌ **Query Execution Failed:**\n```\n{str(exc)}\n```"
-    
 def calculate_confidence(
         evidence_count: int,
         repo_count: int,
@@ -934,15 +1301,18 @@ if user_input:
 
     else:
         with st.chat_message("assistant", avatar="🤖"):
-            with st.spinner("🔍 Searching knowledge graph and generating answer…"):
+            with st.spinner("🔍 Searching knowledge graph…"):
                 try:
                     _sel = st.session_state.get("selected_repos") or []
                     _available = st.session_state.get("available_repos") or []
                     _active_repos = _sel if (_sel and len(_sel) < len(_available)) else None
                     drv = _get_driver(neo4j_uri, neo4j_user, neo4j_pwd)
 
-                    answer = query_graph_cypher(
-                        question=user_input,
+                    # ── Single-pass router: classify once, then route ──────────
+                    # Replaces the old dual-path (QA chain + agent = 4 LLM calls)
+                    # with classify_intent() → QA chain OR agent (2-3 LLM calls).
+                    answer = route_and_answer(
+                        user_input=user_input,
                         neo4j_uri=neo4j_uri,
                         neo4j_user=neo4j_user,
                         neo4j_pwd=neo4j_pwd,

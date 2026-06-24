@@ -350,23 +350,12 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
         
         # 1. Identify Function and Method Declarations
         if node.type in ['function_declaration', 'method_declaration']:
-            name_node = None
-            for child in node.children:
-                if child.type in ['identifier', 'field_identifier']:
-                    name_node = child
-                    break
+            # tree-sitter-go defines a specific field for the function name
+            name_node = node.child_by_field_name('name')
             
             if name_node:
                 name = get_text(name_node)
-                new_func = name
-                functions.append({
-                    "name": name,
-                    "id": f"{filepath}::{name}",
-                    # Tree-sitter lines are 0-indexed, we convert to 1-indexed
-                    "start": node.start_point[0] + 1, 
-                    "end": node.end_point[0] + 1,
-                    "code": get_text(node)
-                })
+
 
         # 2. Identify Function Calls within a function
         elif node.type == 'call_expression' and current_func:
