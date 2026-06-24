@@ -10,7 +10,9 @@ tqdm>=4.66.0                     # Terminal progress bars for the CLI pipeline
 python-dotenv>=1.0.0             # Load .env files for API keys
 
 # ── Frontend UI (frontend_chat.py) ───────────────────────────────────────────
-streamlit>=1.35.0                # Web UI framework
+fastapi>=0.100.0                 # Backend API framework
+uvicorn>=0.20.0                  # ASGI server for FastAPI
+pydantic>=2.0.0                  # Data validation
 neo4j-graphrag[google-genai]>=1.1.0  # VectorRetriever + GraphRAG pipeline
 langchain>=0.3.0                 # AgentExecutor, create_tool_calling_agent, @tool
 langchain-neo4j>=0.1.0           # GraphCypherQAChain, Neo4jGraph
