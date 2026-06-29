@@ -152,6 +152,29 @@ function App() {
         )}
 
         <div className="section-header">⚙️ RAG Settings</div>
+        {repos.length > 0 && (
+          <div className="input-group">
+            <label className="input-label">Target Repositories</label>
+            <select 
+              multiple 
+              className="text-input" 
+              style={{ height: 'auto', minHeight: '80px', padding: '0.5rem' }}
+              value={selectedRepos}
+              onChange={(e) => {
+                const options = [...e.target.selectedOptions];
+                const values = options.map(option => option.value);
+                setSelectedRepos(values);
+              }}
+            >
+              {repos.map(repo => (
+                <option key={repo} value={repo}>{repo}</option>
+              ))}
+            </select>
+            <div style={{ fontSize: '0.7rem', color: 'rgba(255,255,255,0.4)', marginTop: '4px' }}>
+              Hold Cmd/Ctrl to select multiple. Leave empty to search all.
+            </div>
+          </div>
+        )}
         <div className="input-group">
           <label className="input-label">Top-K retrieval results: {topK}</label>
           <input type="range" min="1" max="15" value={topK} onChange={e => setTopK(parseInt(e.target.value))} />

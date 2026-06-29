@@ -5,7 +5,7 @@
 #
 # PURPOSE:
 #   A pure Python command-line tool to bootstrap a GitHub repository into a
-#   Neo4j knowledge graph.  Zero Streamlit dependencies.
+#   Neo4j knowledge graph.
 #
 # USAGE:
 #   python backend_ingest.py
@@ -145,10 +145,11 @@ MERGE (repo:Repository {full_name: $repo_full_name})
 MERGE (file:File {path: $filepath, repo: $repo_full_name})
 MERGE (func:Function {id: $func_id})
   ON CREATE SET
-    func.name     = $func_name,
-    func.filepath = $filepath,
-    func.repo     = $repo_full_name,
-    func.code     = $func_code
+    func.name      = $func_name,
+    func.filepath  = $filepath,
+    func.repo      = $repo_full_name,
+    func.code      = $func_code,
+    func.embedding = $embedding
 MERGE (file)-[:DECLARES]->(func)
 MERGE (repo)-[:DECLARES]->(func)
 """
@@ -192,6 +193,7 @@ MERGE (repo)-[:CONTAINS_FILE]->(file)
 CYPHER_INGEST_DEPENDENCY = """
 MERGE (file:File {path: $filepath, repo: $repo_full_name})
 MERGE (module:Module {name: $target_module})
+  ON CREATE SET module.embedding = coalesce(module.embedding, $embedding)
 MERGE (file)-[r:DEPENDS_ON]->(module)
   ON CREATE SET r.added_in_commit = $commit_sha, r.is_active = true
   ON MATCH  SET r.is_active = true
@@ -252,6 +254,28 @@ ORDER BY affected_file
 CYPHER_VECTOR_INDEX = """
 CREATE VECTOR INDEX issue_embeddings IF NOT EXISTS
 FOR (i:Issue) ON (i.embedding)
+OPTIONS {
+  indexConfig: {
+    `vector.dimensions`: 3072,
+    `vector.similarity_function`: 'cosine'
+  }
+}
+"""
+
+CYPHER_CODE_VECTOR_INDEX = """
+CREATE VECTOR INDEX code_embeddings IF NOT EXISTS
+FOR (n:Function) ON (n.embedding)
+OPTIONS {
+  indexConfig: {
+    `vector.dimensions`: 3072,
+    `vector.similarity_function`: 'cosine'
+  }
+}
+"""
+
+CYPHER_MODULE_VECTOR_INDEX = """
+CREATE VECTOR INDEX module_embeddings IF NOT EXISTS
+FOR (m:Module) ON (m.embedding)
 OPTIONS {
   indexConfig: {
     `vector.dimensions`: 3072,
@@ -347,29 +371,34 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
 
     def walk(node, current_func=None):
         new_func = current_func
-        
+
         # 1. Identify Function and Method Declarations
         if node.type in ['function_declaration', 'method_declaration']:
-            # tree-sitter-go defines a specific field for the function name
             name_node = node.child_by_field_name('name')
-            
             if name_node:
                 name = get_text(name_node)
-
+                new_func = name  # Track current function scope for call-edge detection
+                functions.append({
+                    "name":  name,
+                    "id":    f"{filepath}::{name}",
+                    "start": node.start_point[0] + 1,
+                    "end":   node.end_point[0] + 1,
+                    "code":  get_text(node),
+                })
 
         # 2. Identify Function Calls within a function
         elif node.type == 'call_expression' and current_func:
             func_node = node.children[0]
             callee_name = None
-            
-            if func_node.type == 'identifier': # e.g., foo()
+
+            if func_node.type == 'identifier':  # e.g., foo()
                 callee_name = get_text(func_node)
-            elif func_node.type == 'selector_expression': # e.g., pkg.foo() or obj.foo()
+            elif func_node.type == 'selector_expression':  # e.g., pkg.foo() or obj.foo()
                 for child in func_node.children:
                     if child.type == 'field_identifier':
                         callee_name = get_text(child)
                         break
-            
+
             if callee_name:
                 calls.append((current_func, callee_name))
 
@@ -670,7 +699,7 @@ def summarize_with_llm(
         try:
             client = google_genai.Client(api_key=google_api_key)
             response = client.models.generate_content(
-                model="gemini-3.5-flash",
+                model="gemini-2.5-flash",
                 contents=user_prompt,
                 config=genai_types.GenerateContentConfig(
                     system_instruction=system_instruction,
@@ -684,7 +713,7 @@ def summarize_with_llm(
         except Exception as exc:
             logger.debug("google-genai SDK failed: %s", exc)
 
-    model = "gemini-3.5-flash"
+    model = "gemini-2.5-flash"
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{model}:generateContent?key={google_api_key}"
@@ -723,6 +752,37 @@ def summarize_with_llm(
     return _heuristic_summary(repo_full_name, compact_files, commit_msg)
 
 
+
+def get_embedding(text: str, api_key: str) -> list:
+    if not text or not api_key: return []
+    if GENAI_AVAILABLE:
+        try:
+            client = google_genai.Client(api_key=api_key)
+            resp = client.models.embed_content(model="gemini-embedding-2", contents=text)
+            return list(resp.embeddings[0].values)
+        except Exception as exc:
+            logger.debug("google-genai embed failed: %s", exc)
+    return []
+
+
+def get_embeddings_batch(texts: list, api_key: str) -> list:
+    """Embed a list of texts in a single Gemini API call.
+
+    Returns a parallel list of float-vectors (one per input text).
+    Falls back to individual calls if the batch request fails.
+    """
+    if not texts or not api_key:
+        return [[] for _ in texts]
+    if GENAI_AVAILABLE:
+        try:
+            client = google_genai.Client(api_key=api_key)
+            resp = client.models.embed_content(model="gemini-embedding-2", contents=texts)
+            return [list(emb.values) for emb in resp.embeddings]
+        except Exception as exc:
+            logger.debug("Batch embed failed — falling back to individual calls: %s", exc)
+    # Fallback: embed one-by-one
+    return [get_embedding(t, api_key) for t in texts]
+
 def _github_headers(github_token: str) -> dict:
     headers = {
         "Accept": "application/vnd.github+json",
@@ -734,9 +794,28 @@ def _github_headers(github_token: str) -> dict:
 
 
 def _fetch_json(url: str, params=None, github_token: str = "") -> dict:
-    resp = requests.get(url, headers=_github_headers(github_token), params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    """GET a JSON endpoint with exponential back-off for transient errors."""
+    last_exc: Exception = RuntimeError(f"Failed after 5 attempts: {url}")
+    for attempt in range(5):
+        try:
+            resp = requests.get(
+                url, headers=_github_headers(github_token), params=params, timeout=30
+            )
+            if resp.status_code in (429, 500, 502, 503):
+                wait = int(resp.headers.get("Retry-After", 2 ** attempt))
+                logger.debug(
+                    "HTTP %s — retrying in %ds (attempt %d/5): %s",
+                    resp.status_code, wait, attempt + 1, url,
+                )
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.Timeout as exc:
+            last_exc = exc
+            logger.debug("Timeout (attempt %d/5): %s", attempt + 1, url)
+            time.sleep(2 ** attempt)
+    raise last_exc
 
 
 async def _fetch_commit_async(
@@ -835,6 +914,7 @@ def _write_commit_to_graph(
                 target_module=target,
                 repo_full_name=repo_full_name,
                 commit_sha=commit_sha,
+                embedding=None,
             )
         # --- Temporal dependency soft-deletes (removed imports) ---
         for source, _rel, target in dependencies.get("removed", []):
@@ -967,6 +1047,7 @@ def phase2_scan_file_contents(
     repo_full_name: str,
     file_paths: list,
     github_token: str,
+    google_api_key: str,
 ) -> int:
     if not file_paths:
         return 0
@@ -978,16 +1059,21 @@ def phase2_scan_file_contents(
     def _flush_batch():
         if not batch_params:
             return
+        # Batch-embed all unique module names in a single API call
+        unique_modules = list({target for _, target, _ in batch_params})
+        batch_vectors = get_embeddings_batch(unique_modules, google_api_key)
+        embeddings_map: dict = dict(zip(unique_modules, batch_vectors))
+
         with driver.session() as sess:
             for filepath, target_module, repo_fn in batch_params:
+                emb = embeddings_map.get(target_module) or None
                 sess.run(
                     CYPHER_INGEST_DEPENDENCY,
                     filepath=filepath,
                     target_module=target_module,
                     repo_full_name=repo_fn,
-                    # Phase 2 scans HEAD without a specific commit reference;
-                    # use a sentinel so the temporal property is still populated.
                     commit_sha="initial_scan",
+                    embedding=emb,
                 )
         batch_params.clear()
 
@@ -1015,6 +1101,7 @@ def phase2_scan_file_contents(
                 with driver.session() as sess:
                     for func in ast_data["functions"]:
                         prefixed_id = f"{repo_full_name}::{func['id']}"
+                        embed_text = f"{func['name']}\n{func.get('code', '')}"
                         sess.run(
                             CYPHER_INGEST_FUNCTION,
                             repo_full_name=repo_full_name,
@@ -1022,6 +1109,7 @@ def phase2_scan_file_contents(
                             func_id=prefixed_id,
                             func_name=func["name"],
                             func_code=func.get("code", ""),
+                            embedding=get_embedding(embed_text, google_api_key),
                         )
                     for caller, callee in ast_data["calls"]:
                         caller_id = f"{repo_full_name}::{path}::{caller}"
@@ -1158,9 +1246,6 @@ def phase3_backfill_commits(
                 commit_date = commit_info.get("author", {}).get("date", "")
                 commit_url  = commit_payload.get("html_url", "")
 
-                commit_dt = datetime.strptime(commit_date, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                is_deep_scan = commit_dt >= cutoff_date
-
                 modified_files_list = [item["filename"] for item in compact_files]
                 dependencies = extract_temporal_dependencies(compact_files)
                 raw_diff = render_diff_text(compact_files)
@@ -1215,8 +1300,11 @@ def phase3_backfill_commits(
                                     prefixed_id = f"{repo_full_name}::{func_id}"
                                     sess.run(CYPHER_MODIFIED_FUNCTION,
                                              commit_sha=sha, func_id=prefixed_id)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.debug(
+                                "Deep-scan function attribution failed for %s@%s: %s",
+                                filepath, sha[:8], exc,
+                            )
 
                 processed += 1
                 time.sleep(0.5)
@@ -1301,6 +1389,8 @@ def bootstrap(
     logger.info("Creating Neo4j indexes and constraints …")
     for cypher, label in [
         (CYPHER_VECTOR_INDEX,         "vector index issue_embeddings"),
+        (CYPHER_CODE_VECTOR_INDEX,    "vector index code_embeddings"),
+        (CYPHER_MODULE_VECTOR_INDEX,  "vector index module_embeddings"),
         (CYPHER_FULLTEXT_INDEX,       "fulltext index commit_summaries"),
         (CYPHER_CONSTRAINT_FILE_REPO, "composite uniqueness: File(path, repo)"),
         (CYPHER_CONSTRAINT_FUNC_ID,   "uniqueness: Function(id)"),
@@ -1338,7 +1428,7 @@ def bootstrap(
     print()
     unscanned_files = get_unprocessed_files(driver, repo_full_name, source_files)
     files_scanned = phase2_scan_file_contents(
-        driver, repo_full_name, unscanned_files, github_token
+        driver, repo_full_name, unscanned_files, github_token, google_api_key
     )
     _set_status(driver, repo_full_name, "in_progress",
                 f"Phase 2 done — {files_scanned} files scanned for imports.",
