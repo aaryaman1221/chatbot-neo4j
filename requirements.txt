@@ -6,9 +6,11 @@ PyGithub>=2.3.0                  # GitHub API via Auth.Token
 neo4j>=5.20.0                    # Neo4j Python driver
 google-genai>=0.8.0              # Gemini embeddings + LLM summarization
 requests>=2.31.0                 # REST fallback for GitHub & Gemini APIs
+httpx>=0.27.0                    # Async HTTP client
 tqdm>=4.66.0                     # Terminal progress bars for the CLI pipeline
 python-dotenv>=1.0.0             # Load .env files for API keys
-
+tree-sitter>=0.21.3              # AST parsing for code analysis
+tree-sitter-go>=0.21.2           # AST parsing for Go code
 # ── Frontend UI (frontend_chat.py) ───────────────────────────────────────────
 fastapi>=0.100.0                 # Backend API framework
 uvicorn>=0.20.0                  # ASGI server for FastAPI

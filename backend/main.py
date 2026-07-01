@@ -226,6 +226,65 @@ def _extract_path_hints(query: str) -> List[str]:
     return unique
 
 
+# Regex that detects blame-style intent even when adverbs sit between
+# 'who' and the verb (e.g. "who last changed", "who recently modified").
+import re as _re_blame
+_BLAME_PATTERN = _re_blame.compile(
+    r'\bwho\b.{0,25}\b(added|wrote|changed|modified|introduced|created|implemented|broke|touched|owns|did)\b'
+    r'|\bwhich commit\b'
+    r'|\bwhen was\b'
+    r'|\bwhen did\b'
+    r'|\bgit blame\b'
+    r'|\bblame\b'
+    r'|\bwho is responsible\b'
+    r'|\bwho owns\b',
+    _re_blame.IGNORECASE,
+)
+
+
+def _extract_blame_hints(query: str) -> dict:
+    """
+    Extract function name, file name, and any quoted identifier from the query
+    to drive the blame Cypher lookup.
+
+    Returns a dict with keys:
+      - 'func_hints': list of possible function/symbol names
+      - 'file_hints': list of possible file path fragments
+    """
+    import re
+    func_hints: list[str] = []
+    file_hints: list[str] = []
+
+    # Quoted identifiers: 'process_payment', "handleLogin", `myFunc`
+    for m in re.finditer(r'[\'"`]([\w_]+)[\'"`]', query):
+        func_hints.append(m.group(1))
+
+    # CamelCase or snake_case words that look like function/class names
+    for m in re.finditer(r'\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+|[A-Z][a-zA-Z0-9]{2,})\b', query):
+        word = m.group(1)
+        # Skip common English filler words
+        if word.lower() not in {
+            "who", "what", "when", "where", "which", "how", "the", "this", "that",
+            "was", "were", "has", "have", "did", "does", "added", "changed",
+            "introduced", "modified", "created", "wrote",
+        }:
+            func_hints.append(word)
+
+    # File extensions: auth.py, payment.go, user_service.ts
+    for m in re.finditer(r'\b([\w_\-]+\.(?:py|go|ts|js|java|cpp|c|rb|rs|kt))\b', query, re.IGNORECASE):
+        file_hints.append(m.group(1))
+        func_hints.append(m.group(1).rsplit(".", 1)[0])  # stem as func hint too
+
+    # Path-style fragments: auth/login, services/payment
+    for m in re.finditer(r'\b([\w\-]+/[\w\-]+)\b', query):
+        file_hints.append(m.group(1))
+
+    # Deduplicate
+    func_hints = list(dict.fromkeys(h for h in func_hints if len(h) > 2))
+    file_hints = list(dict.fromkeys(file_hints))
+    return {"func_hints": func_hints, "file_hints": file_hints}
+
+
 def _build_context_block(records: list[dict], source: str) -> str:
     """
     Format a list of retrieval records into clearly labelled plain-text sections.
@@ -275,6 +334,50 @@ def _build_context_block(records: list[dict], source: str) -> str:
     return "\n".join(lines)
 
 
+def _build_blame_context_block(records: list[dict]) -> str:
+    """
+    Format blame records (User → Commit → Function/File) into a clearly
+    labelled plain-text section for the LLM.
+
+    Each record is expected to have:
+      - 'author'       : User.login
+      - 'commit_sha'   : Commit.sha
+      - 'commit_msg'   : Commit.message
+      - 'committed_at' : Commit.timestamp
+      - 'func_name'    : Function.name  (may be None for file-level hits)
+      - 'filepath'     : Function.filepath or File.path
+    """
+    if not records:
+        return ""
+
+    lines: list[str] = ["[Source: blame-traversal]"]
+    seen: set[str] = set()
+
+    for rec in records:
+        author      = rec.get("author") or "<unknown>"
+        sha         = rec.get("commit_sha") or "<no sha>"
+        msg         = (rec.get("commit_msg") or "").strip().splitlines()[0]  # first line only
+        date        = rec.get("committed_at") or ""
+        func_name   = rec.get("func_name") or ""
+        filepath    = rec.get("filepath") or "<unknown path>"
+
+        uid = f"{sha}::{filepath}::{func_name}"
+        if uid in seen:
+            continue
+        seen.add(uid)
+
+        lines.append(f"\n{'─'*60}")
+        lines.append(f"Author     : {author}")
+        lines.append(f"Commit SHA : {sha}")
+        lines.append(f"Date       : {date}")
+        lines.append(f"Message    : {msg}")
+        if func_name:
+            lines.append(f"Function   : {func_name}")
+        lines.append(f"File       : {filepath}")
+
+    return "\n".join(lines)
+
+
 # -----------------------------------------------------------------------------
 # GraphRAG Core — main retrieval
 # -----------------------------------------------------------------------------
@@ -287,11 +390,12 @@ def retrieve_code_context(
     top_k: int = 5,
 ) -> str:
     """
-    3-stage retrieval pipeline:
-      Stage 1 — Vector search (fixed Cypher: returns seed + connected code bodies).
-      Stage 2 — Path-hint keyword boost (direct file-path lookup for components
-                 explicitly named in the query — bypasses vector ranking).
-      Stage 3 — Fulltext commit-summary fallback (only if stages 1+2 both fail).
+    Multi-stage retrieval pipeline:
+      Stage 1 — Vector search (semantic — returns seed + connected code bodies).
+                 Results are also reused by Stage 4 for blame resolution.
+      Stage 2 — Path-hint keyword boost (direct file-path lookup for named components).
+      Stage 3 — Fulltext commit-summary fallback (commit/history keywords).
+      Stage 4 — Blame traversal (who added/changed — uses Stage 1 filepaths directly).
 
     Logs every decision point so you can see exactly which path was taken.
     """
@@ -304,6 +408,7 @@ def retrieve_code_context(
     path_hints    = _extract_path_hints(user_query)
     context_parts: list[str] = []
     retrieval_path_tags: list[str] = []
+    vector_rows:   list[dict] = []   # kept for Stage 4 semantic blame resolution
 
     # ── Stage 1: Vector search ────────────────────────────────────────────────
     # Fixed query:
@@ -357,6 +462,7 @@ def retrieve_code_context(
                 "(each may carry up to 4 connected nodes).", len(rows),
             )
             if rows:
+                vector_rows = rows          # expose to Stage 4
                 context_parts.append(_build_context_block(rows, "vector-search"))
                 retrieval_path_tags.append("vector")
         except Exception as exc:
@@ -556,6 +662,220 @@ def retrieve_code_context(
         except Exception as exc:
             logger.error("[RETRIEVE] ❌ Stage 3b fulltext FAILED: %s", exc)
 
+    # ── Stage 4: Blame traversal ───────────────────────────────────────────────
+    # Triggers on "who added / who changed / which commit / blame" style queries.
+    # Walks the (User)-[:AUTHORED]->(Commit)-[:MODIFIED]->(Function|File) chain
+    # and returns author + commit metadata alongside the code artefact.
+    _is_blame_query = bool(_BLAME_PATTERN.search(user_query))
+
+    if _is_blame_query:
+        logger.info("[RETRIEVE] Stage 4 — blame traversal triggered.")
+
+        # ── Semantic resolution: use exact filepaths from Stage 1 vector results
+        # This is far more reliable than NLP hint extraction from free text.
+        semantic_filepaths = list(dict.fromkeys(
+            r["filepath"] for r in vector_rows if r.get("filepath")
+        ))
+
+        # ── Fallback: NLP hint extraction (only when vector search returned nothing)
+        fallback_hints: list[str] = []
+        if not semantic_filepaths:
+            logger.info("[RETRIEVE] Stage 4 — no vector results, falling back to NLP hints.")
+            blame_hints  = _extract_blame_hints(user_query)
+            fallback_hints = blame_hints["func_hints"] + blame_hints["file_hints"]
+
+        logger.info(
+            "[RETRIEVE] Stage 4 semantic_filepaths=%s  fallback_hints=%s",
+            semantic_filepaths, fallback_hints,
+        )
+
+        blame_rows: list[dict] = []
+
+        # 4a — Semantic path: query by exact filepaths from Stage 1
+        for filepath in semantic_filepaths:
+            if selected_repos:
+                blame_fp_cypher = """
+                MATCH (u:User)-[:AUTHORED]->(c:Commit)-[:MODIFIED]->(f:File)
+                WHERE f.path = $filepath
+                MATCH (c)-[:BELONGS_TO]->(r:Repository)
+                WHERE r.full_name IN $selected_repos
+                RETURN
+                  u.login       AS author,
+                  c.sha         AS commit_sha,
+                  coalesce(c.message, c.summary_text, '') AS commit_msg,
+                  c.timestamp   AS committed_at,
+                  ''            AS func_name,
+                  f.path        AS filepath
+                ORDER BY c.timestamp DESC
+                LIMIT 5
+                """
+            else:
+                blame_fp_cypher = """
+                MATCH (u:User)-[:AUTHORED]->(c:Commit)-[:MODIFIED]->(f:File)
+                WHERE f.path = $filepath
+                RETURN
+                  u.login       AS author,
+                  c.sha         AS commit_sha,
+                  coalesce(c.message, c.summary_text, '') AS commit_msg,
+                  c.timestamp   AS committed_at,
+                  ''            AS func_name,
+                  f.path        AS filepath
+                ORDER BY c.timestamp DESC
+                LIMIT 5
+                """
+            try:
+                with driver.session() as session:
+                    rows = session.run(
+                        blame_fp_cypher,
+                        filepath=filepath,
+                        selected_repos=selected_repos or [],
+                    ).data()
+                logger.info(
+                    "[RETRIEVE] Stage 4a semantic filepath=%r → %d record(s).", filepath, len(rows)
+                )
+                blame_rows.extend(rows)
+            except Exception as exc:
+                logger.warning("[RETRIEVE] Stage 4a filepath=%r failed: %s", filepath, exc)
+
+            # Also try Function-level blame for the same filepath
+            if selected_repos:
+                blame_fn_cypher = """
+                MATCH (u:User)-[:AUTHORED]->(c:Commit)-[:MODIFIED]->(fn:Function)
+                WHERE fn.filepath = $filepath
+                MATCH (c)-[:BELONGS_TO]->(r:Repository)
+                WHERE r.full_name IN $selected_repos
+                RETURN
+                  u.login       AS author,
+                  c.sha         AS commit_sha,
+                  coalesce(c.message, c.summary_text, '') AS commit_msg,
+                  c.timestamp   AS committed_at,
+                  fn.name       AS func_name,
+                  fn.filepath   AS filepath
+                ORDER BY c.timestamp DESC
+                LIMIT 5
+                """
+            else:
+                blame_fn_cypher = """
+                MATCH (u:User)-[:AUTHORED]->(c:Commit)-[:MODIFIED]->(fn:Function)
+                WHERE fn.filepath = $filepath
+                RETURN
+                  u.login       AS author,
+                  c.sha         AS commit_sha,
+                  coalesce(c.message, c.summary_text, '') AS commit_msg,
+                  c.timestamp   AS committed_at,
+                  fn.name       AS func_name,
+                  fn.filepath   AS filepath
+                ORDER BY c.timestamp DESC
+                LIMIT 5
+                """
+            try:
+                with driver.session() as session:
+                    rows = session.run(
+                        blame_fn_cypher,
+                        filepath=filepath,
+                        selected_repos=selected_repos or [],
+                    ).data()
+                logger.info(
+                    "[RETRIEVE] Stage 4a func-level filepath=%r → %d record(s).", filepath, len(rows)
+                )
+                blame_rows.extend(rows)
+            except Exception as exc:
+                logger.warning("[RETRIEVE] Stage 4a func filepath=%r failed: %s", filepath, exc)
+
+        # 4b — Fallback: NLP hint-based lookup (only runs when Stage 1 had no results)
+        for hint in fallback_hints:
+            if selected_repos:
+                blame_hint_cypher = """
+                MATCH (u:User)-[:AUTHORED]->(c:Commit)-[:MODIFIED]->(f:File)
+                WHERE toLower(f.path) CONTAINS toLower($hint)
+                MATCH (c)-[:BELONGS_TO]->(r:Repository)
+                WHERE r.full_name IN $selected_repos
+                RETURN
+                  u.login       AS author,
+                  c.sha         AS commit_sha,
+                  coalesce(c.message, c.summary_text, '') AS commit_msg,
+                  c.timestamp   AS committed_at,
+                  ''            AS func_name,
+                  f.path        AS filepath
+                ORDER BY c.timestamp DESC
+                LIMIT 5
+                """
+            else:
+                blame_hint_cypher = """
+                MATCH (u:User)-[:AUTHORED]->(c:Commit)-[:MODIFIED]->(f:File)
+                WHERE toLower(f.path) CONTAINS toLower($hint)
+                RETURN
+                  u.login       AS author,
+                  c.sha         AS commit_sha,
+                  coalesce(c.message, c.summary_text, '') AS commit_msg,
+                  c.timestamp   AS committed_at,
+                  ''            AS func_name,
+                  f.path        AS filepath
+                ORDER BY c.timestamp DESC
+                LIMIT 5
+                """
+            try:
+                with driver.session() as session:
+                    rows = session.run(
+                        blame_hint_cypher,
+                        hint=hint,
+                        selected_repos=selected_repos or [],
+                    ).data()
+                logger.info(
+                    "[RETRIEVE] Stage 4b fallback hint=%r → %d record(s).", hint, len(rows)
+                )
+                blame_rows.extend(rows)
+            except Exception as exc:
+                logger.warning("[RETRIEVE] Stage 4b hint=%r failed: %s", hint, exc)
+
+        # 4c — fallback: no semantic paths and no NLP hints → return top authors overall
+        if not semantic_filepaths and not fallback_hints:
+            logger.info("[RETRIEVE] Stage 4c — no hints; fetching top authors overall.")
+            repo_clause = "WHERE r.full_name IN $selected_repos" if selected_repos else ""
+            top_authors_cypher = f"""
+            MATCH (u:User)-[:AUTHORED]->(c:Commit)-[:BELONGS_TO]->(r:Repository)
+            {repo_clause}
+            RETURN
+              u.login   AS author,
+              count(c)  AS commit_count
+            ORDER BY commit_count DESC
+            LIMIT 10
+            """
+            try:
+                with driver.session() as session:
+                    rows = session.run(
+                        top_authors_cypher,
+                        selected_repos=selected_repos or [],
+                    ).data()
+                logger.info("[RETRIEVE] Stage 4c top-authors → %d record(s).", len(rows))
+                # Reformat to match blame schema
+                blame_rows.extend([
+                    {
+                        "author":       r.get("author"),
+                        "commit_sha":   f"{r.get('commit_count')} commits total",
+                        "commit_msg":   "",
+                        "committed_at": "",
+                        "func_name":    "",
+                        "filepath":     "(all files)",
+                    }
+                    for r in rows
+                ])
+            except Exception as exc:
+                logger.warning("[RETRIEVE] Stage 4c failed: %s", exc)
+
+        if blame_rows:
+            context_parts.append(_build_blame_context_block(blame_rows))
+            retrieval_path_tags.append("blame")
+            logger.info("[RETRIEVE] Stage 4 — %d blame record(s) added to context.", len(blame_rows))
+        else:
+            logger.warning(
+                "[RETRIEVE] ⚠️  Stage 4 blame traversal returned 0 results. "
+                "Check that (User)-[:AUTHORED]->(Commit)-[:MODIFIED]->(Function/File) "
+                "edges were created during ingest."
+            )
+    else:
+        logger.info("[RETRIEVE] Stage 4 skipped — no blame keywords in query.")
+
     # ── Final assembly ────────────────────────────────────────────────────────
     if not context_parts:
         logger.error(
@@ -594,6 +914,7 @@ git history, issues, and repository structure. You have access to a knowledge gr
 code functions, commits, files, issues, and repository metadata.
 
 The context below is structured as labelled sections. Each section starts with a [Source: ...] tag.
+
 Sections from "vector-search" or "path-hint-boost" contain function/code blocks:
   Function : <name>
   File     : <filepath>
@@ -605,6 +926,14 @@ Sections from "fulltext-fallback" contain commit or issue records:
   File     : <repo>
   Code     : <commit message / summary / diff>
 
+Sections from "blame-traversal" contain git-blame style records linking authors to code changes:
+  Author     : <GitHub login of the person who made the commit>
+  Commit SHA : <the exact commit SHA>
+  Date       : <ISO timestamp of the commit>
+  Message    : <first line of the commit message>
+  Function   : <name of the function that was modified>  (may be absent for file-level hits)
+  File       : <file path that was changed>
+
 CONTEXT:
 {graph_context}
 
@@ -612,7 +941,12 @@ Instructions:
 - Answer ONLY using the information shown in the context above. Never invent evidence.
 - For questions about commits, list them with their SHA, repo, and summary.
 - For questions about code, write like a senior engineer doing a code review explanation.
-- Start with a "### Summary" section.
+- For blame / ownership questions (who added / who changed / which commit):
+    * Lead with a clear statement of the author's name and commit SHA.
+    * Include the date and the commit message so the manager has full context.
+    * If multiple commits touched the same code, list them in reverse-chronological order.
+    * Use the heading "### Ownership & Blame Summary" instead of the generic summary.
+- Start with a "### Summary" section (or "### Ownership & Blame Summary" for blame queries).
 - Include "### Impact Analysis" ONLY when you can point to specific code that changes.
 - End with "### Evidence" listing every function/commit SHA and file/repo you referenced, as bullet points.
 - If the context truly contains no information relevant to the question (not just no code), say:
