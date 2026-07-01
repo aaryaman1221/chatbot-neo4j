@@ -78,7 +78,8 @@ python backend_ingest.py
 Start the FastAPI backend server which handles agent interactions and graph queries.
 
 ```bash
-uvicorn backend.main:app --reload
+cd backend
+uvicorn main:app --reload
 ```
 
 ### 4. Start the React Frontend

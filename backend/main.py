@@ -166,6 +166,26 @@ _COMPONENT_KEYWORDS = [
     "styles", "style",
 ]
 
+def _sanitize_lucene_query(query: str) -> str:
+    """
+    Strip or escape characters that Lucene's classic query parser treats as
+    special syntax.  The most common offenders in repo queries are:
+      /  — opens a regex literal (causes TokenMgrError on bare prefix like /hugo)
+      ?  — single-char wildcard
+      *  — multi-char wildcard at unexpected positions
+      ~  — fuzzy / proximity operator
+      ^  — boosting operator
+
+    We replace each with a space so the remaining terms are still searched.
+    """
+    import re
+    # Replace Lucene special chars with a space
+    sanitized = re.sub(r'[/\\\?\*~\^\[\]{}()!]', ' ', query)
+    # Collapse multiple spaces
+    sanitized = re.sub(r'\s+', ' ', sanitized).strip()
+    return sanitized or query  # never return empty string
+
+
 def _extract_path_hints(query: str) -> List[str]:
     """
     Pull file-path fragments out of the user query.
@@ -401,36 +421,140 @@ def retrieve_code_context(
     else:
         logger.info("[RETRIEVE] Stage 2 skipped — no path hints in query.")
 
-    # ── Stage 3: Fulltext commit-summary fallback ─────────────────────────────
-    # Only fires when both vector and path-hint returned nothing.
-    if not context_parts:
-        logger.warning(
-            "[RETRIEVE] ⚠️  Stages 1+2 both empty — falling back to fulltext "
-            "commit summaries. Context quality will be lower."
+    # ── Stage 3: Commit retrieval ──────────────────────────────────────────────
+    # Triggers on commit/history-related keywords in the query.
+    # Stage 3a: Direct ORDER BY timestamp DESC — for "last N / recent" questions.
+    # Stage 3b: Fulltext search — for broader commit-keyword augmentation.
+    _COMMIT_KEYWORDS = (
+        "commit", "commits", "merge", "push", "pr", "pull request",
+        "issue", "bug", "fix", "release", "tag", "author", "contributor",
+        "last", "recent", "latest", "history",
+    )
+    _RECENCY_KEYWORDS = ("last", "recent", "latest", "newest", "history")
+    _query_lower = user_query.lower()
+    _needs_commit_context = (
+        not context_parts
+        or any(kw in _query_lower for kw in _COMMIT_KEYWORDS)
+    )
+    _needs_recency_sort = any(kw in _query_lower for kw in _RECENCY_KEYWORDS)
+
+    if _needs_commit_context:
+        if not context_parts:
+            logger.warning(
+                "[RETRIEVE] ⚠️  Stages 1+2 both empty — will use commit context."
+            )
+        else:
+            logger.info(
+                "[RETRIEVE] Stage 3 — augmenting with commit context "
+                "(query contains commit/history keywords)."
+            )
+
+        # ── Stage 3a: Recency-sorted direct Cypher ────────────────────────────
+        # Extracts "owner/repo" pattern from the query to filter by repo.
+        # Returns commits ordered by timestamp DESC so "last N" is correct.
+        if _needs_recency_sort:
+            import re as _re
+            # Pull "owner/repo" patterns (e.g. "gohugoio/hugo") from the query
+            _repo_matches = _re.findall(r'\b[\w\-]+/[\w\-]+\b', user_query)
+            _repo_hint = _repo_matches[0] if _repo_matches else None
+
+            # Also extract a numeric limit (e.g. "last 5" → 5)
+            _limit_match = _re.search(r'\b(\d+)\b', user_query)
+            _commit_limit = min(int(_limit_match.group(1)), 20) if _limit_match else 10
+
+            logger.info(
+                "[RETRIEVE] Stage 3a — recency query: repo_hint=%r, limit=%d",
+                _repo_hint, _commit_limit,
+            )
+
+            if _repo_hint:
+                recency_cypher = """
+                MATCH (c:Commit)-[:BELONGS_TO]->(r:Repository {full_name: $repo_hint})
+                OPTIONAL MATCH (u:User)-[:AUTHORED]->(c)
+                RETURN
+                  c.sha                          AS name,
+                  r.full_name                    AS filepath,
+                  coalesce(c.message, c.summary_text, c.diff_text, '') AS code,
+                  []                             AS connected
+                ORDER BY c.timestamp DESC
+                LIMIT $commit_limit
+                """
+                params = {"repo_hint": _repo_hint, "commit_limit": _commit_limit}
+            else:
+                # No specific repo — fetch most recent commits across all repos
+                recency_cypher = """
+                MATCH (c:Commit)-[:BELONGS_TO]->(r:Repository)
+                RETURN
+                  c.sha       AS name,
+                  r.full_name AS filepath,
+                  coalesce(c.message, c.summary_text, c.diff_text, '') AS code,
+                  []          AS connected
+                ORDER BY c.timestamp DESC
+                LIMIT $commit_limit
+                """
+                params = {"commit_limit": _commit_limit}
+                if selected_repos:
+                    recency_cypher = """
+                    MATCH (c:Commit)-[:BELONGS_TO]->(r:Repository)
+                    WHERE r.full_name IN $selected_repos
+                    RETURN
+                      c.sha       AS name,
+                      r.full_name AS filepath,
+                      coalesce(c.message, c.summary_text, c.diff_text, '') AS code,
+                      []          AS connected
+                    ORDER BY c.timestamp DESC
+                    LIMIT $commit_limit
+                    """
+                    params["selected_repos"] = selected_repos
+
+            try:
+                with driver.session() as session:
+                    rows = session.run(recency_cypher, **params).data()
+                logger.info(
+                    "[RETRIEVE] Stage 3a recency → %d commit(s).", len(rows)
+                )
+                if rows:
+                    context_parts.append(
+                        _build_context_block(rows, "recent-commits")
+                    )
+                    retrieval_path_tags.append("recent-commits")
+            except Exception as exc:
+                logger.error("[RETRIEVE] ❌ Stage 3a recency FAILED: %s", exc)
+
+        # ── Stage 3b: Fulltext search ──────────────────────────────────────────
+        lucene_query = _sanitize_lucene_query(user_query)
+        logger.info(
+            "[RETRIEVE] Stage 3b — fulltext: sanitized=%r (original=%r)",
+            lucene_query, user_query,
         )
         fulltext_cypher = """
         CALL db.index.fulltext.queryNodes('commit_summaries', $search_query)
         YIELD node, score
         RETURN
-          node.summary_text AS name,
-          ''                AS filepath,
-          node.diff_text    AS code,
-          []                AS connected
+          coalesce(node.sha, node.id, toString(id(node))) AS name,
+          coalesce(node.repo, '')                          AS filepath,
+          coalesce(
+            node.summary_text,
+            node.message,
+            node.diff_text,
+            ''
+          )                                               AS code,
+          []                                              AS connected
         LIMIT 10
         """
         try:
             with driver.session() as session:
                 rows = session.run(
-                    fulltext_cypher, search_query=user_query
+                    fulltext_cypher, search_query=lucene_query
                 ).data()
-            logger.info("[RETRIEVE] Stage 3 fulltext → %d record(s).", len(rows))
+            logger.info("[RETRIEVE] Stage 3b fulltext → %d record(s).", len(rows))
             if rows:
                 context_parts.append(
-                    _build_context_block(rows, "fulltext-fallback")
+                    _build_context_block(rows, "fulltext-commits")
                 )
                 retrieval_path_tags.append("fulltext")
         except Exception as exc:
-            logger.error("[RETRIEVE] ❌ Stage 3 fulltext also FAILED: %s", exc)
+            logger.error("[RETRIEVE] ❌ Stage 3b fulltext FAILED: %s", exc)
 
     # ── Final assembly ────────────────────────────────────────────────────────
     if not context_parts:
@@ -465,26 +589,34 @@ def answer_question_hybrid(
 
     context_is_empty = graph_context.strip() == "No relevant context found in the knowledge graph."
 
-    system_prompt = f"""You are a senior backend architect analyzing a codebase stored in a knowledge graph.
+    system_prompt = f"""You are a senior software engineering assistant with deep knowledge of codebases, 
+git history, issues, and repository structure. You have access to a knowledge graph that stores 
+code functions, commits, files, issues, and repository metadata.
 
-The context below is structured as labelled sections. Each section starts with a [Source: ...] tag
-followed by one or more function blocks. Each block contains:
+The context below is structured as labelled sections. Each section starts with a [Source: ...] tag.
+Sections from "vector-search" or "path-hint-boost" contain function/code blocks:
   Function : <name>
   File     : <filepath>
   Code     : <source code>
   ↳ Called/Dep: <name> [<file>]   (optional — connected functions)
 
+Sections from "fulltext-fallback" contain commit or issue records:
+  Function : <sha or id>
+  File     : <repo>
+  Code     : <commit message / summary / diff>
+
 CONTEXT:
 {graph_context}
 
 Instructions:
-- Answer ONLY using the code and file paths shown above. Never invent evidence.
-- Write like a senior engineer doing a code review explanation.
+- Answer ONLY using the information shown in the context above. Never invent evidence.
+- For questions about commits, list them with their SHA, repo, and summary.
+- For questions about code, write like a senior engineer doing a code review explanation.
 - Start with a "### Summary" section.
 - Include "### Impact Analysis" ONLY when you can point to specific code that changes.
-- End with "### Evidence" listing every function name and file path you referenced, as bullet points.
-- If the context contains no relevant functions for the question, say exactly:
-  "The graph does not contain sufficient data to answer this question. The relevant files may not have been ingested yet."
+- End with "### Evidence" listing every function/commit SHA and file/repo you referenced, as bullet points.
+- If the context truly contains no information relevant to the question (not just no code), say:
+  "The graph does not contain sufficient data to answer this question. The relevant data may not have been ingested yet."
 """
 
     logger.info("[LLM] ── Invoking LLM ─────────────────────────────────")
