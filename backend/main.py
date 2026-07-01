@@ -348,6 +348,86 @@ def _build_context_block(records: list[dict], source: str, allow_no_code: bool =
 
     return "\n".join(lines)
 
+def _extract_relevant_lines(code: str, term: str, context: int = 6) -> str:
+    """
+    Return the full function body with lines that contain `term` clearly marked
+    with a '>>>' prefix. Surrounding lines are indented for readability.
+
+    Since token usage is not a constraint, we include the full code but make
+    the exact hit lines visually prominent so the LLM can write accurate diffs.
+    If no match is found, the full code is returned as-is.
+    """
+    if not code or not term:
+        return code or ""
+
+    term_lower = term.lower()
+    all_lines  = code.splitlines()
+    hit_set    = {i for i, ln in enumerate(all_lines) if term_lower in ln.lower()}
+
+    if not hit_set:
+        return code  # no match — return everything unchanged
+
+    # Return all lines, marking hits with >>> so the LLM can spot them instantly
+    marked = []
+    for i, ln in enumerate(all_lines):
+        prefix = ">>> " if i in hit_set else "    "
+        marked.append(f"{prefix}{ln}")
+    return "\n".join(marked)
+
+
+def _fetch_subject_definition(
+    driver,
+    subject: str,
+    selected_repos: Optional[List[str]] = None,
+) -> Optional[dict]:
+    """
+    Look up the actual definition (struct, type, class, function) of the named
+    subject in the graph and return it as a record dict.
+
+    This gives the LLM the struct's field list and types so it can reason about
+    what removing a field actually means (e.g. what type Event is, what it contains).
+
+    Returns None if no definition is found.
+    """
+    repo_filter = "AND fn.repo IN $selected_repos" if selected_repos else ""
+
+    # Look for a Function or File node whose name matches AND has stored code
+    # (the struct definition would be stored as a Function node in most AST parsers)
+    defn_cypher = f"""
+    MATCH (fn)
+    WHERE (fn:Function OR fn:File)
+      AND fn.code IS NOT NULL
+      AND toLower(coalesce(fn.name, '')) CONTAINS toLower($subject)
+      {repo_filter}
+    RETURN
+      fn.name                                AS name,
+      coalesce(fn.filepath, fn.path, '')     AS filepath,
+      coalesce(fn.repo, '')                  AS repo,
+      fn.code                                AS code,
+      'SUBJECT_DEFINITION'                   AS rel_type
+    ORDER BY size(fn.code) DESC
+    LIMIT 3
+    """
+    try:
+        with driver.session() as session:
+            rows = session.run(
+                defn_cypher,
+                subject=subject.lower(),
+                selected_repos=selected_repos or [],
+            ).data()
+        if rows:
+            logger.info(
+                "[IMPACT] Subject definition for %r found: %d candidate(s).",
+                subject, len(rows),
+            )
+            # Return the longest match (most likely the full struct definition)
+            best = max(rows, key=lambda r: len(r.get("code") or ""))
+            best["connected"] = []
+            return best
+    except Exception as exc:
+        logger.warning("[IMPACT] Subject definition lookup for %r failed: %s", subject, exc)
+    return None
+
 
 def _build_blame_context_block(records: list[dict]) -> str:
     """
@@ -710,7 +790,7 @@ def _run_impact_traversal(
               dep.name                                         AS name,
               coalesce(dep.filepath, dep.path, '')             AS filepath,
               coalesce(dep.repo, '')                           AS repo,
-              'OUTBOUND_' + type(rel)                          AS rel_type,
+              type(rel)                                        AS rel_type_raw,
               coalesce(dep.code, '')                           AS code
             LIMIT 20
             """
@@ -737,7 +817,8 @@ def _run_impact_traversal(
                         "name":     row.get("name") or "<unknown>",
                         "filepath": row.get("filepath") or "",
                         "repo":     row.get("repo") or "",
-                        "rel_type": row.get("rel_type") or "",
+                        # Build prefix in Python — avoids Cypher string concat issues
+                        "rel_type": "OUTBOUND_" + (row.get("rel_type_raw") or "EDGE"),
                         "code":     row.get("code") or "",
                         "connected": [],
                     })
@@ -808,6 +889,24 @@ def retrieve_code_context(
                 selected_repos=_effective_repos or None,
             )
 
+            # ── Fetch the struct/type definition of the primary subject ─────
+            # Prepend it so the LLM sees WHAT the struct is before seeing callers.
+            # Try the first non-stopword subject (most likely the struct name).
+            _primary_subject = next(
+                (s for s in impact_subjects if len(s) > 4), impact_subjects[0]
+            ) if impact_subjects else None
+            if _primary_subject:
+                defn_record = _fetch_subject_definition(
+                    driver, _primary_subject,
+                    selected_repos=_effective_repos or None,
+                )
+                if defn_record:
+                    logger.info(
+                        "[RETRIEVE] Stage 0 — prepending subject definition for %r.",
+                        _primary_subject,
+                    )
+                    impact_rows = [defn_record] + impact_rows
+
             # ── If repo hints found in query, post-filter impact rows ──────
             # Keeps rows whose repo field CONTAINS any of the repo hint fragments.
             if _repo_hint_filter and impact_rows:
@@ -836,6 +935,9 @@ def retrieve_code_context(
                         "AND fn.repo IN $selected_repos"
                         if _effective_repos else ""
                     )
+                    # Build the rel_type label in Python — Cypher cannot concatenate
+                    # a string literal with a runtime parameter ($field_name).
+                    field_rel_label = f"REFERENCES_FIELD_{field.upper()}"
                     field_grep_cypher = f"""
                     MATCH (fn:Function)
                     WHERE fn.code IS NOT NULL
@@ -845,7 +947,6 @@ def retrieve_code_context(
                       fn.name                                AS name,
                       coalesce(fn.filepath, fn.path, '')     AS filepath,
                       coalesce(fn.repo, '')                  AS repo,
-                      'REFERENCES_FIELD_' + $field_name      AS rel_type,
                       fn.code                                AS code
                     LIMIT 20
                     """
@@ -860,7 +961,13 @@ def retrieve_code_context(
                             "[RETRIEVE] Stage 0 field-grep '%s' → %d function(s) reference it.",
                             field, len(field_rows),
                         )
-                        # Post-filter by repo hint if needed
+                        # Attach rel_type label and extract the precise lines that
+                        # reference the field — replaces full function body in context.
+                        for r in field_rows:
+                            r["rel_type"] = field_rel_label
+                            r.setdefault("connected", [])
+                            if r.get("code"):
+                                r["code"] = _extract_relevant_lines(r["code"], field)
                         if _repo_hint_filter:
                             field_rows = [
                                 r for r in field_rows
@@ -1622,13 +1729,46 @@ Instructions:
     * Use the heading "### Ownership & Blame Summary" instead of the generic summary.
 - For impact / migration / dependency questions (move package / remove field / what gets affected / what imports this):
     * Use the heading "### Migration Impact Analysis".
-    * List the SUBJECT node first (the thing being moved or modified).
-    * If Relation is REFERENCES_FIELD_<name>: these are the highest-risk callers — list them FIRST under
-      "#### 🔴 Direct Field References (will break immediately)" and quote the line(s) of code that use the field.
-    * Then list IMPORTS / DEPENDS_ON / CALLS consumers under "#### 🟡 Structural Dependents".
-    * Group all results by repository — cross-repo dependencies are especially dangerous.
-    * Note any entries where Code is "<not stored>" — these need manual verification.
-    * Close with "### Recommended Action Items" listing concrete steps (update field references, bump version, run tests, etc.).
+    * **Section 1 — Subject Definition**
+      Quote the FULL code of the node marked Relation=SUBJECT_DEFINITION.
+      From it, identify: the exact type of the field being removed/changed, whether it is
+      a value type or pointer/reference, and whether it is exported (capital letter in Go,
+      public in Java/Python etc.).
+      If no definition is in context, say so explicitly.
+    * **Section 2 — 🔴 Direct Field References (will break at compile time)**
+      For EVERY record with Relation starting with REFERENCES_FIELD_:
+        - State the file path and function name.
+        - Quote the EXACT lines marked with >>> from the Code snippet.
+        - Write the specific change required, formatted as a code diff:
+          ```diff
+          - <the current line(s) using the field>
+          + <what the line(s) should look like after the change>
+          ```
+          If the field is simply removed with no replacement, write:
+          ```diff
+          - <current line>
+          + // DELETED — Event field removed; verify downstream consumers
+          ```
+        - Classify as: COMPILE_ERROR | RUNTIME_PANIC | LOGIC_CHANGE
+      If Code is "<not stored>", write:
+        "Code not in graph — open <filepath> manually and search for .<field_name>"
+    * **Section 3 — 🟡 Structural Dependents**
+      List every record with Relation=IMPORTS/DEPENDS_ON/CALLS grouped by repository.
+      For each, state what kind of dependency it is (imports the package, calls a function
+      that uses the struct, etc.) and whether it is cross-repo (highest risk).
+    * **Section 4 — Migration Strategy**
+      Based on the evidence above, classify the change as one of:
+        A. CLEAN REMOVAL — field is unused in all callers (safe to delete)
+        B. BREAKING REMOVAL — callers depend on it; must update all callers before deleting
+        C. DEPRECATION PATH — add a replacement field first, migrate callers, then delete
+      Recommend which strategy applies and why, referencing the specific files found above.
+    * **Section 5 — Ordered Migration Checklist**
+      Write a numbered list. Each item must reference a SPECIFIC file or function from the
+      context — never a generic step. Format each item as:
+        N. `<filepath>` → `<function>`: <one-sentence description of the exact change>
+      End with: "Run tests: search for test files referencing <subject name> and <field name>"
+      DO NOT include steps like "update references", "run tests", or "bump version" without
+      a specific file/function attached to them.
 - For commit-file questions (what files did commit X change / touch / modify):
     * Use the heading "### Commit Change Summary".
     * Start with the commit metadata (SHA, author, timestamp, message) from the first record(s) in "commit-file-lookup".
