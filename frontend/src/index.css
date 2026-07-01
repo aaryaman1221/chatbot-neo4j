@@ -101,7 +101,7 @@ html, body, #root {
 .hero-title {
   font-size: 2.6rem;
   font-weight: 700;
-  background: linear-gradient(135deg, #00d4ff 0%, #7b61ff 50%, #ff6b6b 100%);
+  background: #00d4ff;
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
@@ -177,6 +177,10 @@ html, body, #root {
   display: flex;
   gap: 1rem;
 }
+
+.chat-message.user-message {
+  background: rgba(255, 255, 255, 0.09);
+}
 .chat-message:hover {
   border-color: rgba(255, 255, 255, 0.12);
 }
@@ -220,7 +224,7 @@ html, body, #root {
 }
 
 .btn {
-  background: linear-gradient(135deg, #00d4ff, #7b61ff);
+  background: #00d4ff;
   color: white;
   border: none;
   border-radius: 8px;

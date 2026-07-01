@@ -1,8 +1,8 @@
-# GraphRAG Explorer: Neo4j + Gemini 🕸️
+# GraphRAG Explorer: Neo4j + Gemini
 
 A powerful Python-based application that ingests GitHub repository data into a Neo4j knowledge graph and provides a highly interactive Streamlit chat interface. It leverages an Agentic Workflow using LangChain and Google's Gemini models to answer complex queries about your codebase.
 
-## 🌟 Features
+## Features
 
 - **Backend Ingestion Pipeline** (`backend_ingest.py`): 
   - Pure Python CLI to bootstrap a GitHub repository into a Neo4j graph.
@@ -14,14 +14,14 @@ A powerful Python-based application that ingests GitHub repository data into a N
   - Powered by a LangChain Tool-Calling Agent.
   - Uses Neo4j Vector Retrieval and GraphCypherQAChain to dynamically answer questions about the repository structure, commit history, and code logic.
 
-## 📋 Prerequisites
+## Prerequisites
 
 - Python 3.9+
 - Docker (for easily running Neo4j)
 - A GitHub Personal Access Token
 - A Google Gemini API Key
 
-## 🛠️ Installation
+## Installation
 
 1. **Clone the repository** (if you haven't already):
    ```bash
@@ -47,7 +47,7 @@ A powerful Python-based application that ingests GitHub repository data into a N
    FORCE_LLM_UPDATE=false
    ```
 
-## 🚀 Usage
+## Usage
 
 ### 1. Start Neo4j Database
 
@@ -80,18 +80,18 @@ Once the data is ingested, start the Streamlit application to interactively expl
 streamlit run frontend_chat.py
 ```
 
-## 🧠 Architecture Overview
+## Architecture Overview
 
 - **Graph Model**: The graph models `Repository`, `File`, `Function`, `Commit`, `User`, and `Module` nodes, with rich relationships such as `DECLARES`, `CALLS`, `MODIFIED`, `AUTHORED`, and `DEPENDS_ON`.
 - **LLM Agent**: The UI utilizes a `create_tool_calling_agent` from LangChain, equipping it with specific tools to perform impact analysis, search commit history, and execute generic Cypher queries against the graph.
 
-## ⚡ Token Optimization & Graph Retrieval
+## Token Optimization & Graph Retrieval
 
 Unlike standard vector DB-based retrieval that relies solely on text chunk similarity, this application leverages **GraphRAG** via Neo4j. This results in significant token optimization:
 - **Targeted Context**: Instead of padding the prompt with entire files or disjointed text chunks, the system retrieves precise subgraphs (e.g., a function, its direct dependencies, and recent commits).
 - **Reduced Token Costs**: By filtering out irrelevant code and returning highly structured context, the LLM prompt remains small and dense with useful information, drastically reducing token usage per query.
 
-## 🆚 GraphRAG Explorer vs. GitHub Copilot CLI
+## GraphRAG Explorer vs. GitHub Copilot CLI
 
 While standard tools like GitHub Copilot CLI excel at autocomplete and local file edits, GraphRAG Explorer is built for deep, repository-scale analytical queries with several key advantages:
 
@@ -100,7 +100,7 @@ While standard tools like GitHub Copilot CLI excel at autocomplete and local fil
 3. **Commit History Integration**: GraphRAG models git history natively. You can ask *why* a piece of code changed or *who* introduced a bug, leveraging `MODIFIED` and `AUTHORED` relationships.
 4. **Transparent Reasoning**: The retrieved context is based on explicit graph traversal. You can verify exactly which files, functions, and commits were used to generate the answer, minimizing black-box hallucinations.
 
-## 📦 Dependencies
+## Dependencies
 
 Major dependencies include:
 - `neo4j` and `neo4j-graphrag`: For graph database interaction.

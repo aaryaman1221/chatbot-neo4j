@@ -25,12 +25,19 @@ import requests
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, _LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("graphrag")
 
 app = FastAPI(title="GraphRAG API")
 
-# Configurable allowed origins — set ALLOWED_ORIGINS=http://a.com,http://b.com in .env
 # Default covers the Vite dev server and common alt port.
 _ALLOWED_ORIGINS = [
     o.strip()
@@ -65,24 +72,39 @@ class ConnectionRequest(BaseModel):
 # -----------------------------------------------------------------------------
 
 def get_embedding(text: str, api_key: str) -> list:
-    if not text or not api_key: return []
+    """Return a float vector for *text*. Logs the retrieval path taken."""
+    if not text or not api_key:
+        logger.warning("[EMBED] Skipped — text or api_key is empty.")
+        return []
+
     if GENAI_AVAILABLE:
+        logger.debug("[EMBED] Trying google-genai SDK (model=gemini-embedding-2) …")
         try:
             client = google_genai.Client(api_key=api_key)
             resp = client.models.embed_content(model="gemini-embedding-2", contents=text)
-            return list(resp.embeddings[0].values)
+            vec = list(resp.embeddings[0].values)
+            logger.info("[EMBED] ✅ google-genai SDK — vector dim=%d", len(vec))
+            return vec
         except Exception as exc:
-            logger.debug("google-genai embed failed: %s", exc)
+            logger.warning("[EMBED] ❌ google-genai SDK failed (%s) — trying REST fallback.", exc)
+    else:
+        logger.debug("[EMBED] google-genai SDK not available — going straight to REST.")
 
     # REST fallback
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:embedContent?key={api_key}"
     payload = {"model": "models/gemini-embedding-2", "content": {"parts": [{"text": text}]}}
     try:
+        logger.debug("[EMBED] Trying REST endpoint …")
         resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
         resp.raise_for_status()
-        return resp.json().get("embedding", {}).get("values", [])
+        vec = resp.json().get("embedding", {}).get("values", [])
+        if vec:
+            logger.info("[EMBED] ✅ REST fallback succeeded — vector dim=%d", len(vec))
+        else:
+            logger.warning("[EMBED] ❌ REST fallback returned empty embedding.")
+        return vec
     except Exception as exc:
-        logger.debug("REST embedding failed: %s", exc)
+        logger.error("[EMBED] ❌ REST fallback also failed: %s", exc)
         return []
 
 def _check_neo4j(uri: str, user: str, pwd: str) -> tuple[bool, str]:
@@ -134,7 +156,107 @@ def _fetch_available_repos(driver) -> list:
         return []
 
 # -----------------------------------------------------------------------------
-# GraphRAG Core
+# GraphRAG Core — helpers
+# -----------------------------------------------------------------------------
+
+# Common Go/Python component path segments that indicate a specific file target.
+_COMPONENT_KEYWORDS = [
+    "help", "textinput", "textarea", "list", "paginator", "progress",
+    "spinner", "viewport", "filepicker", "table", "cursor", "key",
+    "styles", "style",
+]
+
+def _extract_path_hints(query: str) -> List[str]:
+    """
+    Pull file-path fragments out of the user query.
+
+    Recognises patterns like:
+      - bubbles/help   bubbles/textinput
+      - help.go        textinput.go
+      - the help component
+
+    Returns a deduplicated list of lowercase path segments to match against
+    Function.filepath in the graph.
+    """
+    import re
+    hints: list[str] = []
+
+    # Explicit path separators: "bubbles/help", "charmbracelet/lipgloss"
+    for m in re.finditer(r'[\w\-]+/[\w\-]+', query):
+        segment = m.group().split("/")[-1].lower()
+        hints.append(segment)
+
+    # Bare ".go" filenames: "help.go", "textinput.go"
+    for m in re.finditer(r'\b([\w\-]+)\.go\b', query, re.IGNORECASE):
+        hints.append(m.group(1).lower())
+
+    # Component keywords that appear as standalone words
+    q_lower = query.lower()
+    for kw in _COMPONENT_KEYWORDS:
+        if re.search(rf'\b{re.escape(kw)}\b', q_lower):
+            hints.append(kw)
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique: list[str] = []
+    for h in hints:
+        if h not in seen:
+            seen.add(h)
+            unique.append(h)
+    return unique
+
+
+def _build_context_block(records: list[dict], source: str) -> str:
+    """
+    Format a list of retrieval records into clearly labelled plain-text sections.
+
+    Each record is expected to have at minimum:
+      - 'name' / 'func_name' — the function or symbol name
+      - 'filepath'           — source file path
+      - 'code'               — source code body
+
+    Connected sub-nodes (if present under 'connected') are appended as
+    sub-sections underneath their seed.
+    """
+    if not records:
+        return ""
+
+    lines: list[str] = [f"[Source: {source}]"]
+    seen_ids: set[str] = set()
+
+    for rec in records:
+        name     = rec.get("name") or rec.get("func_name") or "<unknown>"
+        filepath = rec.get("filepath") or rec.get("path") or "<unknown path>"
+        code     = (rec.get("code") or "").strip()
+        uid      = f"{filepath}::{name}"
+
+        if uid in seen_ids or not code:
+            continue
+        seen_ids.add(uid)
+
+        lines.append(f"\n{'─'*60}")
+        lines.append(f"Function : {name}")
+        lines.append(f"File     : {filepath}")
+        lines.append("Code     :")
+        lines.append(code)
+
+        # Connected nodes returned by the expanded vector query
+        for conn in rec.get("connected") or []:
+            c_name = conn.get("name") or "<unknown>"
+            c_path = conn.get("path") or conn.get("filepath") or ""
+            c_code = (conn.get("code") or "").strip()
+            c_uid  = f"{c_path}::{c_name}"
+            if c_uid in seen_ids or not c_code:
+                continue
+            seen_ids.add(c_uid)
+            lines.append(f"\n  ↳ Called/Dep: {c_name}  [{c_path}]")
+            lines.append(f"  {c_code.replace(chr(10), chr(10)+'  ')}")
+
+    return "\n".join(lines)
+
+
+# -----------------------------------------------------------------------------
+# GraphRAG Core — main retrieval
 # -----------------------------------------------------------------------------
 
 def retrieve_code_context(
@@ -144,50 +266,190 @@ def retrieve_code_context(
     selected_repos: Optional[List[str]] = None,
     top_k: int = 5,
 ) -> str:
-    query_vector = get_embedding(user_query, google_api_key)
-    results = []
+    """
+    3-stage retrieval pipeline:
+      Stage 1 — Vector search (fixed Cypher: returns seed + connected code bodies).
+      Stage 2 — Path-hint keyword boost (direct file-path lookup for components
+                 explicitly named in the query — bypasses vector ranking).
+      Stage 3 — Fulltext commit-summary fallback (only if stages 1+2 both fail).
 
+    Logs every decision point so you can see exactly which path was taken.
+    """
+    logger.info("[RETRIEVE] ── New retrieval ────────────────────────────")
+    logger.info("[RETRIEVE] Query        : %r", user_query[:200])
+    logger.info("[RETRIEVE] Selected repos: %s", selected_repos or "<all>")
+    logger.info("[RETRIEVE] top_k        : %d", top_k)
+
+    query_vector  = get_embedding(user_query, google_api_key)
+    path_hints    = _extract_path_hints(user_query)
+    context_parts: list[str] = []
+    retrieval_path_tags: list[str] = []
+
+    # ── Stage 1: Vector search ────────────────────────────────────────────────
+    # Fixed query:
+    #   • Repo filter is in WITH clause, not after YIELD (avoids cross-repo pollution)
+    #   • Returns DISTINCT seed + up to 4 connected nodes each WITH their code bodies
+    #   • No more structural_path label-only strings — real code is returned
     if query_vector:
-        repo_filter = "WHERE node.repo IN $selected_repos" if selected_repos else ""
+        repo_clause = (
+            "AND node.repo IN $selected_repos"
+            if selected_repos else ""
+        )
         vector_cypher = f"""
         CALL db.index.vector.queryNodes('code_embeddings', $top_k, $query_vector)
         YIELD node, score
-        {repo_filter}
-        MATCH path = (node)-[:CALLS|DEPENDS_ON*1..2]-(connected)
-        RETURN [n IN nodes(path) | labels(n)[0] + ' ' + coalesce(n.name, n.path, '')] AS structural_path,
-               node.code AS source_code
-        LIMIT 20
+        WITH node, score
+        WHERE node.code IS NOT NULL {repo_clause}
+        OPTIONAL MATCH (node)-[:CALLS|DEPENDS_ON]->(connected)
+        WHERE (connected:Function OR connected:File)
+          AND connected.code IS NOT NULL
+          {"AND connected.repo IN $selected_repos" if selected_repos else ""}
+        WITH node,
+             score,
+             collect(DISTINCT {{
+               name:     connected.name,
+               path:     coalesce(connected.filepath, connected.path),
+               code:     connected.code
+             }})[..4] AS connected_nodes
+        RETURN
+          node.name                                          AS name,
+          coalesce(node.filepath, node.path)                 AS filepath,
+          node.code                                          AS code,
+          connected_nodes                                    AS connected,
+          score
+        ORDER BY score DESC
+        LIMIT $top_k
         """
+        logger.info(
+            "[RETRIEVE] Stage 1 — vector search (top_k=%d, repo_filter=%s) …",
+            top_k, bool(selected_repos),
+        )
         try:
             with driver.session() as session:
-                results = session.run(
+                rows = session.run(
                     vector_cypher,
                     query_vector=query_vector,
                     top_k=top_k,
                     selected_repos=selected_repos or [],
                 ).data()
+            logger.info(
+                "[RETRIEVE] Stage 1 returned %d seed record(s)  "
+                "(each may carry up to 4 connected nodes).", len(rows),
+            )
+            if rows:
+                context_parts.append(_build_context_block(rows, "vector-search"))
+                retrieval_path_tags.append("vector")
         except Exception as exc:
-            logger.error("Vector search failed: %s", exc)
+            logger.error("[RETRIEVE] ❌ Stage 1 vector search FAILED: %s", exc)
+    else:
+        logger.warning(
+            "[RETRIEVE] ⚠️  No query vector — skipping Stage 1 entirely."
+        )
 
-    # Fulltext fallback — triggered when nodes have no embeddings yet or vector returns nothing
-    if not results:
-        logger.info("Vector search returned no results — falling back to fulltext index.")
+    # ── Stage 2: Path-hint keyword boost ─────────────────────────────────────
+    # For any file-path fragments found in the query (e.g. "help", "textinput"),
+    # directly fetch all Function nodes whose filepath contains that segment.
+    # This catches downstream consumers that vector similarity misses.
+    if path_hints:
+        logger.info(
+            "[RETRIEVE] Stage 2 — path-hint boost for: %s", path_hints
+        )
+        hint_rows: list[dict] = []
+        for hint in path_hints:
+            repo_filter_clause = (
+                "AND fn.repo IN $selected_repos"
+                if selected_repos else ""
+            )
+            hint_cypher = f"""
+            MATCH (fn:Function)
+            WHERE toLower(fn.filepath) CONTAINS toLower($hint)
+              AND fn.code IS NOT NULL
+              {repo_filter_clause}
+            RETURN
+              fn.name     AS name,
+              fn.filepath AS filepath,
+              fn.code     AS code,
+              []          AS connected
+            LIMIT 8
+            """
+            try:
+                with driver.session() as session:
+                    rows = session.run(
+                        hint_cypher,
+                        hint=hint,
+                        selected_repos=selected_repos or [],
+                    ).data()
+                logger.info(
+                    "[RETRIEVE] Stage 2 hint=%r → %d function(s) found.",
+                    hint, len(rows),
+                )
+                hint_rows.extend(rows)
+            except Exception as exc:
+                logger.warning(
+                    "[RETRIEVE] Stage 2 hint=%r failed: %s", hint, exc
+                )
+
+        if hint_rows:
+            context_parts.append(_build_context_block(hint_rows, "path-hint-boost"))
+            retrieval_path_tags.append("path-hint")
+        else:
+            logger.warning(
+                "[RETRIEVE] ⚠️  Stage 2 path-hints produced 0 results. "
+                "Likely cause: these files were not AST-parsed during ingest "
+                "(run backend_ingest.py phase 2 for the relevant repos)."
+            )
+    else:
+        logger.info("[RETRIEVE] Stage 2 skipped — no path hints in query.")
+
+    # ── Stage 3: Fulltext commit-summary fallback ─────────────────────────────
+    # Only fires when both vector and path-hint returned nothing.
+    if not context_parts:
+        logger.warning(
+            "[RETRIEVE] ⚠️  Stages 1+2 both empty — falling back to fulltext "
+            "commit summaries. Context quality will be lower."
+        )
         fulltext_cypher = """
         CALL db.index.fulltext.queryNodes('commit_summaries', $search_query)
         YIELD node, score
-        RETURN node.summary_text AS structural_path, node.diff_text AS source_code
+        RETURN
+          node.summary_text AS name,
+          ''                AS filepath,
+          node.diff_text    AS code,
+          []                AS connected
         LIMIT 10
         """
         try:
             with driver.session() as session:
-                results = session.run(fulltext_cypher, search_query=user_query).data()
+                rows = session.run(
+                    fulltext_cypher, search_query=user_query
+                ).data()
+            logger.info("[RETRIEVE] Stage 3 fulltext → %d record(s).", len(rows))
+            if rows:
+                context_parts.append(
+                    _build_context_block(rows, "fulltext-fallback")
+                )
+                retrieval_path_tags.append("fulltext")
         except Exception as exc:
-            logger.warning("Fulltext fallback also failed: %s", exc)
+            logger.error("[RETRIEVE] ❌ Stage 3 fulltext also FAILED: %s", exc)
 
-    if not results:
+    # ── Final assembly ────────────────────────────────────────────────────────
+    if not context_parts:
+        logger.error(
+            "[RETRIEVE] ❌ ALL stages returned 0 results. "
+            "Check: (1) Function nodes have .code set, "
+            "(2) 'code_embeddings' vector index exists, "
+            "(3) 'commit_summaries' fulltext index exists."
+        )
         return "No relevant context found in the knowledge graph."
 
-    return json.dumps(results, indent=2)
+    full_context = "\n\n".join(context_parts)
+    retrieval_path = "+".join(retrieval_path_tags) or "none"
+    logger.info(
+        "[RETRIEVE] ✅ path=%-20s | context_chars=%d",
+        retrieval_path, len(full_context),
+    )
+    logger.debug("[RETRIEVE] Context preview (first 3000 chars):\n%s", full_context[:3000])
+    return full_context
 
 def answer_question_hybrid(
     user_input: str,
@@ -196,25 +458,46 @@ def answer_question_hybrid(
     google_api_key: str,
     selected_repos: Optional[List[str]] = None,
     top_k: int = 5,
-) -> str:
+) -> dict:
     graph_context = retrieve_code_context(
         user_input, driver, google_api_key, selected_repos, top_k
     )
 
-    system_prompt = f"""
-    You are a senior backend architect analyzing a codebase.
+    context_is_empty = graph_context.strip() == "No relevant context found in the knowledge graph."
 
-    Here is the relevant sub-graph architecture retrieved from the database:
-    {graph_context}
+    system_prompt = f"""You are a senior backend architect analyzing a codebase stored in a knowledge graph.
 
-    Answer the user's question based ONLY on this architecture.
-    Write like a senior engineer explaining a codebase.
-    Start with a "### Summary" section.
-    Include a "### Impact Analysis" ONLY if there are tangible impacts. DO NOT list empty impacts.
-    End with a "### Evidence" section listing the specific files, functions, or modules referenced in your answer as bullet points.
-    Never invent evidence.
-    If the database results are empty, strictly reply that you do not have the data.
-    """
+The context below is structured as labelled sections. Each section starts with a [Source: ...] tag
+followed by one or more function blocks. Each block contains:
+  Function : <name>
+  File     : <filepath>
+  Code     : <source code>
+  ↳ Called/Dep: <name> [<file>]   (optional — connected functions)
+
+CONTEXT:
+{graph_context}
+
+Instructions:
+- Answer ONLY using the code and file paths shown above. Never invent evidence.
+- Write like a senior engineer doing a code review explanation.
+- Start with a "### Summary" section.
+- Include "### Impact Analysis" ONLY when you can point to specific code that changes.
+- End with "### Evidence" listing every function name and file path you referenced, as bullet points.
+- If the context contains no relevant functions for the question, say exactly:
+  "The graph does not contain sufficient data to answer this question. The relevant files may not have been ingested yet."
+"""
+
+    logger.info("[LLM] ── Invoking LLM ─────────────────────────────────")
+    logger.info("[LLM] Context empty   : %s", context_is_empty)
+    logger.info("[LLM] System prompt   : %d chars", len(system_prompt))
+    logger.info("[LLM] User input      : %r", user_input[:200])
+    logger.debug("[LLM] Full system prompt:\n%s", system_prompt[:4000])
+
+    if context_is_empty:
+        logger.warning(
+            "[LLM] ⚠️  LLM is being called with EMPTY context. "
+            "Response will be generic/unhelpful. Fix the retrieval pipeline above."
+        )
 
     messages = [
         SystemMessage(content=system_prompt),
@@ -223,9 +506,18 @@ def answer_question_hybrid(
 
     try:
         response = llm.invoke(messages)
-        return response.content
+        logger.info("[LLM] ✅ LLM responded — response_chars=%d", len(response.content))
+        logger.debug("[LLM] Response content:\n%s", response.content[:2000])
+        return {
+            "answer": response.content,
+            "usage": response.usage_metadata if hasattr(response, "usage_metadata") else None
+        }
     except Exception as exc:
-        return f"❌ Agent Error: {exc}"
+        logger.error("[LLM] ❌ LLM invocation failed: %s", exc)
+        return {
+            "answer": f"❌ Agent Error: {exc}",
+            "usage": None
+        }
 
 # -----------------------------------------------------------------------------
 # API Endpoints
@@ -285,17 +577,26 @@ def chat(
     req: ChatRequest,
     x_neo4j_uri: str = Header(...),
     x_neo4j_user: str = Header(...),
-    x_neo4j_password: str = Header(...)
+    x_neo4j_password: str = Header(...),
 ):
+    import time as _time
     google_api_key = os.getenv("GOOGLE_API_KEY")
     if not google_api_key:
         raise HTTPException(status_code=500, detail="GOOGLE_API_KEY not found in environment.")
 
+    logger.info(
+        "[CHAT] ════════════════════════════════════════════════════════"
+    )
+    logger.info("[CHAT] Incoming query   : %r", req.query[:200])
+    logger.info("[CHAT] Selected repos   : %s", req.selected_repos or "<all>")
+    logger.info("[CHAT] top_k            : %d", req.top_k)
+
+    _t0 = _time.perf_counter()
     try:
         drv = get_neo4j_driver(x_neo4j_uri, x_neo4j_user, x_neo4j_password)
         llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=google_api_key, temperature=0.0)
 
-        answer = answer_question_hybrid(
+        result = answer_question_hybrid(
             user_input=req.query,
             llm=llm,
             driver=drv,
@@ -304,7 +605,14 @@ def chat(
             top_k=req.top_k,
         )
 
-        return {"answer": answer}
+        answer = result["answer"]
+        usage = result["usage"]
+
+        elapsed = _time.perf_counter() - _t0
+        logger.info("[CHAT] ✅ Done in %.2fs — answer_chars=%d", elapsed, len(answer))
+        return {"answer": answer, "usage": usage}
     except Exception as e:
+        elapsed = _time.perf_counter() - _t0
+        logger.error("[CHAT] ❌ Failed after %.2fs: %s", elapsed, e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))

@@ -92,7 +92,7 @@ function App() {
       });
       const data = await res.json();
       if (res.ok) {
-        setMessages((prev) => [...prev, { role: 'assistant', content: data.answer }]);
+        setMessages((prev) => [...prev, { role: 'assistant', content: data.answer, usage: data.usage }]);
       } else {
         setMessages((prev) => [...prev, { role: 'assistant', content: `❌ Error: ${data.detail}` }]);
       }
@@ -225,10 +225,15 @@ function App() {
           )}
 
           {messages.map((m, i) => (
-            <div key={i} className="chat-message">
+            <div key={i} className={`chat-message ${m.role === 'user' ? 'user-message' : 'assistant-message'}`}>
               <div className="chat-avatar">{m.role === 'user' ? '🧑‍💻' : '🤖'}</div>
               <div className="chat-content">
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
+                {m.usage && (
+                  <div style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.4)', marginTop: '8px', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '4px' }}>
+                    Tokens: {m.usage.input_tokens} input, {m.usage.output_tokens} output, {m.usage.total_tokens} total
+                  </div>
+                )}
               </div>
             </div>
           ))}
