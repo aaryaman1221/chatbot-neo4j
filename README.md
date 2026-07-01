@@ -9,10 +9,11 @@ A powerful Python-based application that ingests GitHub repository data into a N
   - Parses code structure using Tree-sitter (AST). *(Note: Currently supports only Python and Go code)*
   - Uses Google Gemini for LLM-powered summarization of code and commits.
   - Models repositories, files, functions, commits, and their dependencies in Neo4j.
-- **Frontend Agentic Chat** (`frontend_chat.py`):
-  - Modern, responsive Streamlit UI with a rich aesthetic.
-  - Powered by a LangChain Tool-Calling Agent.
-  - Uses Neo4j Vector Retrieval and GraphCypherQAChain to dynamically answer questions about the repository structure, commit history, and code logic.
+- **Backend API & Agent** (`backend/main.py`):
+  - FastAPI server providing endpoints for the agentic chat.
+  - Powered by a LangChain Tool-Calling Agent, Neo4j Vector Retrieval, and GraphCypherQAChain.
+- **Frontend UI** (`frontend/`):
+  - Modern, responsive React application built with Vite.
 
 ## Prerequisites
 
@@ -72,12 +73,22 @@ Ingest the target GitHub repository into your Neo4j graph database. This step wi
 python backend_ingest.py
 ```
 
-### 3. Start the Frontend Chat UI
+### 3. Start the Backend API
 
-Once the data is ingested, start the Streamlit application to interactively explore and chat with your codebase.
+Start the FastAPI backend server which handles agent interactions and graph queries.
 
 ```bash
-streamlit run frontend_chat.py
+uvicorn backend.main:app --reload
+```
+
+### 4. Start the React Frontend
+
+Start the React development server to interactively explore and chat with your codebase.
+
+```bash
+cd frontend
+npm install
+npm run dev
 ```
 
 ## Architecture Overview
@@ -106,6 +117,7 @@ Major dependencies include:
 - `neo4j` and `neo4j-graphrag`: For graph database interaction.
 - `google-genai` and `langchain-google-genai`: For Gemini LLM capabilities.
 - `langchain` and `langchain-neo4j`: For the agentic workflow and Cypher QA chains.
-- `streamlit`: For the frontend UI.
+- `fastapi` & `uvicorn`: For the backend REST API.
+- React & Vite: For the frontend UI.
 - `PyGithub`: For fetching repository data.
 - `tree-sitter` (optional but recommended): For precise code parsing.
