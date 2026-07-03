@@ -42,6 +42,7 @@ import base64
 
 import logging
 import os
+import sys
 import re
 import time
 import ast
@@ -145,19 +146,27 @@ MERGE (repo:Repository {full_name: $repo_full_name})
 MERGE (file:File {path: $filepath, repo: $repo_full_name})
 MERGE (func:Function {id: $func_id})
   ON CREATE SET
-    func.name      = $func_name,
-    func.filepath  = $filepath,
-    func.repo      = $repo_full_name,
-    func.code      = $func_code,
-    func.embedding = $embedding
+    func.name            = $func_name,
+    func.filepath        = $filepath,
+    func.repo            = $repo_full_name,
+    func.code            = $func_code,
+    func.embedding       = $embedding,
+    func.qualified_calls = $qualified_calls
+  ON MATCH SET
+    func.qualified_calls = $qualified_calls
 MERGE (file)-[:DECLARES]->(func)
 MERGE (repo)-[:DECLARES]->(func)
 """
 
 CYPHER_INGEST_CALLS = """
 MATCH (caller:Function {id: $caller_id})
-OPTIONAL MATCH (callee:Function {name: $callee_name, repo: $repo_full_name})
-WITH caller, callee WHERE callee IS NOT NULL
+// Try file-local match first (same file as the caller)
+OPTIONAL MATCH (local:Function {name: $callee_name, filepath: $caller_filepath, repo: $repo_full_name})
+// Fall back to repo-wide match, but LIMIT 1 to avoid fan-out
+OPTIONAL MATCH (repo_wide:Function {name: $callee_name, repo: $repo_full_name})
+WHERE repo_wide.filepath <> $caller_filepath
+WITH caller, coalesce(local, repo_wide) AS callee
+WHERE callee IS NOT NULL
 MERGE (caller)-[:CALLS]->(callee)
 """
 
@@ -237,17 +246,54 @@ MERGE (r:Repository {full_name: $helper_repo})
 MERGE (f)-[:USES_REPO]->(r)
 """
 
+CYPHER_LINK_MODULE_TO_REPO = """
+MATCH (m:Module)
+MATCH (r:Repository)
+WHERE toLower(m.name) CONTAINS toLower(r.name)
+   OR toLower(m.name) CONTAINS toLower(r.full_name)
+MERGE (m)-[:REPRESENTS]->(r)
+"""
+
+CYPHER_LINK_XREPO_CALLS = """
+MATCH (caller:Function {repo: $parent_repo})
+WHERE caller.qualified_calls IS NOT NULL AND any(q IN caller.qualified_calls WHERE q STARTS WITH $helper_prefix)
+MATCH (callee:Function {repo: $helper_repo})
+WHERE $helper_prefix + "." + callee.name IN caller.qualified_calls
+MERGE (caller)-[:CALLS {cross_repo: true}]->(callee)
+"""
+
 CYPHER_CROSS_REPO_IMPACT = """
 MATCH (helperCommit:Commit {sha: $commit_sha})-[:MODIFIED]->(changed)
 WHERE changed:Function OR changed:File
 WITH collect(changed) AS changedNodes
+// Path 1: Direct cross-repo CALLS
 MATCH (parentFile:File {repo: $parent_repo})-[:USES_REPO]->(helperRepo:Repository {full_name: $helper_repo})
-OPTIONAL MATCH (parentFunc:Function {repo: $parent_repo})-[:CALLS]->(helperFunc:Function)
+OPTIONAL MATCH (parentFunc:Function {repo: $parent_repo})-[:CALLS {cross_repo: true}]->(helperFunc:Function)
 WHERE helperFunc IN changedNodes
+WITH changedNodes, collect(DISTINCT {
+  affected_file: parentFile.path,
+  affected_function: parentFunc.name,
+  affected_in_file: parentFunc.filepath,
+  impact_type: 'CALLS'
+}) AS call_impacts
+// Path 2: Module-level dependency impact
+OPTIONAL MATCH (changedFile:File)-[:DECLARES]->(changedFunc:Function)
+WHERE changedFile IN changedNodes OR changedFunc IN changedNodes
+WITH changedNodes, call_impacts, collect(DISTINCT changedFile.path) AS changedPaths
+OPTIONAL MATCH (parentFile2:File {repo: $parent_repo})-[:DEPENDS_ON]->(m:Module)-[:REPRESENTS]->(helperRepo2:Repository {full_name: $helper_repo})
+WITH call_impacts, collect(DISTINCT {
+  affected_file: parentFile2.path,
+  affected_function: null,
+  affected_in_file: parentFile2.path,
+  impact_type: 'DEPENDS_ON'
+}) AS dep_impacts
+UNWIND (call_impacts + dep_impacts) AS impact
+WHERE impact.affected_file IS NOT NULL
 RETURN DISTINCT
-  parentFile.path      AS affected_file,
-  parentFunc.name      AS affected_function,
-  parentFunc.filepath  AS affected_in_file
+  impact.affected_file AS affected_file,
+  impact.affected_function AS affected_function,
+  impact.affected_in_file AS affected_in_file,
+  impact.impact_type AS impact_type
 ORDER BY affected_file
 """
 
@@ -347,7 +393,18 @@ def parse_python_ast(filepath: str, source_code: str) -> dict:
                 })
                 for child in ast.walk(node):
                     if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
-                        calls.append((node.name, child.func.id))
+                        calls.append((node.name, child.func.id, None))
+                    elif isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
+                        parts = []
+                        attr_node = child.func
+                        while isinstance(attr_node, ast.Attribute):
+                            parts.append(attr_node.attr)
+                            attr_node = attr_node.value
+                        if isinstance(attr_node, ast.Name):
+                            parts.append(attr_node.id)
+                        parts.reverse()
+                        qualified_name = ".".join(parts)
+                        calls.append((node.name, child.func.attr, qualified_name))
     except Exception:
         pass
         
@@ -389,18 +446,20 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
         # 2. Identify Function Calls within a function
         elif node.type == 'call_expression' and current_func:
             func_node = node.children[0]
-            callee_name = None
-
             if func_node.type == 'identifier':  # e.g., foo()
                 callee_name = get_text(func_node)
+                calls.append((current_func, callee_name, None))
             elif func_node.type == 'selector_expression':  # e.g., pkg.foo() or obj.foo()
+                parts = []
                 for child in func_node.children:
                     if child.type == 'field_identifier':
-                        callee_name = get_text(child)
-                        break
-
-            if callee_name:
-                calls.append((current_func, callee_name))
+                        parts.append(get_text(child))
+                    elif child.type == 'identifier':
+                        parts.insert(0, get_text(child))
+                if parts:
+                    callee_name = parts[-1]  # bare name for intra-repo matching
+                    callee_qualified = ".".join(parts)  # e.g., "lipgloss.NewStyle"
+                    calls.append((current_func, callee_name, callee_qualified))
 
         # Recurse through children
         for child in node.children:
@@ -697,7 +756,7 @@ def summarize_with_llm(
 
     if GENAI_AVAILABLE:
         try:
-            client = google_genai.Client(api_key=google_api_key)
+            client = google_genai.Client(api_key=google_api_key, http_options={'timeout': 60.0})
             response = client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=user_prompt,
@@ -757,7 +816,7 @@ def get_embedding(text: str, api_key: str) -> list:
     if not text or not api_key: return []
     if GENAI_AVAILABLE:
         try:
-            client = google_genai.Client(api_key=api_key)
+            client = google_genai.Client(api_key=api_key, http_options={'timeout': 60.0})
             resp = client.models.embed_content(model="gemini-embedding-2", contents=text)
             return list(resp.embeddings[0].values)
         except Exception as exc:
@@ -775,7 +834,7 @@ def get_embeddings_batch(texts: list, api_key: str) -> list:
         return [[] for _ in texts]
     if GENAI_AVAILABLE:
         try:
-            client = google_genai.Client(api_key=api_key)
+            client = google_genai.Client(api_key=api_key, http_options={'timeout': 60.0})
             resp = client.models.embed_content(model="gemini-embedding-2", contents=texts)
             return [list(emb.values) for emb in resp.embeddings]
         except Exception as exc:
@@ -942,6 +1001,23 @@ def resolve_cross_repo_edges(driver, parent_repo: str, helper_repo: str):
             parent_repo,
             helper_repo,
         )
+        res_mod = session.run(CYPHER_LINK_MODULE_TO_REPO)
+        sum_mod = res_mod.consume()
+        logger.info("Module to Repository links created: %d", sum_mod.counters.relationships_created)
+
+        res_calls = session.run(
+            CYPHER_LINK_XREPO_CALLS,
+            parent_repo=parent_repo,
+            helper_repo=helper_repo,
+            helper_prefix=helper_repo_name,
+        )
+        sum_calls = res_calls.consume()
+        logger.info(
+            "Cross-repo CALLS relationships created (%s → %s): %d",
+            parent_repo,
+            helper_repo,
+            sum_calls.counters.relationships_created,
+        )
 
 def _set_status(driver, repo_full_name: str, status: str, detail: str = "",
                 commits_processed: int = 0, files_scanned: int = 0):
@@ -1102,6 +1178,14 @@ def phase2_scan_file_contents(
                     for func in ast_data["functions"]:
                         prefixed_id = f"{repo_full_name}::{func['id']}"
                         embed_text = f"{func['name']}\n{func.get('code', '')}"
+                        qual_calls_set = set()
+                        for c in ast_data["calls"]:
+                            if c[0] == func["name"]:
+                                if len(c) > 2 and c[2]:
+                                    qual_calls_set.add(c[2])
+                                if len(c) > 1 and c[1]:
+                                    qual_calls_set.add(c[1])
+                        func_qual_calls = sorted(list(qual_calls_set))
                         sess.run(
                             CYPHER_INGEST_FUNCTION,
                             repo_full_name=repo_full_name,
@@ -1110,13 +1194,17 @@ def phase2_scan_file_contents(
                             func_name=func["name"],
                             func_code=func.get("code", ""),
                             embedding=get_embedding(embed_text, google_api_key),
+                            qualified_calls=func_qual_calls,
                         )
-                    for caller, callee in ast_data["calls"]:
+                    for call_record in ast_data["calls"]:
+                        caller = call_record[0]
+                        callee_bare = call_record[1]
                         caller_id = f"{repo_full_name}::{path}::{caller}"
                         sess.run(
                             CYPHER_INGEST_CALLS,
                             caller_id=caller_id,
-                            callee_name=callee,
+                            callee_name=callee_bare,
+                            caller_filepath=path,
                             repo_full_name=repo_full_name,
                         )
                     sess.run(
@@ -1464,6 +1552,32 @@ def bootstrap(
 
 if __name__ == "__main__":
     load_dotenv()
+
+    if "--link-repos" in sys.argv:
+        NEO4J_URI      = os.environ.get("NEO4J_URI",      "neo4j://localhost:7687")
+        NEO4J_USER     = os.environ.get("NEO4J_USER",     "neo4j")
+        NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "")
+        TARGET_REPO    = os.environ.get("TARGET_REPO",    "")
+        HELPER_REPOS   = [r.strip() for r in os.environ.get("HELPER_REPOS", "").split(",") if r.strip()]
+        
+        idx = sys.argv.index("--link-repos")
+        args = sys.argv[idx + 1:]
+        if len(args) >= 2:
+            parent = args[0]
+            helpers = args[1:]
+        elif TARGET_REPO and HELPER_REPOS:
+            parent = TARGET_REPO
+            helpers = HELPER_REPOS
+        else:
+            print("[ERROR] --link-repos requires <parent_repo> <helper_repo1>... or TARGET_REPO and HELPER_REPOS env vars.")
+            sys.exit(1)
+            
+        print(f"Linking cross-repo edges for parent '{parent}' with helpers: {helpers}")
+        with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD)) as driver:
+            for h in helpers:
+                resolve_cross_repo_edges(driver, parent, h)
+        print("✅ Cross-repo linking COMPLETE.")
+        sys.exit(0)
 
     GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN", "")
     GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")

@@ -285,7 +285,7 @@ def _extract_blame_hints(query: str) -> dict:
     return {"func_hints": func_hints, "file_hints": file_hints}
 
 
-def _build_context_block(records: list[dict], source: str, allow_no_code: bool = False) -> str:
+def _build_context_block(records: list[dict], source: str, allow_no_code: bool = False, global_seen: set[str] | None = None) -> str:
     """
     Format a list of retrieval records into clearly labelled plain-text sections.
 
@@ -312,12 +312,14 @@ def _build_context_block(records: list[dict], source: str, allow_no_code: bool =
         code     = (rec.get("code") or "").strip()
         uid      = f"{filepath}::{name}"
 
-        if uid in seen_ids:
+        if uid in seen_ids or (global_seen is not None and uid in global_seen):
             continue
         # Drop code-less records unless caller explicitly allows structural-only entries
         if not code and not allow_no_code:
             continue
         seen_ids.add(uid)
+        if global_seen is not None:
+            global_seen.add(uid)
 
         lines.append(f"\n{'─'*60}")
         lines.append(f"Function : {name}")
@@ -340,9 +342,11 @@ def _build_context_block(records: list[dict], source: str, allow_no_code: bool =
             c_path = conn.get("path") or conn.get("filepath") or ""
             c_code = (conn.get("code") or "").strip()
             c_uid  = f"{c_path}::{c_name}"
-            if c_uid in seen_ids or not c_code:
+            if c_uid in seen_ids or (global_seen is not None and c_uid in global_seen) or not c_code:
                 continue
             seen_ids.add(c_uid)
+            if global_seen is not None:
+                global_seen.add(c_uid)
             lines.append(f"\n  ↳ Called/Dep: {c_name}  [{c_path}]")
             lines.append(f"  {c_code.replace(chr(10), chr(10)+'  ')}")
 
@@ -429,7 +433,7 @@ def _fetch_subject_definition(
     return None
 
 
-def _build_blame_context_block(records: list[dict]) -> str:
+def _build_blame_context_block(records: list[dict], global_seen: set[str] | None = None) -> str:
     """
     Format blame records (User → Commit → Function/File) into a clearly
     labelled plain-text section for the LLM.
@@ -457,9 +461,11 @@ def _build_blame_context_block(records: list[dict]) -> str:
         filepath    = rec.get("filepath") or "<unknown path>"
 
         uid = f"{sha}::{filepath}::{func_name}"
-        if uid in seen:
+        if uid in seen or (global_seen is not None and uid in global_seen):
             continue
         seen.add(uid)
+        if global_seen is not None:
+            global_seen.add(uid)
 
         lines.append(f"\n{'─'*60}")
         lines.append(f"Author     : {author}")
@@ -859,6 +865,7 @@ def retrieve_code_context(
     path_hints    = _extract_path_hints(user_query)
     context_parts: list[str] = []
     retrieval_path_tags: list[str] = []
+    global_seen_ids: set[str] = set()  # Cross-stage deduplication
     vector_rows:   list[dict] = []   # kept for Stage 4 semantic blame resolution
 
     # ── Stage 0: Dependency-impact traversal ─────────────────────────────────
@@ -987,7 +994,7 @@ def retrieve_code_context(
                 "[RETRIEVE] Stage 0 returned %d impact record(s) (post-filter).", len(impact_rows)
             )
             if impact_rows:
-                impact_block = _build_context_block(impact_rows, "dependency-impact", allow_no_code=True)
+                impact_block = _build_context_block(impact_rows, "dependency-impact", allow_no_code=True, global_seen=global_seen_ids)
                 if impact_block:
                     context_parts.append(impact_block)
                     retrieval_path_tags.append("impact")
@@ -1051,7 +1058,7 @@ def retrieve_code_context(
             )
             if rows:
                 vector_rows = rows          # expose to Stage 4
-                context_parts.append(_build_context_block(rows, "vector-search"))
+                context_parts.append(_build_context_block(rows, "vector-search", global_seen=global_seen_ids))
                 retrieval_path_tags.append("vector")
         except Exception as exc:
             logger.error("[RETRIEVE] ❌ Stage 1 vector search FAILED: %s", exc)
@@ -1104,7 +1111,7 @@ def retrieve_code_context(
                 )
 
         if hint_rows:
-            context_parts.append(_build_context_block(hint_rows, "path-hint-boost"))
+            context_parts.append(_build_context_block(hint_rows, "path-hint-boost", global_seen=global_seen_ids))
             retrieval_path_tags.append("path-hint")
         else:
             logger.warning(
@@ -1209,7 +1216,7 @@ def retrieve_code_context(
                 )
                 if rows:
                     context_parts.append(
-                        _build_context_block(rows, "recent-commits")
+                        _build_context_block(rows, "recent-commits", global_seen=global_seen_ids)
                     )
                     retrieval_path_tags.append("recent-commits")
             except Exception as exc:
@@ -1244,7 +1251,7 @@ def retrieve_code_context(
             logger.info("[RETRIEVE] Stage 3b fulltext → %d record(s).", len(rows))
             if rows:
                 context_parts.append(
-                    _build_context_block(rows, "fulltext-commits")
+                    _build_context_block(rows, "fulltext-commits", global_seen=global_seen_ids)
                 )
                 retrieval_path_tags.append("fulltext")
         except Exception as exc:
@@ -1406,7 +1413,7 @@ def retrieve_code_context(
                 logger.warning("[RETRIEVE] Stage 3c fallback fulltext→MODIFIED failed: %s", exc)
 
         if commit_file_rows:
-            block = _build_context_block(commit_file_rows, "commit-file-lookup", allow_no_code=True)
+            block = _build_context_block(commit_file_rows, "commit-file-lookup", allow_no_code=True, global_seen=global_seen_ids)
             if block:
                 context_parts.append(block)
                 retrieval_path_tags.append("commit-files")
@@ -1625,7 +1632,7 @@ def retrieve_code_context(
                 logger.warning("[RETRIEVE] Stage 4c failed: %s", exc)
 
         if blame_rows:
-            context_parts.append(_build_blame_context_block(blame_rows))
+            context_parts.append(_build_blame_context_block(blame_rows, global_seen=global_seen_ids))
             retrieval_path_tags.append("blame")
             logger.info("[RETRIEVE] Stage 4 — %d blame record(s) added to context.", len(blame_rows))
         else:
@@ -1717,6 +1724,23 @@ Sections from "dependency-impact" contain graph-traversal results showing what d
 
 CONTEXT:
 {graph_context}
+
+REASONING PROTOCOL (follow for every answer):
+1. TRACE BEFORE YOU CLAIM: Before stating that entity A affects/calls/depends-on entity B,
+   identify the explicit evidence connecting them in the context above.
+   Evidence can be EITHER:
+   - An explicit graph relationship path (e.g., A [CALLS] → B, or A [DEPENDS_ON] → Module)
+   - Code-level imports or symbol references visible in the retrieved source code (e.g., "import foo" or using a struct/class from another module).
+   If you cannot find either a graph path or code-level evidence in the context, say "no evidence found" instead of inferring from general knowledge.
+2. CROSS-REPO & MODULE VERIFICATION: For cross-repository or cross-module claims, look for:
+   - A CALLS edge with cross_repo=true
+   - A DEPENDS_ON → Module path or USES_REPO edge linking repositories
+   - Import statements in the retrieved code blocks (e.g., importing a package from an external repo or another file).
+   If none of these exist in the context, state: "The retrieved graph and code context do not show a link between these entities."
+3. DISTINGUISH DIRECT vs TRANSITIVE: If A calls B and B calls C, say "A is transitively
+   affected through B" — not "A calls C".
+4. CITE EVIDENCE INLINE: When referencing a function or file, include its [Source: ...]
+   tag so the user can trace your reasoning back to a specific retrieval stage.
 
 Instructions:
 - Answer ONLY using the information shown in the context above. Never invent evidence.
