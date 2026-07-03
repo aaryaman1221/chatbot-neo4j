@@ -1,0 +1,239 @@
+# =============================================================================
+# ingest/queries.py — Neo4j Cypher Query Templates & Indexes
+# =============================================================================
+
+CYPHER_CREATE_REPO = """
+MERGE (repo:Repository {full_name: $repo_full_name})
+  ON CREATE SET repo.name = $repo_name, repo.url = $repo_url
+"""
+
+CYPHER_INGEST_FUNCTION = """
+MERGE (repo:Repository {full_name: $repo_full_name})
+MERGE (file:File {path: $filepath, repo: $repo_full_name})
+MERGE (func:Function {id: $func_id})
+  ON CREATE SET
+    func.name            = $func_name,
+    func.filepath        = $filepath,
+    func.repo            = $repo_full_name,
+    func.code            = $func_code,
+    func.embedding       = $embedding,
+    func.qualified_calls = $qualified_calls
+  ON MATCH SET
+    func.qualified_calls = $qualified_calls
+MERGE (file)-[:DECLARES]->(func)
+MERGE (repo)-[:DECLARES]->(func)
+"""
+
+CYPHER_INGEST_CALLS = """
+MATCH (caller:Function {id: $caller_id})
+// Try file-local match first (same file as the caller)
+OPTIONAL MATCH (local:Function {name: $callee_name, filepath: $caller_filepath, repo: $repo_full_name})
+// Fall back to repo-wide match, but avoid generic method names when matching across files
+OPTIONAL MATCH (repo_wide:Function {name: $callee_name, repo: $repo_full_name})
+WHERE repo_wide.filepath <> $caller_filepath
+  AND NOT $callee_name IN ['New', 'Run', 'Execute', 'Close', 'Open', 'Init', 'String', 'Read', 'Write', 'Update', 'Focus', 'Blur', 'Blink', 'Start', 'Stop', 'Reset', 'Clear', 'Add', 'Remove', 'Delete', 'Get', 'Set', 'List', 'Find', 'Check', 'Verify', 'Validate', 'Parse', 'Format', 'Print', 'Println', 'Error', 'Fatal', 'Panic', 'Log', 'Debug', 'Info', 'Warn']
+WITH caller, coalesce(local, repo_wide) AS callee
+WHERE callee IS NOT NULL
+MERGE (caller)-[:CALLS]->(callee)
+"""
+
+CYPHER_MODIFIED_FUNCTION = """
+MERGE (commit:Commit {sha: $commit_sha})
+MERGE (func:Function {id: $func_id})
+MERGE (commit)-[:MODIFIED]->(func)
+"""
+
+CYPHER_INGEST_COMMIT = """
+MERGE (repo:Repository {full_name: $repo_full_name})
+MERGE (author:User {login: $actor_login})
+MERGE (commit:Commit {sha: $commit_sha})
+SET
+    commit.timestamp    = $committed_at,
+    commit.summary_text = $summary_text,
+    commit.diff_text    = $diff_text,
+    commit.message      = $commit_message,
+    commit.url          = $commit_url
+MERGE (author)-[:AUTHORED]->(commit)
+MERGE (commit)-[:BELONGS_TO]->(repo)
+"""
+
+CYPHER_INGEST_FILE = """
+MERGE (repo:Repository {full_name: $repo_full_name})
+MERGE (file:File {path: $filepath, repo: $repo_full_name})
+  ON CREATE SET file.repo = $repo_full_name
+MERGE (commit:Commit {sha: $commit_sha})
+MERGE (commit)-[:MODIFIED]->(file)
+MERGE (repo)-[:CONTAINS_FILE]->(file)
+"""
+
+CYPHER_INGEST_DEPENDENCY = """
+MERGE (file:File {path: $filepath, repo: $repo_full_name})
+MERGE (module:Module {name: $target_module})
+  ON CREATE SET module.embedding = coalesce(module.embedding, $embedding)
+MERGE (file)-[r:DEPENDS_ON]->(module)
+  ON CREATE SET r.added_in_commit = $commit_sha, r.is_active = true
+  ON MATCH  SET r.is_active = true
+"""
+
+CYPHER_REMOVE_DEPENDENCY = """
+MATCH (file:File {path: $filepath, repo: $repo_full_name})-[r:DEPENDS_ON]->(module:Module {name: $target_module})
+SET r.is_active = false, r.deleted_in_commit = $commit_sha
+"""
+
+CYPHER_TREE_FILE = """
+MERGE (repo:Repository {full_name: $repo_full_name})
+MERGE (file:File {path: $child_path, repo: $repo_full_name})
+  ON CREATE SET file.repo        = $repo_full_name,
+                file.entry_point = $entry_point
+MERGE (repo)-[:CONTAINS_FILE]->(file)
+WITH file, repo
+OPTIONAL MATCH (parent:Directory {path: $parent_path, repo: $repo_full_name})
+FOREACH (_ IN CASE WHEN parent IS NOT NULL THEN [1] ELSE [] END |
+  MERGE (parent)-[:CONTAINS]->(file)
+)
+"""
+
+CYPHER_TREE_DIR = """
+MERGE (repo:Repository {full_name: $repo_full_name})
+MERGE (dir:Directory {path: $child_path, repo: $repo_full_name})
+  ON CREATE SET dir.repo    = $repo_full_name,
+                dir.utility = $utility
+MERGE (repo)-[:CONTAINS_DIR]->(dir)
+WITH dir, repo
+OPTIONAL MATCH (parent:Directory {path: $parent_path, repo: $repo_full_name})
+FOREACH (_ IN CASE WHEN parent IS NOT NULL THEN [1] ELSE [] END |
+  MERGE (parent)-[:CONTAINS]->(dir)
+)
+"""
+
+CYPHER_LINK_REPO_DEPENDENCY = """
+MATCH (f:File {repo: $parent_repo})-[:DEPENDS_ON]->(m:Module)
+WHERE toLower(m.name) CONTAINS toLower($helper_repo_name)
+MERGE (r:Repository {full_name: $helper_repo})
+MERGE (f)-[:USES_REPO]->(r)
+"""
+
+CYPHER_LINK_MODULE_TO_REPO = """
+MATCH (m:Module)
+MATCH (r:Repository)
+WHERE toLower(m.name) CONTAINS toLower(r.name)
+   OR toLower(m.name) CONTAINS toLower(r.full_name)
+MERGE (m)-[:REPRESENTS]->(r)
+"""
+
+CYPHER_LINK_XREPO_CALLS = """
+MATCH (parentFile:File {repo: $parent_repo})-[:USES_REPO]->(helper_repo:Repository {full_name: $helper_repo})
+WITH DISTINCT helper_repo
+MATCH (caller:Function {repo: $parent_repo})
+WHERE caller.qualified_calls IS NOT NULL AND size(caller.qualified_calls) > 0
+UNWIND caller.qualified_calls AS qcall
+WITH caller, qcall, split(qcall, '.') AS parts, helper_repo
+WHERE size(parts) >= 2
+WITH caller, qcall, parts[0] AS prefix, parts[-1] AS func_name, helper_repo
+OPTIONAL MATCH (m:Module)-[:REPRESENTS]->(helper_repo)
+WHERE toLower(m.name) ENDS WITH "/" + toLower(prefix) OR toLower(m.name) = toLower(prefix)
+WITH caller, qcall, prefix, func_name, helper_repo, m
+WHERE toLower(prefix) = toLower($helper_prefix) OR m IS NOT NULL
+MATCH (callee:Function {repo: $helper_repo})
+WHERE (toLower(prefix) = toLower($helper_prefix) AND callee.name = func_name)
+   OR (m IS NOT NULL AND (callee.name = func_name OR (func_name IN ['New', 'NewCommand', 'Init', 'Execute', 'Run'] AND callee.name IN ['Command', 'NewCommand', 'Execute', 'RunE', 'Run'])))
+MERGE (caller)-[:CALLS {cross_repo: true}]->(callee)
+"""
+
+CYPHER_CROSS_REPO_IMPACT = """
+MATCH (helperCommit:Commit {sha: $commit_sha})-[:MODIFIED]->(changed)
+WHERE changed:Function OR changed:File
+WITH collect(changed) AS changedNodes
+// Path 1: Direct cross-repo CALLS
+MATCH (parentFile:File {repo: $parent_repo})-[:USES_REPO]->(helperRepo:Repository {full_name: $helper_repo})
+OPTIONAL MATCH (parentFunc:Function {repo: $parent_repo})-[:CALLS {cross_repo: true}]->(helperFunc:Function)
+WHERE helperFunc IN changedNodes
+WITH changedNodes, collect(DISTINCT {
+  affected_file: parentFile.path,
+  affected_function: parentFunc.name,
+  affected_in_file: parentFunc.filepath,
+  impact_type: 'CALLS'
+}) AS call_impacts
+// Path 2: Module-level dependency impact
+OPTIONAL MATCH (changedFile:File)-[:DECLARES]->(changedFunc:Function)
+WHERE changedFile IN changedNodes OR changedFunc IN changedNodes
+WITH changedNodes, call_impacts, collect(DISTINCT changedFile.path) AS changedPaths
+OPTIONAL MATCH (parentFile2:File {repo: $parent_repo})-[:DEPENDS_ON]->(m:Module)-[:REPRESENTS]->(helperRepo2:Repository {full_name: $helper_repo})
+WITH call_impacts, collect(DISTINCT {
+  affected_file: parentFile2.path,
+  affected_function: null,
+  affected_in_file: parentFile2.path,
+  impact_type: 'DEPENDS_ON'
+}) AS dep_impacts
+UNWIND (call_impacts + dep_impacts) AS impact
+WHERE impact.affected_file IS NOT NULL
+RETURN DISTINCT
+  impact.affected_file AS affected_file,
+  impact.affected_function AS affected_function,
+  impact.affected_in_file AS affected_in_file,
+  impact.impact_type AS impact_type
+ORDER BY affected_file
+"""
+
+CYPHER_VECTOR_INDEX = """
+CREATE VECTOR INDEX issue_embeddings IF NOT EXISTS
+FOR (i:Issue) ON (i.embedding)
+OPTIONS {
+  indexConfig: {
+    `vector.dimensions`: 3072,
+    `vector.similarity_function`: 'cosine'
+  }
+}
+"""
+
+CYPHER_CODE_VECTOR_INDEX = """
+CREATE VECTOR INDEX code_embeddings IF NOT EXISTS
+FOR (n:Function) ON (n.embedding)
+OPTIONS {
+  indexConfig: {
+    `vector.dimensions`: 3072,
+    `vector.similarity_function`: 'cosine'
+  }
+}
+"""
+
+CYPHER_MODULE_VECTOR_INDEX = """
+CREATE VECTOR INDEX module_embeddings IF NOT EXISTS
+FOR (m:Module) ON (m.embedding)
+OPTIONS {
+  indexConfig: {
+    `vector.dimensions`: 3072,
+    `vector.similarity_function`: 'cosine'
+  }
+}
+"""
+
+CYPHER_FULLTEXT_INDEX = """
+CREATE FULLTEXT INDEX commit_summaries IF NOT EXISTS
+FOR (c:Commit) ON EACH [c.summary_text, c.diff_text, c.message]
+"""
+
+CYPHER_UPSERT_STATUS = """
+MERGE (bs:BootstrapStatus {repo: $repo_full_name})
+SET bs.status            = $status,
+    bs.detail            = $detail,
+    bs.commits_processed = $commits_processed,
+    bs.files_scanned     = $files_scanned,
+    bs.updated_at        = $updated_at
+"""
+
+CYPHER_CONSTRAINT_FILE_REPO = """
+CREATE CONSTRAINT file_repo_unique IF NOT EXISTS
+FOR (f:File) REQUIRE (f.path, f.repo) IS UNIQUE
+"""
+
+CYPHER_CONSTRAINT_FUNC_ID = """
+CREATE CONSTRAINT func_id_unique IF NOT EXISTS
+FOR (f:Function) REQUIRE f.id IS UNIQUE
+"""
+
+CYPHER_CLEANUP_UNSCOPED_FILES = "MATCH (f:File)      WHERE f.repo IS NULL DETACH DELETE f"
+CYPHER_CLEANUP_UNSCOPED_DIRS  = "MATCH (d:Directory) WHERE d.repo IS NULL DETACH DELETE d"
+CYPHER_CLEANUP_UNSCOPED_FUNCS = "MATCH (f:Function)  WHERE f.repo IS NULL DETACH DELETE f"
+
+CYPHER_MARK_FILE_SCANNED = "MATCH (file:File {path: $filepath, repo: $repo_full_name}) SET file.content_scanned = true"

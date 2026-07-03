@@ -19,6 +19,7 @@ from backend_ingest import (
     CYPHER_LINK_MODULE_TO_REPO,
     CYPHER_LINK_XREPO_CALLS,
 )
+from ingest.parser import parse_go_ast, parse_python_ast
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("migrate_calls_edges")
@@ -31,6 +32,25 @@ WHERE caller.repo = callee.repo
 WITH caller, r, callee
 MATCH (local:Function {name: callee.name, filepath: caller.filepath, repo: caller.repo})
 WHERE local <> callee
+DELETE r
+RETURN count(*) AS deleted_edges
+"""
+
+CYPHER_CLEANUP_FALSE_BARE_CALLS = """
+MATCH (caller:Function)-[r:CALLS]->(callee:Function)
+WHERE caller.repo = callee.repo
+  AND caller.filepath <> callee.filepath
+  AND NOT coalesce(r.cross_repo, false)
+  AND callee.name IN ['New', 'Run', 'Execute', 'Close', 'Open', 'Init', 'String', 'Read', 'Write', 'Update', 'Focus', 'Blur', 'Blink', 'Start', 'Stop', 'Reset', 'Clear', 'Add', 'Remove', 'Delete', 'Get', 'Set', 'List', 'Find', 'Check', 'Verify', 'Validate', 'Parse', 'Format', 'Print', 'Println', 'Error', 'Fatal', 'Panic', 'Log', 'Debug', 'Info', 'Warn']
+DELETE r
+RETURN count(*) AS deleted_edges
+"""
+
+CYPHER_CLEANUP_FALSE_XREPO_CALLS = """
+MATCH (caller:Function)-[r:CALLS {cross_repo: true}]->(callee:Function)
+WHERE NOT EXISTS {
+  MATCH (f:File {repo: caller.repo})-[:USES_REPO]->(r_helper:Repository {full_name: callee.repo})
+}
 DELETE r
 RETURN count(*) AS deleted_edges
 """
@@ -57,14 +77,59 @@ def main():
     logger.info("Connecting to Neo4j at %s...", uri)
     with GraphDatabase.driver(uri, auth=(user, password)) as driver:
         with driver.session() as session:
+            logger.info("0. Re-populating AST qualified_calls on Function nodes from stored source code...")
+            if not args.dry_run:
+                rows = session.run("MATCH (f:Function) WHERE f.qualified_calls IS NULL AND f.code IS NOT NULL RETURN f.id AS id, f.filepath AS fp, f.code AS code").data()
+                logger.info("Found %d Function nodes to scan for call expressions...", len(rows))
+                batch_updates = []
+                for r in rows:
+                    fp = r["fp"] or ""
+                    code = r["code"] or ""
+                    if fp.endswith(".go"):
+                        ast = parse_go_ast(fp, code)
+                    elif fp.endswith(".py"):
+                        ast = parse_python_ast(fp, code)
+                    else:
+                        continue
+                    qcalls_set = set()
+                    for c in ast.get("calls", []):
+                        if len(c) > 2 and c[2]:
+                            qcalls_set.add(c[2])
+                        if len(c) > 1 and c[1]:
+                            qcalls_set.add(c[1])
+                    qcalls = sorted(list(qcalls_set))
+                    if qcalls:
+                        batch_updates.append({"id": r["id"], "qcalls": qcalls})
+                if batch_updates:
+                    session.run("""
+                        UNWIND $batch AS item
+                        MATCH (f:Function {id: item.id})
+                        SET f.qualified_calls = item.qcalls
+                    """, batch=batch_updates)
+                logger.info("✅ Re-populated qualified_calls on %d Function nodes.", len(batch_updates))
+            else:
+                logger.info("[DRY RUN] Would scan and re-populate AST qualified_calls.")
+
             if args.dry_run:
-                logger.info("[DRY RUN] Would clean up ambiguous CALLS edges where local callee exists.")
+                logger.info("[DRY RUN] Would clean up ambiguous CALLS edges where local callee exists or generic name across files.")
             else:
                 logger.info("1. Cleaning up ambiguous CALLS edges where a file-local callee exists...")
                 res = session.run(CYPHER_CLEANUP_AMBIGUOUS_CALLS)
                 record = res.single()
                 deleted = record["deleted_edges"] if record else 0
                 logger.info("✅ Deleted %d ambiguous intra-repo CALLS edges.", deleted)
+
+                logger.info("1b. Cleaning up false bare-name intra-repo CALLS edges for generic methods...")
+                res_bare = session.run(CYPHER_CLEANUP_FALSE_BARE_CALLS)
+                rec_bare = res_bare.single()
+                deleted_bare = rec_bare["deleted_edges"] if rec_bare else 0
+                logger.info("✅ Deleted %d false bare-name intra-repo CALLS edges.", deleted_bare)
+
+                logger.info("1c. Cleaning up false cross-repo CALLS edges without USES_REPO relationship...")
+                res_xrepo = session.run(CYPHER_CLEANUP_FALSE_XREPO_CALLS)
+                rec_xrepo = res_xrepo.single()
+                deleted_xrepo = rec_xrepo["deleted_edges"] if rec_xrepo else 0
+                logger.info("✅ Deleted %d false cross-repo CALLS edges.", deleted_xrepo)
 
             logger.info("2. Creating Module-to-Repository representation links...")
             if not args.dry_run:
