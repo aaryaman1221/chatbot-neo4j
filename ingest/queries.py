@@ -31,13 +31,23 @@ MERGE (repo)-[:DECLARES]->(func)
 
 CYPHER_INGEST_CALLS = """
 MATCH (caller:Function {id: $caller_id})
-// Try file-local match first (same file as the caller)
+// 1. Try file-local match first (same file as the caller)
 OPTIONAL MATCH (local:Function {name: $callee_name, filepath: $caller_filepath, repo: $repo_full_name})
-// Fall back to repo-wide match, but avoid generic method names when matching across files
+// 2. Try package/directory-local match second (same parent directory in the same repo)
+OPTIONAL MATCH (pkg_local:Function {name: $callee_name, repo: $repo_full_name})
+WHERE pkg_local.filepath <> $caller_filepath
+  AND split(pkg_local.filepath, '/')[0..-1] = split($caller_filepath, '/')[0..-1]
+// 3. Fall back to repo-wide match ONLY if callee is scoped (e.g. Receiver.Method),
+// or if caller explicitly imports/depends on callee's module/path, or if callee is specific
 OPTIONAL MATCH (repo_wide:Function {name: $callee_name, repo: $repo_full_name})
 WHERE repo_wide.filepath <> $caller_filepath
-  AND NOT $callee_name IN ['New', 'Run', 'Execute', 'Close', 'Open', 'Init', 'String', 'Read', 'Write', 'Update', 'Focus', 'Blur', 'Blink', 'Start', 'Stop', 'Reset', 'Clear', 'Add', 'Remove', 'Delete', 'Get', 'Set', 'List', 'Find', 'Check', 'Verify', 'Validate', 'Parse', 'Format', 'Print', 'Println', 'Error', 'Fatal', 'Panic', 'Log', 'Debug', 'Info', 'Warn']
-WITH caller, coalesce(local, repo_wide) AS callee
+  AND split(repo_wide.filepath, '/')[0..-1] <> split($caller_filepath, '/')[0..-1]
+  AND (
+       $callee_name CONTAINS '.'
+    OR EXISTS { MATCH (caller_file:File {path: $caller_filepath, repo: $repo_full_name})-[:DEPENDS_ON]->(m:Module) WHERE toLower(repo_wide.filepath) CONTAINS toLower(m.name) OR toLower(m.name) ENDS WITH toLower(split(repo_wide.filepath, '/')[0]) }
+    OR (NOT $callee_name IN ['New', 'Run', 'Execute', 'Close', 'Open', 'Init', 'String', 'Read', 'Write', 'Update', 'Focus', 'Blur', 'Blink', 'Start', 'Stop', 'Reset', 'Clear', 'Add', 'Remove', 'Delete', 'Get', 'Set', 'List', 'Find', 'Check', 'Verify', 'Validate', 'Parse', 'Format', 'Print', 'Println', 'Error', 'Fatal', 'Panic', 'Log', 'Debug', 'Info', 'Warn', 'Main', 'Test', 'Setup', 'Teardown', 'Config', 'Load', 'Save', 'Create', 'Send', 'Process', 'Handle'] AND size($callee_name) >= 5)
+  )
+WITH caller, coalesce(local, pkg_local, repo_wide) AS callee
 WHERE callee IS NOT NULL
 MERGE (caller)-[:CALLS]->(callee)
 """

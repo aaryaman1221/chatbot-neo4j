@@ -40,8 +40,17 @@ CYPHER_CLEANUP_FALSE_BARE_CALLS = """
 MATCH (caller:Function)-[r:CALLS]->(callee:Function)
 WHERE caller.repo = callee.repo
   AND caller.filepath <> callee.filepath
+  AND split(caller.filepath, '/')[0..-1] <> split(callee.filepath, '/')[0..-1]
   AND NOT coalesce(r.cross_repo, false)
-  AND callee.name IN ['New', 'Run', 'Execute', 'Close', 'Open', 'Init', 'String', 'Read', 'Write', 'Update', 'Focus', 'Blur', 'Blink', 'Start', 'Stop', 'Reset', 'Clear', 'Add', 'Remove', 'Delete', 'Get', 'Set', 'List', 'Find', 'Check', 'Verify', 'Validate', 'Parse', 'Format', 'Print', 'Println', 'Error', 'Fatal', 'Panic', 'Log', 'Debug', 'Info', 'Warn']
+  AND NOT callee.name CONTAINS '.'
+  AND (
+       callee.name IN ['New', 'Run', 'Execute', 'Close', 'Open', 'Init', 'String', 'Read', 'Write', 'Update', 'Focus', 'Blur', 'Blink', 'Start', 'Stop', 'Reset', 'Clear', 'Add', 'Remove', 'Delete', 'Get', 'Set', 'List', 'Find', 'Check', 'Verify', 'Validate', 'Parse', 'Format', 'Print', 'Println', 'Error', 'Fatal', 'Panic', 'Log', 'Debug', 'Info', 'Warn', 'Main', 'Test', 'Setup', 'Teardown', 'Config', 'Load', 'Save', 'Create', 'Send', 'Process', 'Handle']
+    OR size(callee.name) < 5
+    OR NOT EXISTS {
+       MATCH (caller_file:File {path: caller.filepath, repo: caller.repo})-[:DEPENDS_ON]->(m:Module)
+       WHERE toLower(callee.filepath) CONTAINS toLower(m.name) OR toLower(m.name) ENDS WITH toLower(split(callee.filepath, '/')[0])
+    }
+  )
 DELETE r
 RETURN count(*) AS deleted_edges
 """

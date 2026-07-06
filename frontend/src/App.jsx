@@ -14,11 +14,23 @@ function App() {
   const [stats, setStats] = useState(null);
   const [repos, setRepos] = useState([]);
   const [selectedRepos, setSelectedRepos] = useState([]);
+  const [repoSearch, setRepoSearch] = useState('');
   const [topK, setTopK] = useState(5);
   
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+
+  const toggleRepo = (repo) => {
+    setSelectedRepos(prev => 
+      prev.includes(repo) ? prev.filter(r => r !== repo) : [...prev, repo]
+    );
+  };
+
+  const selectAllRepos = () => setSelectedRepos([...repos]);
+  const clearAllRepos = () => setSelectedRepos([]);
+
+  const filteredRepos = repos.filter(r => r.toLowerCase().includes(repoSearch.toLowerCase()));
 
   const getHeaders = () => ({
     'Content-Type': 'application/json',
@@ -154,24 +166,53 @@ function App() {
         <div className="section-header">⚙️ RAG Settings</div>
         {repos.length > 0 && (
           <div className="input-group">
-            <label className="input-label">Target Repositories</label>
-            <select 
-              multiple 
-              className="text-input" 
-              style={{ height: 'auto', minHeight: '80px', padding: '0.5rem' }}
-              value={selectedRepos}
-              onChange={(e) => {
-                const options = [...e.target.selectedOptions];
-                const values = options.map(option => option.value);
-                setSelectedRepos(values);
-              }}
-            >
-              {repos.map(repo => (
-                <option key={repo} value={repo}>{repo}</option>
-              ))}
-            </select>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <label className="input-label">Target Repositories</label>
+              <span style={{ fontSize: '0.75rem', color: '#00d4ff', fontWeight: 600 }}>
+                {selectedRepos.length === 0 ? 'All (Global)' : `${selectedRepos.length} Selected`}
+              </span>
+            </div>
+            <div className="repo-chip-container">
+              <div className="repo-chip-actions">
+                <span>{selectedRepos.length === 0 ? 'Searching all repositories' : 'Custom filter active'}</span>
+                <div>
+                  <button onClick={selectAllRepos} type="button">Select All</button>
+                  <button onClick={clearAllRepos} type="button" style={{ marginLeft: '4px' }}>Clear</button>
+                </div>
+              </div>
+              {repos.length > 3 && (
+                <input 
+                  type="text"
+                  className="repo-filter-input"
+                  placeholder="🔍 Filter repositories..."
+                  value={repoSearch}
+                  onChange={(e) => setRepoSearch(e.target.value)}
+                />
+              )}
+              <div className="repo-chip-list">
+                {filteredRepos.map(repo => {
+                  const isSelected = selectedRepos.includes(repo);
+                  return (
+                    <div 
+                      key={repo} 
+                      className={`repo-chip ${isSelected ? 'active' : ''}`}
+                      onClick={() => toggleRepo(repo)}
+                    >
+                      <span>{isSelected ? '✓' : '📦'}</span>
+                      <span>{repo.split('/').pop()}</span>
+                      <span style={{ fontSize: '0.7em', opacity: 0.6 }}>({repo.split('/')[0]})</span>
+                    </div>
+                  );
+                })}
+                {filteredRepos.length === 0 && (
+                  <div style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.4)', padding: '0.5rem 0' }}>
+                    No matching repositories found.
+                  </div>
+                )}
+              </div>
+            </div>
             <div style={{ fontSize: '0.7rem', color: 'rgba(255,255,255,0.4)', marginTop: '4px' }}>
-              Hold Cmd/Ctrl to select multiple. Leave empty to search all.
+              Click chips to toggle. Leave clear to search across your entire graph.
             </div>
           </div>
         )}

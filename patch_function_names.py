@@ -35,18 +35,18 @@ from neo4j import GraphDatabase
 from tqdm import tqdm
 
 from ingest.config import logger, GITHUB_API_BASE
-from ingest.parser import parse_go_ast
+from ingest.parser import parse_go_ast, parse_python_ast
 
-CYPHER_GET_GO_FILES = """
+CYPHER_GET_SOURCE_FILES = """
 MATCH (fn:Function)
-WHERE fn.repo = $repo AND fn.filepath ENDS WITH '.go'
+WHERE fn.repo = $repo AND (fn.filepath ENDS WITH '.go' OR fn.filepath ENDS WITH '.py')
 RETURN DISTINCT fn.filepath AS filepath
 """
 
 CYPHER_GET_FILE_FUNCS = """
 MATCH (fn:Function)
 WHERE fn.repo = $repo AND fn.filepath = $filepath
-RETURN fn.name AS old_name, fn.id AS old_id
+RETURN fn.name AS old_name, fn.id AS old_id, fn.code AS code
 """
 
 CYPHER_PATCH_FUNCTION = """
@@ -77,13 +77,13 @@ def patch_graph():
     driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_pass))
 
     with driver.session() as session:
-        file_rows = session.run(CYPHER_GET_GO_FILES, repo=target_repo).data()
+        file_rows = session.run(CYPHER_GET_SOURCE_FILES, repo=target_repo).data()
     
     db_paths = [r["filepath"] for r in file_rows]
-    print(f"[*] Found {len(db_paths)} distinct Go files with functions in graph.")
+    print(f"[*] Found {len(db_paths)} distinct Go/Python files with functions in graph.")
 
     if not db_paths:
-        print("[!] No Go files found to patch.")
+        print("[!] No Go or Python files found to patch.")
         driver.close()
         return
 
@@ -98,19 +98,18 @@ def patch_graph():
     resp.raise_for_status()
     print(f"[*] Download complete in {time.time() - start_time:.1f}s ({len(resp.content)/1024/1024:.2f} MB).")
 
-    print("[*] Extracting Go source files from tarball in memory...")
+    print("[*] Extracting source files from tarball in memory...")
     tar_files = {}
     with tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
         for member in tar.getmembers():
-            if not member.name.endswith(".go") or member.isdir():
+            if not (member.name.endswith(".go") or member.name.endswith(".py")) or member.isdir():
                 continue
-            # Strip top-level directory (e.g. 'gohugoio-hugo-123abc/')
             rel_path = member.name.split("/", 1)[-1]
             if rel_path in db_paths:
                 raw_bytes = tar.extractfile(member).read()
                 tar_files[rel_path] = raw_bytes.decode("utf-8", errors="replace")
 
-    print(f"[*] Loaded {len(tar_files)} matching Go files from archive.")
+    print(f"[*] Loaded {len(tar_files)} matching source files from archive.")
 
     total_patched = 0
     total_checked = 0
@@ -123,7 +122,10 @@ def patch_graph():
                 if not source_code:
                     continue
 
-                ast_data = parse_go_ast(filepath, source_code)
+                if filepath.endswith(".go"):
+                    ast_data = parse_go_ast(filepath, source_code)
+                else:
+                    ast_data = parse_python_ast(filepath, source_code)
                 correct_funcs = {f["name"]: f for f in ast_data.get("functions", [])}
 
                 db_funcs = session.run(CYPHER_GET_FILE_FUNCS, repo=target_repo, filepath=filepath).data()
@@ -131,12 +133,17 @@ def patch_graph():
                 for r in db_funcs:
                     total_checked += 1
                     old_name = r["old_name"]
-                    # Strip any trailing parameters or parens from the chopped name
+                    old_code = r.get("code") or ""
                     clean_old = old_name.split("(")[0]
 
                     for corr_name, corr_data in correct_funcs.items():
-                        if clean_old and corr_name.endswith(clean_old) and len(clean_old) >= 2:
-                            if old_name != corr_name:
+                        # Match if name matches or if old bare name is the suffix of scoped name (e.g. Close -> Client.Close)
+                        is_match = (corr_name == old_name) or (corr_name.split(".")[-1] == clean_old) or (clean_old and corr_name.endswith(clean_old) and len(clean_old) >= 2)
+                        if is_match:
+                            # Verify code match if available to distinguish identically named methods in same file
+                            if old_code and corr_data.get("code") and (old_code[:40] != corr_data["code"][:40]) and (old_name != corr_name):
+                                continue
+                            if old_name != corr_name or old_code != corr_data.get("code", ""):
                                 new_id = f"{target_repo}::{filepath}::{corr_name}"
                                 session.run(
                                     CYPHER_PATCH_FUNCTION,
@@ -151,7 +158,7 @@ def patch_graph():
                             break
 
     driver.close()
-    print(f"\n[DONE] Checked {total_checked} functions. Successfully patched {total_patched} chopped function names and code blocks in-place!")
+    print(f"\n[DONE] Checked {total_checked} functions. Successfully patched {total_patched} function names and IDs in-place!")
     print("[*] All vector embeddings, call graphs, and commit blame relationships were preserved with zero token cost.")
 
 

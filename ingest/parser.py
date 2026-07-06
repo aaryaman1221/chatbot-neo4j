@@ -60,28 +60,27 @@ def parse_python_ast(filepath: str, source_code: str) -> dict:
         # Collect FunctionDef/AsyncFunctionDef directly inside Module or ClassDef
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                func_nodes.append(node)
+                func_nodes.append((node, node.name))
             elif isinstance(node, ast.ClassDef):
                 for child in node.body:
                     if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        func_nodes.append(child)
+                        func_nodes.append((child, f"{node.name}.{child.name}"))
 
-
-        for node in func_nodes:
+        for node, scoped_name in func_nodes:
             if node.lineno in seen_lines:
                 continue
             seen_lines.add(node.lineno)
             func_code = ast.get_source_segment(source_code, node) or ""
             functions.append({
-                "name": node.name,
-                "id": f"{filepath}::{node.name}",
+                "name": scoped_name,
+                "id": f"{filepath}::{scoped_name}",
                 "start": node.lineno,
                 "end": node.end_lineno,
                 "code": func_code
             })
             for child in ast.walk(node):
                 if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
-                    calls.append((node.name, child.func.id, None))
+                    calls.append((scoped_name, child.func.id, None))
                 elif isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
                     parts = []
                     attr_node = child.func
@@ -92,7 +91,7 @@ def parse_python_ast(filepath: str, source_code: str) -> dict:
                         parts.append(attr_node.id)
                     parts.reverse()
                     qualified_name = ".".join(parts)
-                    calls.append((node.name, child.func.attr, qualified_name))
+                    calls.append((scoped_name, child.func.attr, qualified_name))
     except Exception:
         pass
 
@@ -124,10 +123,20 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
             name_node = node.child_by_field_name('name')
             if name_node:
                 name = get_text(name_node)
-                new_func = name  # Track current function scope for call-edge detection
+                receiver_name = ""
+                if node.type == 'method_declaration':
+                    recv_node = node.child_by_field_name('receiver')
+                    if recv_node:
+                        recv_text = get_text(recv_node)
+                        m = re.search(r'\*?(?:[A-Za-z0-9_]+\.)?([A-Za-z0-9_]+)(?:\[.*?\])?\s*\)', recv_text)
+                        if m:
+                            receiver_name = m.group(1)
+                
+                scoped_name = f"{receiver_name}.{name}" if receiver_name else name
+                new_func = scoped_name  # Track current function scope for call-edge detection
                 functions.append({
-                    "name":  name,
-                    "id":    f"{filepath}::{name}",
+                    "name":  scoped_name,
+                    "id":    f"{filepath}::{scoped_name}",
                     "start": node.start_point[0] + 1,
                     "end":   node.end_point[0] + 1,
                     "code":  get_text(node),

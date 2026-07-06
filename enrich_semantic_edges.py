@@ -36,7 +36,7 @@ def pass_1_receiver_types(session, dry_run: bool) -> int:
     logger.info("── Pass 1: Receiver & Type Resolution (DECLARES_METHOD) ──")
     query = """
     MATCH (f:Function)
-    WHERE f.code IS NOT NULL AND f.code STARTS WITH 'func ('
+    WHERE f.name CONTAINS '.' OR (f.code IS NOT NULL AND f.code STARTS WITH 'func (')
     RETURN elementId(f) AS func_eid, f.name AS func_name, f.filepath AS filepath, f.repo AS repo, substring(f.code, 0, 150) AS header
     """
     rows = session.run(query).data()
@@ -45,10 +45,17 @@ def pass_1_receiver_types(session, dry_run: bool) -> int:
     receiver_regex = re.compile(r"^func\s*\(\s*(?:\w+\s+)?\*?([A-Za-z0-9_]+)\s*\)\s*([A-Za-z0-9_]+)")
     batch = []
     for r in rows:
-        header = r.get("header") or ""
-        m = receiver_regex.match(header)
-        if m:
-            type_name = m.group(1)
+        func_name = r.get("func_name") or ""
+        type_name = ""
+        if "." in func_name:
+            type_name = func_name.split(".")[0]
+        else:
+            header = r.get("header") or ""
+            m = receiver_regex.match(header)
+            if m:
+                type_name = m.group(1)
+        
+        if type_name:
             batch.append({
                 "func_eid": r["func_eid"],
                 "type_name": type_name,
@@ -83,12 +90,13 @@ def pass_2_struct_embedding(session, dry_run: bool) -> int:
     logger.info("── Pass 2: Struct Composition & Inheritance (EMBEDS) ──")
     query = """
     MATCH (f:Function)
-    WHERE f.code IS NOT NULL AND (toLower(f.code) CONTAINS 'struct {' OR toLower(f.code) CONTAINS 'interface {')
+    WHERE f.code IS NOT NULL AND (toLower(f.code) CONTAINS 'struct {' OR toLower(f.code) CONTAINS 'interface {' OR f.code CONTAINS 'class ')
     RETURN f.repo AS repo, f.filepath AS filepath, f.code AS code
     """
     rows = session.run(query).data()
     
     struct_regex = re.compile(r"type\s+([A-Za-z0-9_]+)\s+struct\s*\{([^}]+)\}", re.MULTILINE)
+    py_class_regex = re.compile(r"class\s+([A-Za-z0-9_]+)\s*\(([A-Za-z0-9_,\s.]+)\):", re.MULTILINE)
     batch = []
     for r in rows:
         code = r.get("code") or ""
@@ -112,6 +120,18 @@ def pass_2_struct_embedding(session, dry_run: bool) -> int:
                             "repo": repo,
                             "filepath": filepath,
                         })
+        for cm in py_class_regex.finditer(code):
+            outer_type = cm.group(1)
+            parents = cm.group(2)
+            for parent in parents.split(","):
+                inner_name = parent.strip().split(".")[-1]
+                if inner_name and inner_name not in ["object", "ABC", "BaseModel", "Exception"] and inner_name != outer_type:
+                    batch.append({
+                        "outer_type": outer_type,
+                        "inner_name": inner_name,
+                        "repo": repo,
+                        "filepath": filepath,
+                    })
 
     if not batch:
         batch.append({"outer_type": "Command", "inner_name": "Command", "repo": "gohugoio/hugo", "filepath": ""})
@@ -144,7 +164,7 @@ def pass_3_duck_typing_implements(session, dry_run: bool) -> int:
     WHERE t1 <> t2 AND m1.name = m2.name AND t1.repo <> t2.repo
     WITH t1, t2, count(DISTINCT m1.name) AS shared_methods, collect(DISTINCT m1.name) AS methods
     WHERE shared_methods >= 2
-       OR 'Run' IN methods OR 'Execute' IN methods OR 'PreRun' IN methods OR 'Update' IN methods
+       OR (shared_methods = 1 AND NOT toLower(methods[0]) IN ['init', 'close', 'open', 'read', 'write', 'get', 'set', 'string', 'to_string', 'to_dict', 'copy', 'clone', 'len', 'hash', 'main', 'test', 'setup', 'teardown', 'config', 'load', 'save', 'create', 'send', 'process', 'handle'])
     RETURN elementId(t1) AS t1_eid, t1.name AS t1_name, elementId(t2) AS t2_eid, t2.name AS t2_name, shared_methods
     """
     rows = session.run(query).data()
@@ -160,7 +180,7 @@ def pass_3_duck_typing_implements(session, dry_run: bool) -> int:
     WHERE t1 <> t2 AND m1.name = m2.name AND t1.repo <> t2.repo
     WITH t1, t2, count(DISTINCT m1.name) AS shared_methods, collect(DISTINCT m1.name) AS methods
     WHERE shared_methods >= 2
-       OR 'Run' IN methods OR 'Execute' IN methods OR 'PreRun' IN methods OR 'Update' IN methods
+       OR (shared_methods = 1 AND NOT toLower(methods[0]) IN ['init', 'close', 'open', 'read', 'write', 'get', 'set', 'string', 'to_string', 'to_dict', 'copy', 'clone', 'len', 'hash', 'main', 'test', 'setup', 'teardown', 'config', 'load', 'save', 'create', 'send', 'process', 'handle'])
     MERGE (t1)-[r:IMPLEMENTS]->(t2)
     RETURN count(r) AS count
     """
@@ -175,7 +195,7 @@ def pass_4_wrappers_and_factories(session, dry_run: bool) -> int:
     logger.info("── Pass 4: Adapter & Wrapper Construction (WRAPS and PRODUCES) ──")
     query = """
     MATCH (caller:Function)-[:CALLS]->(callee:Function)
-    WHERE (callee.name STARTS WITH 'New' OR callee.name STARTS WITH 'new' OR callee.name STARTS WITH 'Wrap' OR callee.name CONTAINS 'Adapter' OR callee.name CONTAINS 'Wrapper')
+    WHERE (toLower(callee.name) STARTS WITH 'new' OR toLower(callee.name) STARTS WITH 'create' OR toLower(callee.name) STARTS WITH 'build' OR toLower(callee.name) STARTS WITH 'make' OR toLower(callee.name) STARTS WITH 'from_' OR toLower(callee.name) STARTS WITH 'to_' OR toLower(callee.name) CONTAINS 'adapter' OR toLower(callee.name) CONTAINS 'wrapper' OR toLower(callee.name) CONTAINS 'factory' OR toLower(callee.name) CONTAINS 'proxy')
       AND caller.repo <> callee.repo
     RETURN elementId(caller) AS caller_eid, elementId(callee) AS callee_eid
     """
@@ -188,7 +208,7 @@ def pass_4_wrappers_and_factories(session, dry_run: bool) -> int:
 
     wraps_query = """
     MATCH (caller:Function)-[:CALLS]->(callee:Function)
-    WHERE (callee.name STARTS WITH 'New' OR callee.name STARTS WITH 'new' OR callee.name STARTS WITH 'Wrap' OR callee.name CONTAINS 'Adapter' OR callee.name CONTAINS 'Wrapper')
+    WHERE (toLower(callee.name) STARTS WITH 'new' OR toLower(callee.name) STARTS WITH 'create' OR toLower(callee.name) STARTS WITH 'build' OR toLower(callee.name) STARTS WITH 'make' OR toLower(callee.name) STARTS WITH 'from_' OR toLower(callee.name) STARTS WITH 'to_' OR toLower(callee.name) CONTAINS 'adapter' OR toLower(callee.name) CONTAINS 'wrapper' OR toLower(callee.name) CONTAINS 'factory' OR toLower(callee.name) CONTAINS 'proxy')
       AND caller.repo <> callee.repo
     MERGE (caller)-[r:WRAPS]->(callee)
     RETURN count(r) AS count
@@ -198,7 +218,7 @@ def pass_4_wrappers_and_factories(session, dry_run: bool) -> int:
 
     produces_query = """
     MATCH (t:Type)-[:DECLARES_METHOD]->(f:Function)
-    WHERE f.name STARTS WITH 'New' OR f.name STARTS WITH 'new' OR f.name STARTS WITH 'Build'
+    WHERE toLower(f.name) STARTS WITH 'new' OR toLower(f.name) STARTS WITH 'create' OR toLower(f.name) STARTS WITH 'build' OR toLower(f.name) STARTS WITH 'make' OR toLower(f.name) STARTS WITH 'from_' OR toLower(f.name) CONTAINS 'factory'
     MERGE (f)-[r:PRODUCES]->(t)
     RETURN count(r) AS count
     """
@@ -220,14 +240,15 @@ def pass_5_lifecycle_hooks_and_registry(session, dry_run: bool) -> int:
     hook_query = """
     MATCH (f:Function)
     WHERE toLower(f.name) CONTAINS 'prerun' OR toLower(f.name) CONTAINS 'postrun'
-       OR toLower(f.name) ENDS WITH 'hook' OR toLower(f.name) ENDS WITH 'handler'
-       OR toLower(f.name) ENDS WITH 'callback' OR toLower(f.name) STARTS WITH 'on'
-       OR toLower(f.name) STARTS WITH 'before' OR toLower(f.name) STARTS WITH 'after'
-       OR f.name IN ['Init', 'init', 'Setup', 'Teardown', 'Middleware']
+       OR toLower(f.name) CONTAINS 'hook' OR toLower(f.name) CONTAINS 'handler'
+       OR toLower(f.name) CONTAINS 'callback' OR toLower(f.name) CONTAINS 'listener'
+       OR toLower(f.name) STARTS WITH 'on_' OR toLower(f.name) STARTS WITH 'before'
+       OR toLower(f.name) STARTS WITH 'after' OR toLower(f.name) STARTS WITH 'pre_'
+       OR toLower(f.name) STARTS WITH 'post_' OR toLower(f.name) IN ['init', 'setup', 'teardown', 'startup', 'shutdown', 'middleware']
     OPTIONAL MATCH (t:Type)-[:DECLARES_METHOD]->(f)
     WITH f, coalesce(t, f) AS host
     WHERE host <> f OR f.entry_point = false
-    MERGE (host)-[r:LIFECYCLE_HOOK {trigger: case when toLower(f.name) CONTAINS 'pre' or toLower(f.name) CONTAINS 'before' or toLower(f.name) CONTAINS 'init' then 'pre_exec' else 'post_exec' end}]->(f)
+    MERGE (host)-[r:LIFECYCLE_HOOK {trigger: case when toLower(f.name) CONTAINS 'pre' or toLower(f.name) CONTAINS 'before' or toLower(f.name) CONTAINS 'init' or toLower(f.name) CONTAINS 'setup' then 'pre_exec' else 'post_exec' end}]->(f)
     RETURN count(r) AS count
     """
     res1 = session.run(hook_query).data()
@@ -235,7 +256,7 @@ def pass_5_lifecycle_hooks_and_registry(session, dry_run: bool) -> int:
 
     reg_query = """
     MATCH (caller:Function)-[:CALLS]->(reg:Function)
-    WHERE reg.name STARTS WITH 'Add' OR reg.name STARTS WITH 'Register' OR reg.name STARTS WITH 'Bind' OR reg.name STARTS WITH 'Handle' OR reg.name STARTS WITH 'Use' OR reg.name STARTS WITH 'Route'
+    WHERE toLower(reg.name) STARTS WITH 'add' OR toLower(reg.name) STARTS WITH 'register' OR toLower(reg.name) STARTS WITH 'bind' OR toLower(reg.name) STARTS WITH 'handle' OR toLower(reg.name) STARTS WITH 'use' OR toLower(reg.name) STARTS WITH 'route' OR toLower(reg.name) STARTS WITH 'subscribe' OR toLower(reg.name) STARTS WITH 'emit' OR toLower(reg.name) STARTS WITH 'listen' OR toLower(reg.name) STARTS WITH 'attach' OR toLower(reg.name) STARTS WITH 'mount'
     MERGE (caller)-[r:REGISTERS_WITH]->(reg)
     RETURN count(r) AS count
     """
@@ -256,8 +277,8 @@ def pass_6_delegation_and_forwarding(session, dry_run: bool) -> int:
 
     dispatch_query = """
     MATCH (caller:Function)-[:CALLS]->(callee:Function)
-    WHERE (toLower(caller.name) CONTAINS 'prerun' OR toLower(caller.name) CONTAINS 'postrun' OR toLower(caller.name) CONTAINS 'execute' OR toLower(caller.name) CONTAINS 'run' OR caller.name CONTAINS 'Adapter' OR caller.name CONTAINS 'Wrapper' OR caller.name CONTAINS 'exec')
-      AND (toLower(callee.name) CONTAINS 'prerun' OR toLower(callee.name) CONTAINS 'postrun' OR toLower(callee.name) CONTAINS 'execute' OR toLower(callee.name) CONTAINS 'run' OR toLower(callee.name) CONTAINS 'build')
+    WHERE (toLower(caller.name) CONTAINS 'prerun' OR toLower(caller.name) CONTAINS 'postrun' OR toLower(caller.name) CONTAINS 'execute' OR toLower(caller.name) CONTAINS 'run' OR toLower(caller.name) CONTAINS 'dispatch' OR toLower(caller.name) CONTAINS 'handle' OR toLower(caller.name) CONTAINS 'send' OR toLower(caller.name) CONTAINS 'process' OR toLower(caller.name) CONTAINS 'forward' OR toLower(caller.name) CONTAINS 'invoke' OR toLower(caller.name) CONTAINS 'call' OR caller.name CONTAINS 'Adapter' OR caller.name CONTAINS 'Wrapper' OR caller.name CONTAINS 'exec')
+      AND (toLower(callee.name) CONTAINS 'prerun' OR toLower(callee.name) CONTAINS 'postrun' OR toLower(callee.name) CONTAINS 'execute' OR toLower(callee.name) CONTAINS 'run' OR toLower(callee.name) CONTAINS 'build' OR toLower(callee.name) CONTAINS 'process' OR toLower(callee.name) CONTAINS 'handle' OR toLower(callee.name) CONTAINS 'step' OR toLower(callee.name) CONTAINS 'serve')
       AND caller <> callee
     MERGE (caller)-[r:DISPATCHES_TO]->(callee)
     RETURN count(r) AS count
@@ -276,6 +297,42 @@ def pass_6_delegation_and_forwarding(session, dry_run: bool) -> int:
 
     logger.info("✅ Created/verified %d DISPATCHES_TO and %d FORWARDS_TO relationships.", dispatch_count, forward_count)
     return dispatch_count + forward_count
+
+
+def pass_7_mutates_state_of(session, dry_run: bool) -> int:
+    """Pass 7: Identify methods and functions that mutate object state or data structures (MUTATES_STATE_OF)."""
+    logger.info("── Pass 7: State Mutation & Side-Effect Analysis (MUTATES_STATE_OF) ──")
+    
+    if dry_run:
+        logger.info("[DRY-RUN] Would create MUTATES_STATE_OF edges.")
+        return 0
+
+    mutates_query = """
+    MATCH (t:Type)-[:DECLARES_METHOD]->(f:Function)
+    WHERE f.code IS NOT NULL
+      AND (
+        f.code =~ '(?s)^func\\s*\\(\\s*\\w*\\s*\\*.*'
+        OR f.code CONTAINS 'self.'
+        OR f.code CONTAINS '.Lock()'
+        OR f.code CONTAINS '.Unlock()'
+        OR f.code CONTAINS '.Store('
+        OR f.code CONTAINS '.Swap('
+        OR toLower(f.name) STARTS WITH 'set'
+        OR toLower(f.name) STARTS WITH 'update'
+        OR toLower(f.name) STARTS WITH 'reset'
+        OR toLower(f.name) STARTS WITH 'clear'
+        OR toLower(f.name) STARTS WITH 'delete'
+        OR toLower(f.name) STARTS WITH 'remove'
+        OR toLower(f.name) STARTS WITH 'append'
+        OR toLower(f.name) STARTS WITH 'add'
+      )
+    MERGE (f)-[r:MUTATES_STATE_OF]->(t)
+    RETURN count(r) AS count
+    """
+    res = session.run(mutates_query).data()
+    count = res[0]["count"] if res else 0
+    logger.info("✅ Created/verified %d MUTATES_STATE_OF relationships.", count)
+    return count
 
 
 def main():
@@ -301,8 +358,9 @@ def main():
             t4 = pass_4_wrappers_and_factories(session, args.dry_run)
             t5 = pass_5_lifecycle_hooks_and_registry(session, args.dry_run)
             t6 = pass_6_delegation_and_forwarding(session, args.dry_run)
+            t7 = pass_7_mutates_state_of(session, args.dry_run)
 
-            total = t1 + t2 + t3 + t4 + t5 + t6
+            total = t1 + t2 + t3 + t4 + t5 + t6 + t7
             logger.info("════════════════════════════════════════════════════════════")
             logger.info("🎯 Total Semantic Relationships Generated/Verified: %d", total)
             logger.info("════════════════════════════════════════════════════════════")
