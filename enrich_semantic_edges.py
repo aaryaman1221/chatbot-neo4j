@@ -22,6 +22,7 @@ Usage:
 import os
 import sys
 import re
+import json
 import argparse
 import logging
 from dotenv import load_dotenv
@@ -29,6 +30,55 @@ from neo4j import GraphDatabase
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("enrich_semantic_edges")
+
+
+def pass_0_backfill_declares_method(session, dry_run: bool) -> int:
+    """Pass 0 (backfill): Wire DECLARES_METHOD from existing :Type nodes to their :Function methods.
+
+    New ingestion creates these edges inline (G3). This pass catches all Type nodes
+    already in the graph from pre-fix ingestion runs, ensuring the structural
+    traversal in retriever Stage 0a works on existing data without re-ingestion.
+    """
+    logger.info("── Pass 0: Backfill DECLARES_METHOD (Type → Function) ──")
+    if dry_run:
+        logger.info("[DRY-RUN] Would wire DECLARES_METHOD edges from receiver-named Functions to Types.")
+        return 0
+
+    # Strategy A: scoped function names ("ReceiverType.MethodName" pattern)
+    scoped_query = """
+    MATCH (f:Function)
+    WHERE f.name CONTAINS '.'
+    WITH f, split(f.name, '.')[0] AS receiver_name
+    MATCH (t:Type {name: receiver_name, repo: f.repo})
+    WHERE NOT (t)-[:DECLARES_METHOD]->(f)
+    MERGE (t)-[:DECLARES_METHOD]->(f)
+    RETURN count(*) AS count
+    """
+    res_a = session.run(scoped_query).data()
+    count_a = res_a[0]["count"] if res_a else 0
+
+    # Strategy B: code-header receiver pattern ("func (x *ReceiverType)")
+    header_query = """
+    MATCH (f:Function)
+    WHERE f.code IS NOT NULL
+      AND f.code STARTS WITH 'func ('
+      AND NOT f.name CONTAINS '.'
+    WITH f, substring(f.code, 0, 200) AS header
+    WHERE header =~ '(?s)^func\\s*\\(\\s*\\w+\\s+\\*?([A-Za-z0-9_]+)\\s*\\).*'
+    WITH f, replace(replace(split(header, ')')[0], 'func (', ''), '*', '') AS recv_raw
+    WITH f, trim(split(recv_raw, ' ')[-1]) AS receiver_name
+    MATCH (t:Type {name: receiver_name, repo: f.repo})
+    WHERE NOT (t)-[:DECLARES_METHOD]->(f)
+    MERGE (t)-[:DECLARES_METHOD]->(f)
+    RETURN count(*) AS count
+    """
+    res_b = session.run(header_query).data()
+    count_b = res_b[0]["count"] if res_b else 0
+
+    total = count_a + count_b
+    logger.info("✅ Backfilled %d DECLARES_METHOD edges (%d scoped-name + %d code-header).",
+                total, count_a, count_b)
+    return total
 
 
 def pass_1_receiver_types(session, dry_run: bool) -> int:
@@ -86,12 +136,11 @@ def pass_1_receiver_types(session, dry_run: bool) -> int:
 
 
 def pass_2_struct_embedding(session, dry_run: bool) -> int:
-    """Pass 2: Discover anonymous struct embeddings and type composition (EMBEDS)."""
+    """Pass 2: Discover struct embeddings and type composition (EMBEDS) using explicit Type nodes."""
     logger.info("── Pass 2: Struct Composition & Inheritance (EMBEDS) ──")
     query = """
-    MATCH (f:Function)
-    WHERE f.code IS NOT NULL AND (toLower(f.code) CONTAINS 'struct {' OR toLower(f.code) CONTAINS 'interface {' OR f.code CONTAINS 'class ')
-    RETURN f.repo AS repo, f.filepath AS filepath, f.code AS code
+    MATCH (t:Type)
+    RETURN t.repo AS repo, t.filepath AS filepath, t.name AS name, t.code AS code, t.fields AS fields
     """
     rows = session.run(query).data()
     
@@ -102,6 +151,25 @@ def pass_2_struct_embedding(session, dry_run: bool) -> int:
         code = r.get("code") or ""
         repo = r.get("repo") or ""
         filepath = r.get("filepath") or ""
+        name = r.get("name") or ""
+        fields_json = r.get("fields") or []
+        
+        for f_str in fields_json:
+            try:
+                # G2: handle both native dicts (new ingestion) and legacy JSON strings
+                f_meta = json.loads(f_str) if isinstance(f_str, str) else f_str
+                if isinstance(f_meta, dict) and f_meta.get("is_embedded"):
+                    inner_name = f_meta.get("type", "").lstrip("*").split(".")[-1]
+                    if inner_name and inner_name != name:
+                        batch.append({
+                            "outer_type": name,
+                            "inner_name": inner_name,
+                            "repo": repo,
+                            "filepath": filepath,
+                        })
+            except Exception:
+                pass
+                
         for sm in struct_regex.finditer(code):
             outer_type = sm.group(1)
             body = sm.group(2)
@@ -120,6 +188,29 @@ def pass_2_struct_embedding(session, dry_run: bool) -> int:
                             "repo": repo,
                             "filepath": filepath,
                         })
+        for cm in py_class_regex.finditer(code):
+            outer_type = cm.group(1)
+            parents = cm.group(2)
+            for parent in parents.split(","):
+                inner_name = parent.strip().split(".")[-1]
+                if inner_name and inner_name not in ["object", "ABC", "BaseModel", "Exception"] and inner_name != outer_type:
+                    batch.append({
+                        "outer_type": outer_type,
+                        "inner_name": inner_name,
+                        "repo": repo,
+                        "filepath": filepath,
+                    })
+
+    func_query = """
+    MATCH (f:Function)
+    WHERE f.code IS NOT NULL AND (toLower(f.code) CONTAINS 'struct {' OR toLower(f.code) CONTAINS 'interface {' OR f.code CONTAINS 'class ')
+    RETURN f.repo AS repo, f.filepath AS filepath, f.code AS code
+    """
+    f_rows = session.run(func_query).data()
+    for r in f_rows:
+        code = r.get("code") or ""
+        repo = r.get("repo") or ""
+        filepath = r.get("filepath") or ""
         for cm in py_class_regex.finditer(code):
             outer_type = cm.group(1)
             parents = cm.group(2)
@@ -156,35 +247,165 @@ def pass_2_struct_embedding(session, dry_run: bool) -> int:
 
 
 def pass_3_duck_typing_implements(session, dry_run: bool) -> int:
-    """Pass 3: Match struct method sets against interface contracts across repos (IMPLEMENTS)."""
+    """Pass 3: Match struct method sets against interface contracts across repos (IMPLEMENTS).
+
+    G1 fix: IMPLEMENTS edges are only created when at least one Type has
+    kind='INTERFACE' and the interface's method set is a strict subset of the
+    struct's declared methods.  The previous ambiguous fallback (which created
+    edges in an arbitrary direction for cross-repo types with no kind info) is
+    removed to prevent reversed or spurious IMPLEMENTS edges.
+    """
     logger.info("── Pass 3: Duck-Typing & Interface Realization (IMPLEMENTS) ──")
-    query = """
+
+    # Pull all Type nodes — use method_names (scalar List<String>) as primary source,
+    # fall back to stored JSON methods strings, then to DECLARES_METHOD graph edges.
+    t_query = """
+    MATCH (t:Type)
+    OPTIONAL MATCH (t)-[:DECLARES_METHOD]->(f:Function)
+    WITH t, collect(DISTINCT f.name) AS edge_method_names
+    RETURN
+      elementId(t) AS eid,
+      t.name        AS name,
+      t.kind        AS kind,
+      t.repo        AS repo,
+      t.method_names AS scalar_method_names,
+      t.methods      AS stored_methods,
+      edge_method_names
+    """
+    t_rows = session.run(t_query).data()
+
+    type_methods_map: dict = {}
+    for r in t_rows:
+        m_set: set = set()
+
+        # 1. method_names: List<String> — direct scalar list (B1/B2 format, most reliable)
+        for name in (r.get("scalar_method_names") or []):
+            if name:
+                m_set.add(name)
+
+        # 2. DECLARES_METHOD graph edges (catches materialized interface methods from G8)
+        for name in (r.get("edge_method_names") or []):
+            if name:
+                # Strip "ReceiverType." prefix if present
+                m_set.add(name.split(".")[-1] if "." in name else name)
+
+        # 3. Stored JSON methods strings (G2: handle both dict and JSON string for legacy nodes)
+        if not m_set:
+            for m_raw in (r.get("stored_methods") or []):
+                try:
+                    m_obj = json.loads(m_raw) if isinstance(m_raw, str) else m_raw
+                    if isinstance(m_obj, dict) and m_obj.get("name"):
+                        m_set.add(m_obj["name"])
+                except Exception:
+                    pass
+
+        if m_set:
+            type_methods_map[r["eid"]] = {
+                "name":    r["name"],
+                "kind":    (r.get("kind") or "").upper(),
+                "repo":    r["repo"],
+                "methods": m_set,
+            }
+
+    # Noise method names that appear on almost every type — matching on these alone
+    # is meaningless and produces false-positive IMPLEMENTS edges.
+    _NOISE_METHODS = {
+        "init", "close", "open", "read", "write", "get", "set", "string",
+        "to_string", "to_dict", "copy", "clone", "len", "hash", "main",
+        "test", "setup", "teardown", "config", "load", "save", "create",
+        "send", "process", "handle",
+    }
+
+    implements_batch: list[dict] = []
+    eids = list(type_methods_map.keys())
+
+    for i in range(len(eids)):
+        for j in range(i + 1, len(eids)):
+            t1 = type_methods_map[eids[i]]
+            t2 = type_methods_map[eids[j]]
+
+            # Skip same type or same repo + same name (duplicate nodes)
+            if t1["name"] == t2["name"] and t1["repo"] == t2["repo"]:
+                continue
+
+            # Only consider cross-repo pairs OR mixed (struct, interface) same-repo pairs
+            same_repo = t1["repo"] == t2["repo"]
+            if same_repo and not (
+                (t1["kind"] == "INTERFACE") ^ (t2["kind"] == "INTERFACE")
+            ):
+                continue
+
+            # --- G1 FIX: require explicit kind='INTERFACE' to determine direction ---
+            # Case A: t2 is the interface, t1 is the implementor
+            if t2["kind"] == "INTERFACE" and t2["methods"] and t2["methods"].issubset(t1["methods"]):
+                shared = t2["methods"].intersection(t1["methods"])
+                non_noise = shared - _NOISE_METHODS
+                if len(non_noise) >= 1 or len(shared) >= 2:
+                    implements_batch.append({"t1_eid": eids[i], "t2_eid": eids[j]})
+
+            # Case B: t1 is the interface, t2 is the implementor → edge is t2 → t1
+            elif t1["kind"] == "INTERFACE" and t1["methods"] and t1["methods"].issubset(t2["methods"]):
+                shared = t1["methods"].intersection(t2["methods"])
+                non_noise = shared - _NOISE_METHODS
+                if len(non_noise) >= 1 or len(shared) >= 2:
+                    implements_batch.append({"t1_eid": eids[j], "t2_eid": eids[i]})
+            # (No fallback: if neither type has kind=INTERFACE, we skip to avoid wrong direction)
+
+    # Also capture pairs found via direct DECLARES_METHOD graph overlap (from pass_1)
+    graph_query = """
     MATCH (t1:Type)-[:DECLARES_METHOD]->(m1:Function)
     MATCH (t2:Type)-[:DECLARES_METHOD]->(m2:Function)
-    WHERE t1 <> t2 AND m1.name = m2.name AND t1.repo <> t2.repo
-    WITH t1, t2, count(DISTINCT m1.name) AS shared_methods, collect(DISTINCT m1.name) AS methods
-    WHERE shared_methods >= 2
-       OR (shared_methods = 1 AND NOT toLower(methods[0]) IN ['init', 'close', 'open', 'read', 'write', 'get', 'set', 'string', 'to_string', 'to_dict', 'copy', 'clone', 'len', 'hash', 'main', 'test', 'setup', 'teardown', 'config', 'load', 'save', 'create', 'send', 'process', 'handle'])
-    RETURN elementId(t1) AS t1_eid, t1.name AS t1_name, elementId(t2) AS t2_eid, t2.name AS t2_name, shared_methods
+    WHERE t1 <> t2
+      AND m1.name = m2.name
+      AND (
+          (t1.kind = 'INTERFACE' AND t2.kind IN ['STRUCT', 'TYPE'])
+       OR (t2.kind = 'INTERFACE' AND t1.kind IN ['STRUCT', 'TYPE'])
+      )
+    WITH t1, t2,
+         count(DISTINCT m1.name) AS shared_methods,
+         collect(DISTINCT m1.name) AS shared_list
+    WHERE shared_methods >= 1
+    RETURN elementId(t1) AS t1_eid,
+           elementId(t2) AS t2_eid,
+           t1.kind       AS t1_kind,
+           t2.kind       AS t2_kind,
+           shared_methods
     """
-    rows = session.run(query).data()
-    logger.info("Found %d cross-repo type pairs with matching method sets.", len(rows))
+    graph_rows = session.run(graph_query).data()
+    for r in graph_rows:
+        if r["t2_kind"] == "INTERFACE":
+            # t1 is struct, t2 is interface → t1 IMPLEMENTS t2
+            implements_batch.append({"t1_eid": r["t1_eid"], "t2_eid": r["t2_eid"]})
+        elif r["t1_kind"] == "INTERFACE":
+            # t2 is struct, t1 is interface → t2 IMPLEMENTS t1
+            implements_batch.append({"t1_eid": r["t2_eid"], "t2_eid": r["t1_eid"]})
+
+    # Deduplicate
+    seen: set = set()
+    dedup_batch: list[dict] = []
+    for item in implements_batch:
+        key = (item["t1_eid"], item["t2_eid"])
+        if key not in seen:
+            seen.add(key)
+            dedup_batch.append(item)
+
+    logger.info("Found %d directional (struct→interface) IMPLEMENTS pairs.", len(dedup_batch))
 
     if dry_run:
-        logger.info("[DRY-RUN] Would create %d IMPLEMENTS relationships.", len(rows))
-        return len(rows)
+        logger.info("[DRY-RUN] Would create %d IMPLEMENTS relationships.", len(dedup_batch))
+        return len(dedup_batch)
+
+    if not dedup_batch:
+        return 0
 
     update_query = """
-    MATCH (t1:Type)-[:DECLARES_METHOD]->(m1:Function)
-    MATCH (t2:Type)-[:DECLARES_METHOD]->(m2:Function)
-    WHERE t1 <> t2 AND m1.name = m2.name AND t1.repo <> t2.repo
-    WITH t1, t2, count(DISTINCT m1.name) AS shared_methods, collect(DISTINCT m1.name) AS methods
-    WHERE shared_methods >= 2
-       OR (shared_methods = 1 AND NOT toLower(methods[0]) IN ['init', 'close', 'open', 'read', 'write', 'get', 'set', 'string', 'to_string', 'to_dict', 'copy', 'clone', 'len', 'hash', 'main', 'test', 'setup', 'teardown', 'config', 'load', 'save', 'create', 'send', 'process', 'handle'])
+    UNWIND $batch AS item
+    MATCH (t1:Type), (t2:Type)
+    WHERE elementId(t1) = item.t1_eid AND elementId(t2) = item.t2_eid
     MERGE (t1)-[r:IMPLEMENTS]->(t2)
     RETURN count(r) AS count
     """
-    res = session.run(update_query).data()
+    res = session.run(update_query, batch=dedup_batch).data()
     created = res[0]["count"] if res else 0
     logger.info("✅ Created/verified %d IMPLEMENTS relationships.", created)
     return created
@@ -347,9 +568,9 @@ def main():
     else:
         load_dotenv()
 
-    uri = os.environ.get("NEO4J_URI", "neo4j://localhost:7687")
+    uri = os.environ.get("NEO4J_URI", "neo4j://localhost:7474")
     user = os.environ.get("NEO4J_USER", "neo4j")
-    password = os.environ.get("NEO4J_PASSWORD", "")
+    password = os.environ.get("NEO4J_PASSWORD", "password123")
 
     if not password and not os.environ.get("NEO4J_NO_AUTH"):
         logger.warning("NEO4J_PASSWORD environment variable not set. Using empty password or check your .env file.")
@@ -357,6 +578,9 @@ def main():
     logger.info("Connecting to Neo4j at %s...", uri)
     with GraphDatabase.driver(uri, auth=(user, password)) as driver:
         with driver.session() as session:
+            # Pass 0 must run first: backfills DECLARES_METHOD for existing data
+            # before passes 1–7 rely on those edges.
+            t0 = pass_0_backfill_declares_method(session, args.dry_run)
             t1 = pass_1_receiver_types(session, args.dry_run)
             t2 = pass_2_struct_embedding(session, args.dry_run)
             t3 = pass_3_duck_typing_implements(session, args.dry_run)
@@ -365,7 +589,7 @@ def main():
             t6 = pass_6_delegation_and_forwarding(session, args.dry_run)
             t7 = pass_7_mutates_state_of(session, args.dry_run)
 
-            total = t1 + t2 + t3 + t4 + t5 + t6 + t7
+            total = t0 + t1 + t2 + t3 + t4 + t5 + t6 + t7
             logger.info("════════════════════════════════════════════════════════════")
             logger.info("🎯 Total Semantic Relationships Generated/Verified: %d", total)
             logger.info("════════════════════════════════════════════════════════════")

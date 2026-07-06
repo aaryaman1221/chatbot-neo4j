@@ -12,19 +12,27 @@ MERGE (repo:Repository {full_name: $repo_full_name})
 MERGE (file:File {path: $filepath, repo: $repo_full_name})
 MERGE (func:Function {id: $func_id})
   ON CREATE SET
-    func.name            = $func_name,
-    func.filepath        = $filepath,
-    func.repo            = $repo_full_name,
-    func.code            = $func_code,
-    func.embedding       = $embedding,
-    func.qualified_calls = $qualified_calls
+    func.name               = $func_name,
+    func.filepath           = $filepath,
+    func.repo               = $repo_full_name,
+    func.code               = $func_code,
+    func.embedding          = $embedding,
+    func.qualified_calls    = $qualified_calls,
+    func.is_exported        = coalesce($is_exported, false),
+    func.is_pointer_receiver = coalesce($is_pointer_receiver, false),
+    func.channels_sent      = $channels_sent,
+    func.channels_received  = $channels_received
   ON MATCH SET
-    func.name            = $func_name,
-    func.filepath        = $filepath,
-    func.repo            = $repo_full_name,
-    func.code            = $func_code,
-    func.embedding       = coalesce($embedding, func.embedding),
-    func.qualified_calls = $qualified_calls
+    func.name               = $func_name,
+    func.filepath           = $filepath,
+    func.repo               = $repo_full_name,
+    func.code               = $func_code,
+    func.embedding          = coalesce($embedding, func.embedding),
+    func.qualified_calls    = $qualified_calls,
+    func.is_exported        = coalesce($is_exported, false),
+    func.is_pointer_receiver = coalesce($is_pointer_receiver, false),
+    func.channels_sent      = $channels_sent,
+    func.channels_received  = $channels_received
 MERGE (file)-[:DECLARES]->(func)
 MERGE (repo)-[:DECLARES]->(func)
 """
@@ -49,7 +57,80 @@ WHERE repo_wide.filepath <> $caller_filepath
   )
 WITH caller, coalesce(local, pkg_local, repo_wide) AS callee
 WHERE callee IS NOT NULL
-MERGE (caller)-[:CALLS]->(callee)
+MERGE (caller)-[r:CALLS]->(callee)
+  ON CREATE SET r.call_type = coalesce($call_type, 'SYNC')
+  ON MATCH  SET r.call_type = coalesce($call_type, r.call_type, 'SYNC')
+"""
+
+CYPHER_INGEST_TYPE = """
+MERGE (repo:Repository {full_name: $repo_full_name})
+MERGE (file:File {path: $filepath, repo: $repo_full_name})
+MERGE (type:Type {id: $type_id})
+  ON CREATE SET
+    type.name         = $type_name,
+    type.kind         = $kind,
+    type.filepath     = $filepath,
+    type.repo         = $repo_full_name,
+    type.code         = $code,
+    type.fields       = $fields,
+    type.field_names  = $field_names,
+    type.methods      = $methods,
+    type.method_names = $method_names,
+    type.tags         = $tags,
+    type.embedding    = $embedding,
+    type.is_exported  = coalesce($is_exported, false)
+  ON MATCH SET
+    type.name         = $type_name,
+    type.kind         = $kind,
+    type.filepath     = $filepath,
+    type.repo         = $repo_full_name,
+    type.code         = $code,
+    type.fields       = $fields,
+    type.field_names  = $field_names,
+    type.methods      = $methods,
+    type.method_names = $method_names,
+    type.tags         = $tags,
+    type.embedding    = coalesce($embedding, type.embedding),
+    type.is_exported  = coalesce($is_exported, false)
+MERGE (file)-[:DECLARES_TYPE]->(type)
+MERGE (repo)-[:DECLARES_TYPE]->(type)
+"""
+
+CYPHER_INGEST_TYPE_EMBEDDING = """
+MATCH (outer:Type {id: $outer_id})
+MATCH (inner:Type {repo: $repo_full_name})
+WHERE inner.name = $inner_name OR inner.id ENDS WITH ("::" + $inner_name)
+MERGE (outer)-[:EMBEDS]->(inner)
+"""
+
+CYPHER_INGEST_VARIABLE = """
+MERGE (repo:Repository {full_name: $repo_full_name})
+MERGE (file:File {path: $filepath, repo: $repo_full_name})
+MERGE (var:Variable {id: $var_id})
+  ON CREATE SET
+    var.name        = $var_name,
+    var.kind        = $kind,
+    var.filepath    = $filepath,
+    var.repo        = $repo_full_name,
+    var.code        = $code,
+    var.embedding   = $embedding,
+    var.is_exported = coalesce($is_exported, false)
+  ON MATCH SET
+    var.name        = $var_name,
+    var.kind        = $kind,
+    var.filepath    = $filepath,
+    var.repo        = $repo_full_name,
+    var.code        = $code,
+    var.embedding   = coalesce($embedding, var.embedding),
+    var.is_exported = coalesce($is_exported, false)
+MERGE (file)-[:DECLARES_VAR]->(var)
+MERGE (repo)-[:DECLARES_VAR]->(var)
+"""
+
+CYPHER_INGEST_DIRECTIVE = """
+MERGE (file:File {path: $filepath, repo: $repo_full_name})
+MERGE (dir:Directive {filepath: $filepath, repo: $repo_full_name, directive: $directive, args: $args})
+MERGE (file)-[:HAS_DIRECTIVE]->(dir)
 """
 
 CYPHER_MODIFIED_FUNCTION = """
@@ -279,4 +360,90 @@ CYPHER_MARK_FILE_SCANNED = "MATCH (file:File {path: $filepath, repo: $repo_full_
 # Without this, every call-edge write triggers a full Function label scan.
 CYPHER_INDEX_FUNC_NAME_REPO = """
 CREATE INDEX func_name_repo IF NOT EXISTS FOR (f:Function) ON (f.name, f.repo)
+"""
+
+CYPHER_TYPE_VECTOR_INDEX = """
+CREATE VECTOR INDEX type_embeddings IF NOT EXISTS
+FOR (t:Type) ON (t.embedding)
+OPTIONS {
+  indexConfig: {
+    `vector.dimensions`: 3072,
+    `vector.similarity_function`: 'cosine'
+  }
+}
+"""
+
+CYPHER_VAR_VECTOR_INDEX = """
+CREATE VECTOR INDEX var_embeddings IF NOT EXISTS
+FOR (v:Variable) ON (v.embedding)
+OPTIONS {
+  indexConfig: {
+    `vector.dimensions`: 3072,
+    `vector.similarity_function`: 'cosine'
+  }
+}
+"""
+
+CYPHER_CONSTRAINT_TYPE_ID = """
+CREATE CONSTRAINT type_id_unique IF NOT EXISTS
+FOR (t:Type) REQUIRE t.id IS UNIQUE
+"""
+
+CYPHER_CONSTRAINT_VAR_ID = """
+CREATE CONSTRAINT var_id_unique IF NOT EXISTS
+FOR (v:Variable) REQUIRE v.id IS UNIQUE
+"""
+
+CYPHER_INDEX_TYPE_NAME_REPO = """
+CREATE INDEX type_name_repo IF NOT EXISTS FOR (t:Type) ON (t.name, t.repo)
+"""
+
+# G4 — fast filtering on Type.kind ("STRUCT" / "INTERFACE" / "TYPE")
+CYPHER_INDEX_TYPE_KIND = """
+CREATE INDEX type_kind IF NOT EXISTS FOR (t:Type) ON (t.kind)
+"""
+
+# M2 — prevent duplicate Directive nodes when the same file is re-ingested
+CYPHER_CONSTRAINT_DIRECTIVE_UNIQUE = """
+CREATE CONSTRAINT directive_unique IF NOT EXISTS
+FOR (d:Directive) REQUIRE (d.filepath, d.repo, d.directive, d.args) IS UNIQUE
+"""
+
+# G8 — materialize an interface method signature as a real :Function node so
+# DECLARES_METHOD edges carry traversable code and the LLM can surface them.
+CYPHER_INGEST_IFACE_METHOD = """
+MERGE (repo:Repository {full_name: $repo_full_name})
+MERGE (file:File {path: $filepath, repo: $repo_full_name})
+MERGE (f:Function {id: $method_id})
+  ON CREATE SET
+    f.name               = $method_name,
+    f.filepath           = $filepath,
+    f.repo               = $repo_full_name,
+    f.code               = $signature,
+    f.is_exported        = $is_exported,
+    f.is_pointer_receiver = false,
+    f.channels_sent      = [],
+    f.channels_received  = [],
+    f.qualified_calls    = []
+  ON MATCH SET
+    f.name               = $method_name,
+    f.code               = coalesce($signature, f.code),
+    f.is_exported        = $is_exported
+MERGE (file)-[:DECLARES]->(f)
+MERGE (repo)-[:DECLARES]->(f)
+WITH f
+MATCH (t:Type {id: $type_id})
+MERGE (t)-[:DECLARES_METHOD]->(f)
+"""
+
+# G3 — link all methods in a just-ingested file to their receiver Type nodes
+# inline, without waiting for the enrichment script to run pass_1.
+CYPHER_LINK_DECLARES_METHOD = """
+MATCH (f:Function)
+WHERE f.filepath = $filepath
+  AND f.repo     = $repo_full_name
+  AND f.name     CONTAINS '.'
+WITH f, split(f.name, '.')[0] AS receiver_name
+MATCH (t:Type {name: receiver_name, repo: $repo_full_name})
+MERGE (t)-[:DECLARES_METHOD]->(f)
 """

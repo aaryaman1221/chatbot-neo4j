@@ -3,6 +3,7 @@
 # =============================================================================
 
 import base64
+import json
 import time
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -51,6 +52,20 @@ from .queries import (
     CYPHER_CLEANUP_UNSCOPED_DIRS,
     CYPHER_CLEANUP_UNSCOPED_FUNCS,
     CYPHER_MARK_FILE_SCANNED,
+    CYPHER_INGEST_TYPE,
+    CYPHER_INGEST_TYPE_EMBEDDING,
+    CYPHER_INGEST_VARIABLE,
+    CYPHER_INGEST_DIRECTIVE,
+    CYPHER_TYPE_VECTOR_INDEX,
+    CYPHER_VAR_VECTOR_INDEX,
+    CYPHER_CONSTRAINT_TYPE_ID,
+    CYPHER_CONSTRAINT_VAR_ID,
+    CYPHER_INDEX_TYPE_NAME_REPO,
+    # Phase 1 gap fixes
+    CYPHER_INDEX_TYPE_KIND,               # G4
+    CYPHER_CONSTRAINT_DIRECTIVE_UNIQUE,   # M2
+    CYPHER_INGEST_IFACE_METHOD,           # G8
+    CYPHER_LINK_DECLARES_METHOD,          # G3
 )
 from .parser import (
     _is_noise_file,
@@ -316,8 +331,10 @@ def phase2_scan_file_contents(
                         scanned += 1
                         continue
                     ast_data = parse_go_ast(path, source_code)
-                else:
+                elif path.endswith(".py"):
                     ast_data = parse_python_ast(path, source_code)
+                else:
+                    continue
 
                 # ── Batch-embed all functions in this file, chunked to _EMBED_FUNC_BATCH_SIZE ──
                 funcs = ast_data["functions"]
@@ -327,6 +344,24 @@ def phase2_scan_file_contents(
                         chunk = funcs[i : i + _EMBED_FUNC_BATCH_SIZE]
                         texts = [f"{f['name']}\n{f.get('code', '')}" for f in chunk]
                         func_embeddings.extend(get_embeddings_batch(texts, google_api_key))
+
+                # ── Batch-embed all types in this file ──
+                types = ast_data.get("types", [])
+                type_embeddings: list = []
+                if types:
+                    for i in range(0, len(types), _EMBED_FUNC_BATCH_SIZE):
+                        chunk = types[i : i + _EMBED_FUNC_BATCH_SIZE]
+                        texts = [f"{t['name']}\n{t.get('code', '')}" for t in chunk]
+                        type_embeddings.extend(get_embeddings_batch(texts, google_api_key))
+
+                # ── Batch-embed all variables in this file ──
+                variables = ast_data.get("variables", [])
+                var_embeddings: list = []
+                if variables:
+                    for i in range(0, len(variables), _EMBED_FUNC_BATCH_SIZE):
+                        chunk = variables[i : i + _EMBED_FUNC_BATCH_SIZE]
+                        texts = [f"{v['name']}\n{v.get('code', '')}" for v in chunk]
+                        var_embeddings.extend(get_embeddings_batch(texts, google_api_key))
 
                 with driver.session() as sess:
                     for func, embedding in zip(funcs, func_embeddings):
@@ -348,10 +383,15 @@ def phase2_scan_file_contents(
                             func_code=func.get("code", ""),
                             embedding=embedding or None,
                             qualified_calls=func_qual_calls,
+                            is_exported=func.get("is_exported", False),
+                            is_pointer_receiver=func.get("is_pointer_receiver", False),
+                            channels_sent=func.get("channels_sent", []),
+                            channels_received=func.get("channels_received", []),
                         )
                     for call_record in ast_data["calls"]:
                         caller = call_record[0]
                         callee_bare = call_record[1]
+                        call_type = call_record[3] if len(call_record) > 3 else "SYNC"
                         caller_id = f"{repo_full_name}::{path}::{caller}"
                         sess.run(
                             CYPHER_INGEST_CALLS,
@@ -359,7 +399,93 @@ def phase2_scan_file_contents(
                             callee_name=callee_bare,
                             caller_filepath=path,
                             repo_full_name=repo_full_name,
+                            call_type=call_type,
                         )
+                    for t, embedding in zip(types, type_embeddings):
+                        prefixed_id = f"{repo_full_name}::{t['id']}"
+
+                        # B2: store fields/methods as JSON-encoded strings — Neo4j cannot
+                        # store List<Map> as a node property; List<String> (JSON) is safe.
+                        # Parallel scalar lists (field_names, method_names) are stored as
+                        # List<String> for fast Cypher set-membership queries.
+                        raw_fields  = t.get("fields",  [])
+                        raw_methods = t.get("methods", [])
+                        fields_json   = [json.dumps(f) for f in raw_fields]
+                        methods_json  = [json.dumps(m) for m in raw_methods]
+                        field_names   = [f["name"] for f in raw_fields  if isinstance(f, dict) and f.get("name")]
+                        method_names  = [m["name"] for m in raw_methods if isinstance(m, dict) and m.get("name")]
+
+                        sess.run(
+                            CYPHER_INGEST_TYPE,
+                            repo_full_name=repo_full_name,
+                            filepath=path,
+                            type_id=prefixed_id,
+                            type_name=t["name"],
+                            kind=t["kind"],
+                            code=t.get("code", ""),
+                            fields=fields_json,
+                            field_names=field_names,
+                            methods=methods_json,
+                            method_names=method_names,
+                            tags=t.get("tags", []),
+                            embedding=embedding or None,
+                            is_exported=t.get("is_exported", False),
+                        )
+                        for embed_name in t.get("embedded_types", []):
+                            sess.run(
+                                CYPHER_INGEST_TYPE_EMBEDDING,
+                                outer_id=prefixed_id,
+                                repo_full_name=repo_full_name,
+                                inner_name=embed_name,
+                            )
+                        # G8: materialize interface method signatures as real :Function nodes
+                        if t.get("kind") == "INTERFACE":
+                            for method in raw_methods:
+                                m_name = method.get("name") or ""
+                                m_sig  = method.get("signature") or ""
+                                if not m_name:
+                                    continue
+                                # Scoped name: InterfaceName.MethodName (mirrors struct receiver pattern)
+                                scoped_method_name = f"{t['name']}.{m_name}"
+                                method_id = f"{repo_full_name}::{path}::{scoped_method_name}"
+                                sess.run(
+                                    CYPHER_INGEST_IFACE_METHOD,
+                                    repo_full_name=repo_full_name,
+                                    filepath=path,
+                                    type_id=prefixed_id,
+                                    method_id=method_id,
+                                    method_name=scoped_method_name,
+                                    signature=m_sig,
+                                    is_exported=m_name[0].isupper() if m_name else False,
+                                )
+                    for v, embedding in zip(variables, var_embeddings):
+                        prefixed_id = f"{repo_full_name}::{v['id']}"
+                        sess.run(
+                            CYPHER_INGEST_VARIABLE,
+                            repo_full_name=repo_full_name,
+                            filepath=path,
+                            var_id=prefixed_id,
+                            var_name=v["name"],
+                            kind=v["kind"],
+                            code=v.get("code", ""),
+                            embedding=embedding or None,
+                            is_exported=v.get("is_exported", False),
+                        )
+                    for d in ast_data.get("directives", []):
+                        sess.run(
+                            CYPHER_INGEST_DIRECTIVE,
+                            filepath=path,
+                            repo_full_name=repo_full_name,
+                            directive=d["directive"],
+                            args=d["args"],
+                        )
+                    # G3: wire DECLARES_METHOD edges from Type → Function inline,
+                    # so the graph is queryable immediately without running enrichment.
+                    sess.run(
+                        CYPHER_LINK_DECLARES_METHOD,
+                        filepath=path,
+                        repo_full_name=repo_full_name,
+                    )
                     sess.run(
                         CYPHER_MARK_FILE_SCANNED,
                         filepath=path,
@@ -530,9 +656,13 @@ def phase3_backfill_commits(
                             raw_data = _fetch_json(raw_url, github_token=github_token)
                             raw_code = base64.b64decode(raw_data["content"]).decode("utf-8")
                             if filepath.endswith(".go"):
+                                if filepath.endswith(_GO_TEST_SUFFIXES):
+                                    continue
                                 historical_ast = parse_go_ast(filepath, raw_code)
-                            else:
+                            elif filepath.endswith(".py"):
                                 historical_ast = parse_python_ast(filepath, raw_code)
+                            else:
+                                continue
                             mod_funcs = get_modified_functions(patch, filepath, historical_ast)
                             with driver.session() as sess:
                                 for func_id in mod_funcs:
@@ -626,13 +756,20 @@ def bootstrap(
 
     logger.info("Creating Neo4j indexes and constraints …")
     for cypher, label in [
-        (CYPHER_VECTOR_INDEX,         "vector index issue_embeddings"),
-        (CYPHER_CODE_VECTOR_INDEX,    "vector index code_embeddings"),
-        (CYPHER_MODULE_VECTOR_INDEX,  "vector index module_embeddings"),
-        (CYPHER_FULLTEXT_INDEX,       "fulltext index commit_summaries"),
-        (CYPHER_CONSTRAINT_FILE_REPO, "composite uniqueness: File(path, repo)"),
-        (CYPHER_CONSTRAINT_FUNC_ID,   "uniqueness: Function(id)"),
-        (CYPHER_INDEX_FUNC_NAME_REPO, "performance index: Function(name, repo)"),
+        (CYPHER_VECTOR_INDEX,              "vector index issue_embeddings"),
+        (CYPHER_CODE_VECTOR_INDEX,         "vector index code_embeddings"),
+        (CYPHER_MODULE_VECTOR_INDEX,       "vector index module_embeddings"),
+        (CYPHER_TYPE_VECTOR_INDEX,         "vector index type_embeddings"),
+        (CYPHER_VAR_VECTOR_INDEX,          "vector index var_embeddings"),
+        (CYPHER_FULLTEXT_INDEX,            "fulltext index commit_summaries"),
+        (CYPHER_CONSTRAINT_FILE_REPO,      "composite uniqueness: File(path, repo)"),
+        (CYPHER_CONSTRAINT_FUNC_ID,        "uniqueness: Function(id)"),
+        (CYPHER_CONSTRAINT_TYPE_ID,        "uniqueness: Type(id)"),
+        (CYPHER_CONSTRAINT_VAR_ID,         "uniqueness: Variable(id)"),
+        (CYPHER_CONSTRAINT_DIRECTIVE_UNIQUE, "uniqueness: Directive(filepath, repo, directive, args)"),  # M2
+        (CYPHER_INDEX_FUNC_NAME_REPO,      "performance index: Function(name, repo)"),
+        (CYPHER_INDEX_TYPE_NAME_REPO,      "performance index: Type(name, repo)"),
+        (CYPHER_INDEX_TYPE_KIND,           "performance index: Type(kind)"),               # G4
     ]:
         try:
             with driver.session() as session:

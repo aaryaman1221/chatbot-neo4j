@@ -154,7 +154,7 @@ def _extract_impact_subjects(query: str) -> List[str]:
         candidates.append(m.group(1).lower())
 
     for m in re.finditer(
-        r'\b(?:package|module|library|pkg|component|resource|struct|class|type|field|property|attribute)\s+([\w_\-\.]+)',
+        r'\b(?:package|module|library|pkg|component|resource|struct|class|type|interface|goroutine|channel|chan|var|variable|defer|directive|field|property|attribute)\s+([\w_\-\.]+)',
         query, re.IGNORECASE
     ):
         candidates.append(m.group(1).lower())
@@ -202,17 +202,17 @@ def _extract_field_hints(query: str) -> List[str]:
 
     for m in re.finditer(
         r'\b(?:remov(?:e|ing)|delet(?:e|ing)|dropp?(?:ing)?|renam(?:e|ing)|updat(?:e|ing))\s+'
-        r'(?:the\s+)?([A-Za-z_][\w_.]*)\s+(?:(?:interface|function|struct|config|method|field|property|attribute|param|parameter|arg|argument|return|setting)\s+)*(?:field|property|attribute|column|param|parameter|arg|argument|method|function|signature|key|config|setting)',
+        r'(?:the\s+)?([A-Za-z_][\w_.]*)\s+(?:(?:interface|function|struct|config|method|field|property|attribute|param|parameter|arg|argument|return|setting|tag|chan|channel|goroutine|var|variable|defer)\s+)*(?:field|property|attribute|column|param|parameter|arg|argument|method|function|signature|key|config|setting|tag|chan|channel|goroutine|var|variable|defer)',
         query, re.IGNORECASE
     ):
         field_hints.append(m.group(1).lower())
 
     for m in re.finditer(
-        r'\b([A-Z][a-z]+|[a-z][a-z0-9]+)\s+(?:(?:interface|function|struct|config|method|field|property|attribute|param|parameter|arg|argument|return|setting)\s+)*(?:[Ff]ield|[Mm]ethod|[Ff]unction|[Ss]ignature|[Kk]ey|[Pp]roperty|[Pp]arameter|[A]rgument|[S]etting)\b',
+        r'\b([A-Z][a-z]+|[a-z][a-z0-9]+)\s+(?:(?:interface|function|struct|config|method|field|property|attribute|param|parameter|arg|argument|return|setting|tag|chan|channel|goroutine|var|variable|defer)\s+)*(?:[Ff]ield|[Mm]ethod|[Ff]unction|[Ss]ignature|[Kk]ey|[Pp]roperty|[Pp]arameter|[A]rgument|[S]etting|[Tt]ag|[Cc]hannel|[Gg]oroutine|[Vv]ariable|[Dd]efer)\b',
         query
     ):
         word = m.group(1).lower()
-        if word not in {"the", "a", "this", "that", "some", "any", "interface", "function", "struct", "config", "method", "field", "property", "attribute", "param", "parameter", "arg", "argument", "return", "setting"}:
+        if word not in {"the", "a", "this", "that", "some", "any", "interface", "function", "struct", "config", "method", "field", "property", "attribute", "param", "parameter", "arg", "argument", "return", "setting", "tag", "chan", "channel", "goroutine", "var", "variable", "defer"}:
             field_hints.append(word)
 
     expanded_hints = []
@@ -245,10 +245,11 @@ def _extract_repo_hints_from_query(query: str) -> List[str]:
 # ── Structured Intent Schema & Extraction ────────────────────────────────────
 
 class QueryIntent(BaseModel):
-    wants_impact: bool = Field(default=False, description="True if the user is asking what depends on, imports, calls, or would break from changing something")
+    wants_impact: bool = Field(default=False, description="True if the user is asking what depends on, imports, calls, or would break from changing something. Do NOT set this for structural/duck-typing questions about which structs implement an interface.")
     wants_blame: bool = Field(default=False, description="True if the user is asking who wrote, changed, modified, or owns some code, or historical author responsibility")
     wants_commit_files: bool = Field(default=False, description="True if asking about commit history, file modification frequency, churn, most frequently changed files, what files/functions changed over time, or what files/functions a specific commit touched")
     wants_recency: bool = Field(default=False, description="True if asking for recent/latest/last N commits, commit history, or most frequently modified/changed files over time")
+    wants_structural: bool = Field(default=False, description="True if the user is asking about structural/type relationships: which structs implement an interface, duck typing, method set satisfaction, interface contracts, struct embedding, type hierarchies, or which methods a type declares. Example triggers: 'find structs that implement', 'which types satisfy', 'what methods does X implement', 'implicit interface implementation', 'duck typing', 'interface contract'.")
 
     subjects: List[str] = Field(default_factory=list, description="Literal package, module, or symbol names the user is asking about (e.g. 'spf13/cobra', 'QueryIntent'), exactly as they'd appear as identifiers — do not invent or expand names not implied by the query")
     field_hints: List[str] = Field(default_factory=list, description="Specific struct fields, properties, function signatures, methods, or config keys mentioned as being removed/changed")
@@ -268,9 +269,17 @@ def _cached_llm_intent(query: str, api_key: str) -> Optional[QueryIntent]:
         )
         structured_llm = llm.with_structured_output(QueryIntent)
         intent = structured_llm.invoke(
-            f"Classify this code-search query and extract literal entity names "
-            f"(package/module/symbol/repo/file names as written — do not normalize "
-            f"or guess canonical forms).\n\nQuery: {query}"
+            "Classify this code-search query and extract literal entity names "
+            "(package/module/symbol/struct/interface/channel/goroutine/defer/var/repo/file names as written — "
+            "do not normalize or guess canonical forms).\n\n"
+            "IMPORTANT classification rules:\n"
+            "- Set wants_structural=True (NOT wants_impact) when the query is about type/interface relationships: "
+            "'which structs implement X', 'find types that satisfy interface Y', 'implicit interface implementation', "
+            "'duck typing', 'method set', 'interface contract', 'what methods satisfy', etc.\n"
+            "- Set wants_impact=True ONLY when the user asks what BREAKS, DEPENDS ON, or IMPORTS something, "
+            "or asks about migration/refactoring blast radius.\n"
+            "- Both can be True simultaneously only if the query explicitly mixes both concerns.\n\n"
+            f"Query: {query}"
         )
         if isinstance(intent, QueryIntent):
             return intent
@@ -293,8 +302,8 @@ def extract_query_intent(query: str, google_api_key: Optional[str] = None) -> Qu
     
     if intent is not None:
         logger.info(
-            "[QUERY_PARSER] ✅ LLM intent extracted: impact=%s blame=%s commit=%s recency=%s subjects=%s",
-            intent.wants_impact, intent.wants_blame, intent.wants_commit_files, intent.wants_recency, intent.subjects,
+            "[QUERY_PARSER] ✅ LLM intent extracted: impact=%s blame=%s commit=%s recency=%s structural=%s subjects=%s",
+            intent.wants_impact, intent.wants_blame, intent.wants_commit_files, intent.wants_recency, intent.wants_structural, intent.subjects,
         )
         return intent
 

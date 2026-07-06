@@ -52,6 +52,9 @@ def _build_context_block(
             lines.append(f"{label:<8} : {name}")
             if filepath and filepath != "<unknown path>" and filepath != name:
                 lines.append(f"File     : {filepath}")
+        elif label in ["Type", "Variable", "Directive", "File"]:
+            lines.append(f"{label:<8} : {name}")
+            lines.append(f"File     : {filepath or '<unknown path>'}")
         else:
             lines.append(f"Function : {name}")
             lines.append(f"File     : {filepath or '<unknown path>'}")
@@ -112,7 +115,7 @@ def _fetch_subject_definition(
 
     defn_cypher = f"""
     MATCH (fn)
-    WHERE (fn:Function OR fn:File OR fn:Type OR fn:Module OR fn:Repository)
+    WHERE (fn:Function OR fn:File OR fn:Type OR fn:Variable OR fn:Directive OR fn:Module OR fn:Repository)
       AND (
           toLower(coalesce(fn.name, '')) CONTAINS toLower($subject)
        OR toLower(coalesce(fn.full_name, '')) CONTAINS toLower($subject)
@@ -199,7 +202,7 @@ def _run_impact_traversal(
         seed_cypher = """
         MATCH (seed)
         WHERE (
-            seed:Repository OR seed:Module OR seed:File OR seed:Function OR seed:Type
+            seed:Repository OR seed:Module OR seed:File OR seed:Function OR seed:Type OR seed:Variable OR seed:Directive
         )
         AND NOT toLower(coalesce(seed.path, seed.filepath, '')) =~ '.*\\.(md|txt|json|yaml|yml|html|css|rst|toml)$'
         AND (
@@ -257,7 +260,7 @@ def _run_impact_traversal(
                 if selected_repos else ""
             )
             consumer_cypher = f"""
-            MATCH (consumer)-[rel:DEPENDS_ON|CALLS|USES_REPO|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD|DECLARES]->(seed)
+            MATCH (consumer)-[rel:DEPENDS_ON|CALLS|USES_REPO|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD|DECLARES|DECLARES_TYPE|DECLARES_VAR|HAS_DIRECTIVE]->(seed)
             WHERE elementId(seed) = $seed_id
               AND (consumer:File OR consumer:Function OR consumer:Module OR consumer:Type OR consumer:Repository)
               {repo_filter}
@@ -419,6 +422,277 @@ def _run_impact_traversal(
     return results
 
 
+def _run_structural_traversal(
+    driver,
+    subjects: List[str],
+    target_repos: Optional[List[str]] = None,
+    source_repos: Optional[List[str]] = None,
+) -> list[dict]:
+    """Find structs/types that implement interfaces defined in `subjects`.
+
+    Strategy:
+    1. Locate Interface/Type nodes whose name or repo path contains any subject term.
+    2. Traverse IMPLEMENTS edges outward to find implementing structs.
+    3. Optionally filter implementors by target_repos.
+    4. For each implementor, fetch the DECLARES_METHOD edges to surface the
+       specific methods that satisfy the interface contract.
+    5. As a fallback, text-grep Function nodes whose code contains both a
+       subject interface name and a method receiver pattern.
+    """
+    results: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for subject in subjects:
+        subject_lower = subject.lower()
+
+        # ── Step 1: locate interface / type seed nodes ────────────────────────
+        iface_cypher = """
+        MATCH (iface)
+        WHERE (iface:Type OR iface:Function)
+          AND (
+              toLower(coalesce(iface.name, ''))      CONTAINS $subject
+           OR toLower(coalesce(iface.full_name, '')) CONTAINS $subject
+           OR toLower(coalesce(iface.path, ''))      CONTAINS $subject
+          )
+        OPTIONAL MATCH (iface)-[:DECLARES_METHOD]->(meth:Function)
+        WITH iface, collect(DISTINCT {name: meth.name, code: coalesce(meth.code, '')})[..20] AS iface_methods
+        RETURN
+          elementId(iface)                                           AS iface_id,
+          coalesce(iface.name, iface.full_name, iface.path)         AS iface_name,
+          coalesce(iface.kind, labels(iface)[0])                    AS iface_kind,
+          coalesce(iface.code, '')                                   AS iface_code,
+          coalesce(iface.filepath, iface.path, iface.full_name, '') AS iface_path,
+          coalesce(iface.repo, '')                                   AS iface_repo,
+          coalesce(iface.method_names, [])                          AS iface_method_names,
+          iface_methods
+        LIMIT 30
+        """
+        try:
+            with driver.session() as session:
+                iface_rows = session.run(iface_cypher, subject=subject_lower).data()
+        except Exception as exc:
+            logger.warning("[STRUCTURAL] Interface seed query for %r failed: %s", subject, exc)
+            iface_rows = []
+
+        logger.info(
+            "[STRUCTURAL] subject=%r → %d interface/type seed(s).", subject, len(iface_rows)
+        )
+
+        # Always emit the interface definition itself as context.
+        # C2: when code is absent, synthesise a contract block from method_names /
+        # materialised DECLARES_METHOD Function nodes so the LLM is never blind.
+        for iface in iface_rows:
+            uid = f"iface::{iface.get('iface_path')}::{iface.get('iface_name')}"
+            if uid not in seen_ids:
+                seen_ids.add(uid)
+
+                raw_code      = (iface.get("iface_code") or "").strip()
+                method_names  = iface.get("iface_method_names") or []
+                iface_methods = iface.get("iface_methods") or []
+
+                # Build a synthetic interface contract block if code is missing
+                if not raw_code:
+                    # Prefer full signatures from materialised Function nodes
+                    sigs = [
+                        m["code"].strip()
+                        for m in iface_methods
+                        if m.get("name") and m.get("code", "").strip()
+                    ]
+                    if not sigs and method_names:
+                        sigs = [f"    {mn}(...)" for mn in method_names]
+                    if sigs:
+                        iface_name = iface.get("iface_name") or subject
+                        raw_code = (
+                            f"type {iface_name} interface {{\n"
+                            + "\n".join(f"    {s}" if not s.startswith("    ") else s for s in sigs)
+                            + "\n}"
+                        )
+
+                # Build connected list from materialised DECLARES_METHOD methods
+                connected = [
+                    {"name": m.get("name"), "path": iface.get("iface_path"), "code": m.get("code")}
+                    for m in iface_methods
+                    if m.get("name") and m.get("code", "").strip()
+                ]
+
+                results.append({
+                    "name":      iface.get("iface_name") or "<unknown>",
+                    "filepath":  iface.get("iface_path") or "",
+                    "repo":      iface.get("iface_repo") or "",
+                    "rel_type":  "INTERFACE_DEFINITION",
+                    "code":      raw_code,
+                    "connected": connected,
+                })
+
+        # ── Step 2 & 3: find implementors via IMPLEMENTS edges ─────────────────
+        target_repo_filter = (
+            "AND (impl.repo IN $target_repos OR impl.full_name IN $target_repos OR impl.name IN $target_repos)"
+            if target_repos else ""
+        )
+        for iface in iface_rows:
+            iface_id = iface["iface_id"]
+            iface_name = iface.get("iface_name") or subject
+
+            impl_cypher = f"""
+            MATCH (impl)-[:IMPLEMENTS]->(iface)
+            WHERE elementId(iface) = $iface_id
+              AND (impl:Type OR impl:Function)
+              {target_repo_filter}
+            OPTIONAL MATCH (impl)-[:DECLARES_METHOD]->(meth:Function)
+            WITH impl,
+                 collect(DISTINCT {{
+                   name: meth.name,
+                   path: coalesce(meth.filepath, meth.path, ''),
+                   code: coalesce(meth.code, '')
+                 }})[..12] AS declared_methods
+            RETURN
+              coalesce(impl.name, impl.full_name)         AS name,
+              coalesce(impl.filepath, impl.path, '')      AS filepath,
+              coalesce(impl.repo, '')                     AS repo,
+              coalesce(impl.kind, labels(impl)[0])        AS kind,
+              coalesce(impl.code, '')                     AS code,
+              declared_methods
+            ORDER BY size(coalesce(impl.code, '')) DESC
+            LIMIT 20
+            """
+            try:
+                with driver.session() as session:
+                    impl_rows = session.run(
+                        impl_cypher,
+                        iface_id=iface_id,
+                        target_repos=target_repos or [],
+                    ).data()
+                logger.info(
+                    "[STRUCTURAL] iface=%r → %d implementor(s).", iface_name, len(impl_rows)
+                )
+            except Exception as exc:
+                logger.warning("[STRUCTURAL] Implementor query for iface %r failed: %s", iface_name, exc)
+                impl_rows = []
+
+            for row in impl_rows:
+                uid = f"impl::{row.get('filepath')}::{row.get('name')}"
+                if uid not in seen_ids:
+                    seen_ids.add(uid)
+                    connected = [
+                        {"name": m.get("name"), "path": m.get("path"), "code": m.get("code")}
+                        for m in (row.get("declared_methods") or [])
+                        if m.get("name")
+                    ]
+                    results.append({
+                        "name":      row.get("name") or "<unknown>",
+                        "filepath":  row.get("filepath") or "",
+                        "repo":      row.get("repo") or "",
+                        "rel_type":  f"IMPLEMENTS_{iface_name.upper()}",
+                        "code":      row.get("code") or "",
+                        "connected": connected,
+                    })
+
+        # ── Step 4: Text/code-grep fallback ───────────────────────────────────
+        # Search for Function nodes whose code mentions the subject (interface name)
+        # and that live in the target repos — catches cases where IMPLEMENTS edges
+        # were not explicitly ingested but the code clearly references the interface.
+        repo_grep_filter = (
+            "AND (fn.repo IN $target_repos OR fn.full_name IN $target_repos)"
+            if target_repos else ""
+        )
+        grep_cypher = f"""
+        MATCH (fn:Function)
+        WHERE fn.code IS NOT NULL
+          AND toLower(fn.code) CONTAINS toLower($subject)
+          {repo_grep_filter}
+        RETURN
+          fn.name                                AS name,
+          coalesce(fn.filepath, fn.path, '')     AS filepath,
+          coalesce(fn.repo, '')                  AS repo,
+          fn.code                                AS code
+        ORDER BY size(fn.code) DESC
+        LIMIT 15
+        """
+        try:
+            with driver.session() as session:
+                grep_rows = session.run(
+                    grep_cypher,
+                    subject=subject_lower,
+                    target_repos=target_repos or [],
+                ).data()
+            logger.info(
+                "[STRUCTURAL] code-grep for subject=%r → %d function(s).", subject, len(grep_rows)
+            )
+        except Exception as exc:
+            logger.warning("[STRUCTURAL] code-grep for %r failed: %s", subject, exc)
+            grep_rows = []
+
+        for row in grep_rows:
+            uid = f"grep::{row.get('filepath')}::{row.get('name')}"
+            if uid not in seen_ids:
+                seen_ids.add(uid)
+                results.append({
+                    "name":      row.get("name") or "<unknown>",
+                    "filepath":  row.get("filepath") or "",
+                    "repo":      row.get("repo") or "",
+                    "rel_type":  "CODE_REFERENCES_INTERFACE",
+                    "code":      _extract_relevant_lines(row.get("code") or "", subject),
+                    "connected": [],
+                })
+
+        # ── Step 5: Type node grep — look for structs in target repos that ─────
+        # declare methods whose names match the known cobra interface methods.
+        type_grep_cypher = f"""
+        MATCH (t:Type)
+        WHERE t.code IS NOT NULL
+          AND toLower(t.code) CONTAINS toLower($subject)
+          {repo_grep_filter.replace('fn.', 't.')}
+        OPTIONAL MATCH (t)-[:DECLARES_METHOD|EMBEDS]->(m:Function)
+        WITH t, collect(DISTINCT {{
+          name: m.name,
+          path: coalesce(m.filepath, m.path, ''),
+          code: coalesce(m.code, '')
+        }})[..8] AS methods
+        RETURN
+          coalesce(t.name, t.full_name)          AS name,
+          coalesce(t.filepath, t.repo, '')       AS filepath,
+          coalesce(t.repo, '')                   AS repo,
+          coalesce(t.kind, 'Type')               AS kind,
+          coalesce(t.code, '')                   AS code,
+          methods
+        ORDER BY size(coalesce(t.code, '')) DESC
+        LIMIT 10
+        """
+        try:
+            with driver.session() as session:
+                type_rows = session.run(
+                    type_grep_cypher,
+                    subject=subject_lower,
+                    target_repos=target_repos or [],
+                ).data()
+            logger.info(
+                "[STRUCTURAL] type-grep for subject=%r → %d type(s).", subject, len(type_rows)
+            )
+        except Exception as exc:
+            logger.warning("[STRUCTURAL] type-grep for %r failed: %s", subject, exc)
+            type_rows = []
+
+        for row in type_rows:
+            uid = f"type_grep::{row.get('filepath')}::{row.get('name')}"
+            if uid not in seen_ids:
+                seen_ids.add(uid)
+                connected = [
+                    {"name": m.get("name"), "path": m.get("path"), "code": m.get("code")}
+                    for m in (row.get("methods") or [])
+                    if m.get("name")
+                ]
+                results.append({
+                    "name":      row.get("name") or "<unknown>",
+                    "filepath":  row.get("filepath") or "",
+                    "repo":      row.get("repo") or "",
+                    "rel_type":  "TYPE_REFERENCES_INTERFACE",
+                    "code":      row.get("code") or "",
+                    "connected": connected,
+                })
+
+    return results
+
+
 def retrieve_code_context(
     user_query: str,
     driver,
@@ -426,7 +700,7 @@ def retrieve_code_context(
     selected_repos: Optional[List[str]] = None,
     top_k: int = 5,
 ) -> tuple[str, Optional[QueryIntent]]:
-    """Multi-stage retrieval pipeline: Stage 0 Impact → Stage 1 Vector → Stage 2 Path Boost → Stage 3 Commit → Stage 4 Blame."""
+    """Multi-stage retrieval pipeline: Stage 0a Structural → Stage 0 Impact → Stage 1 Vector → Stage 2 Path Boost → Stage 3 Commit → Stage 4 Blame."""
     logger.info("[RETRIEVE] ── New retrieval ────────────────────────────")
     logger.info("[RETRIEVE] Query        : %r", user_query[:200])
     logger.info("[RETRIEVE] Selected repos: %s", selected_repos or "<all>")
@@ -440,16 +714,67 @@ def retrieve_code_context(
     global_seen_ids: set[str] = set()
     vector_rows:   list[dict] = []
 
-    if intent and (intent.wants_impact or intent.wants_blame or intent.wants_commit_files or intent.wants_recency or intent.subjects):
+    if intent and (intent.wants_impact or intent.wants_blame or intent.wants_commit_files or intent.wants_recency or intent.wants_structural or intent.subjects):
         intent_summary_lines = [
             "[Source: user-query-intent | LLM Intent Classification]",
-            f"Primary Intent : Impact={intent.wants_impact} | Blame={intent.wants_blame} | Commit={intent.wants_commit_files} | Recency={intent.wants_recency}",
+            f"Primary Intent : Impact={intent.wants_impact} | Blame={intent.wants_blame} | Commit={intent.wants_commit_files} | Recency={intent.wants_recency} | Structural={intent.wants_structural}",
             f"Target Subjects: {intent.subjects or 'none explicitly detected'}",
             f"Modified Symbols/Keys: {intent.field_hints or 'none detected'}",
             f"Target Repos   : {intent.repo_hints or 'all / unscoped'}",
         ]
         context_parts.append("\n".join(intent_summary_lines))
         logger.info("[RETRIEVE] Prepended [Source: user-query-intent] metadata block.")
+
+    # ── Stage 0a: Structural / Interface-satisfaction traversal ──────────────
+    _is_structural_query = intent.wants_structural
+    if _is_structural_query:
+        structural_subjects = intent.subjects or _extract_impact_subjects(user_query)
+        structural_repo_hints = intent.repo_hints or _extract_repo_hints_from_query(user_query)
+        _effective_repos_s0a = selected_repos or []
+
+        # Separate source repos (where interfaces are defined) from target repos
+        # (where implementing structs live). If the query mentions two distinct
+        # repos like "spf13/cobra" and "gohugoio/hugo", we treat the first as
+        # source and the second as target. Otherwise apply all hints to both.
+        _source_repos: Optional[List[str]] = None
+        _target_repos: Optional[List[str]] = None
+        if structural_repo_hints and len(structural_repo_hints) >= 2:
+            _source_repos = [structural_repo_hints[0]]
+            _target_repos = structural_repo_hints[1:]
+        elif structural_repo_hints:
+            _target_repos = structural_repo_hints
+
+        _target_repos = _effective_repos_s0a or _target_repos
+
+        logger.info(
+            "[RETRIEVE] Stage 0a — structural traversal triggered. "
+            "subjects=%s  source_repos=%s  target_repos=%s",
+            structural_subjects, _source_repos, _target_repos,
+        )
+
+        if structural_subjects:
+            structural_rows = _run_structural_traversal(
+                driver,
+                structural_subjects,
+                target_repos=_target_repos or None,
+                source_repos=_source_repos or None,
+            )
+            logger.info(
+                "[RETRIEVE] Stage 0a returned %d structural record(s).", len(structural_rows)
+            )
+            if structural_rows:
+                struct_block = _build_context_block(
+                    structural_rows, "structural-interface", allow_no_code=True, global_seen=global_seen_ids
+                )
+                if struct_block:
+                    context_parts.append(struct_block)
+                    retrieval_path_tags.append("structural")
+        else:
+            logger.warning(
+                "[RETRIEVE] ⚠️  Stage 0a: structural query detected but no subjects extracted."
+            )
+    else:
+        logger.info("[RETRIEVE] Stage 0a skipped — not a structural/interface query.")
 
     # ── Stage 0: Dependency-impact traversal ─────────────────────────────────
     _query_lower_s0 = user_query.lower()
@@ -637,6 +962,50 @@ def retrieve_code_context(
         LIMIT $mod_top_k
         """
 
+        # 1c: type search
+        type_vector_cypher = f"""
+        CALL db.index.vector.queryNodes('type_embeddings', $mod_top_k, $query_vector)
+        YIELD node, score
+        WITH node, score
+        WHERE node.code IS NOT NULL {
+            "AND (node.repo IN $selected_repos OR node.name IN $selected_repos)" if selected_repos else ""
+        }
+        OPTIONAL MATCH (node)-[:EMBEDS|IMPLEMENTS|DECLARES_METHOD]->(connected)
+        WHERE (connected:Function OR connected:Type OR connected:Module)
+        WITH node, score,
+             collect(DISTINCT {{
+               name: connected.name,
+               path: coalesce(connected.filepath, ''),
+               code: coalesce(connected.code, '')
+             }})[..4] AS connected_nodes
+        RETURN
+          node.name                              AS name,
+          coalesce(node.filepath, node.repo, '') AS filepath,
+          '(type: ' + node.name + ' [' + coalesce(node.kind, '') + '])\\n' + coalesce(node.code, '') AS code,
+          connected_nodes                        AS connected,
+          score
+        ORDER BY score DESC
+        LIMIT $mod_top_k
+        """
+
+        # 1d: var search
+        var_vector_cypher = f"""
+        CALL db.index.vector.queryNodes('var_embeddings', $mod_top_k, $query_vector)
+        YIELD node, score
+        WITH node, score
+        WHERE node.code IS NOT NULL {
+            "AND (node.repo IN $selected_repos OR node.name IN $selected_repos)" if selected_repos else ""
+        }
+        RETURN
+          node.name                              AS name,
+          coalesce(node.filepath, node.repo, '') AS filepath,
+          '(var: ' + node.name + ' [' + coalesce(node.kind, '') + '])\\n' + coalesce(node.code, '') AS code,
+          []                                     AS connected,
+          score
+        ORDER BY score DESC
+        LIMIT $mod_top_k
+        """
+
         logger.info(
             "[RETRIEVE] Stage 1 — vector search (top_k=%d, repo_filter=%s) …",
             top_k, bool(selected_repos),
@@ -660,17 +1029,48 @@ def retrieve_code_context(
                     selected_repos=selected_repos or [],
                 ).data()
 
+                # 1c: type search
+                try:
+                    type_rows = session.run(
+                        type_vector_cypher,
+                        query_vector=query_vector,
+                        mod_top_k=mod_top_k,
+                        selected_repos=selected_repos or [],
+                    ).data()
+                except Exception:
+                    type_rows = []
+
+                # 1d: var search
+                try:
+                    var_rows = session.run(
+                        var_vector_cypher,
+                        query_vector=query_vector,
+                        mod_top_k=mod_top_k,
+                        selected_repos=selected_repos or [],
+                    ).data()
+                except Exception:
+                    var_rows = []
+
             logger.info(
-                "[RETRIEVE] Stage 1 returned %d function record(s) + %d module record(s).",
-                len(rows), len(mod_rows),
+                "[RETRIEVE] Stage 1 returned %d func + %d mod + %d type + %d var record(s).",
+                len(rows), len(mod_rows), len(type_rows), len(var_rows),
             )
             if rows:
                 vector_rows = rows
                 context_parts.append(_build_context_block(rows, "vector-search", global_seen=global_seen_ids))
                 retrieval_path_tags.append("vector")
             if mod_rows:
+                vector_rows.extend(mod_rows)
                 context_parts.append(_build_context_block(mod_rows, "module-vector", global_seen=global_seen_ids))
                 retrieval_path_tags.append("module-vector")
+            if type_rows:
+                vector_rows.extend(type_rows)
+                context_parts.append(_build_context_block(type_rows, "type-vector", global_seen=global_seen_ids))
+                retrieval_path_tags.append("type-vector")
+            if var_rows:
+                vector_rows.extend(var_rows)
+                context_parts.append(_build_context_block(var_rows, "var-vector", global_seen=global_seen_ids))
+                retrieval_path_tags.append("var-vector")
         except Exception as exc:
             logger.error("[RETRIEVE] ❌ Stage 1 vector search FAILED: %s", exc)
 
@@ -691,8 +1091,9 @@ def retrieve_code_context(
                 if selected_repos else ""
             )
             hint_cypher = f"""
-            MATCH (fn:Function)
-            WHERE toLower(fn.filepath) CONTAINS toLower($hint)
+            MATCH (fn)
+            WHERE (fn:Function OR fn:Type OR fn:Variable)
+              AND toLower(fn.filepath) CONTAINS toLower($hint)
               AND fn.code IS NOT NULL
               {repo_filter_clause}
             RETURN

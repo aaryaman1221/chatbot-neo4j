@@ -9,13 +9,19 @@ from .config import logger
 from .retriever import retrieve_code_context
 _CORE_PROMPT = """You are a senior software engineering assistant with deep knowledge of codebases, git history, issues, and repository structure. You have access to a knowledge graph that stores code functions, commits, files, issues, and repository metadata.
 
+For Go and polyglot codebases, the graph explicitly tracks:
+- Structural & Duck Typing: Interfaces implemented by structs via [IMPLEMENTS] relationships and method set matching.
+- Struct Composition: Anonymous struct embedding and type inheritance via [EMBEDS] relationships.
+- Concurrency & Channels: Goroutine invocations ([CALLS] with call_type='GOROUTINE'), deferred calls ([CALLS] with call_type='DEFER'), and channel communication (channels_sent and channels_received metadata).
+- Data & Directives: Package variables, struct field tags (e.g. json/yaml/db serialization contracts), and compiler directives (e.g. //go:generate, //go:build).
+
 The context below is structured as labelled sections. Each section starts with a [Source: ...] tag.
 
-Sections from "vector-search" or "path-hint-boost" contain function/code blocks:
-  Function : <name>
-  File     : <filepath>
-  Code     : <source code>
-  ↳ Called/Dep: <name> [<file>]   (optional — connected functions)
+Sections from "vector-search", "type-vector", "var-vector", or "path-hint-boost" contain structural or code blocks:
+  Function / Type / Var / Directive : <name>
+  File                              : <filepath>
+  Code                              : <source code or structural signature>
+  ↳ Called/Dep/Embeds               : <name> [<file>]   (optional — connected graph elements)
 
 Sections from "fulltext-fallback" contain commit or issue records:
   Function : <sha or id>
@@ -154,6 +160,45 @@ Instructions for Impact / Migration / Dependency questions:
 - When generating the final "### Evidence" section, Evidence must only list sources actually referenced in the body text above — do not list retrieved-but-unused records."""
 
 
+_STRUCTURAL_MODULE = """### SPECIALIZED PROTOCOL: Structural Type & Interface-Satisfaction Analysis
+The context includes sections from "structural-interface" containing graph-traversal results about interface definitions, implementing structs, and the methods that satisfy the interface contract:
+  Function / Type : <name of the interface or implementing struct>
+  File            : <filepath>
+  Repo            : <repository>
+  Relation        : one of:
+    - INTERFACE_DEFINITION          → this IS the interface (from spf13/cobra or the subject repo)
+    - IMPLEMENTS_<INTERFACE_NAME>   → this struct/type explicitly implements the named interface
+    - CODE_REFERENCES_INTERFACE     → this function's code references the interface name (duck-typing evidence)
+    - TYPE_REFERENCES_INTERFACE     → this Type node's code references the interface name
+  Code            : <struct/interface definition or function body>
+  ↳ Called/Dep    : <declared methods on the implementing struct> (connected graph elements)
+
+Instructions for Structural / Duck-Typing / Interface-Contract questions:
+- Use the heading "### Interface-Satisfaction Analysis".
+- **Section 1 — Interface Definitions (from subject repo)**
+  For every record with Relation=INTERFACE_DEFINITION:
+  - State the interface name, file, and repo.
+  - List each method in the interface with its full signature.
+  - Note whether it is exported (capital letter in Go).
+- **Section 2 — Implementing Structs (in target repo)**
+  For every record with Relation=IMPLEMENTS_* or CODE_REFERENCES_INTERFACE or TYPE_REFERENCES_INTERFACE:
+  - State the struct name, file, and repo.
+  - For each interface method, identify the **specific method on the struct** (from the ↳ Connected/Dep entries) that satisfies it.
+  - Format as a mapping table:
+    | Interface Method | Satisfying Method on Struct | File |
+    |---|---|---|
+  - If no ↳ Connected methods appear, quote the relevant lines from Code that act as the method body.
+- **Section 3 — Method Contract Verification**
+  For each (struct, interface) pair:
+  - Confirm whether the method signature (receiver type, parameter types, return types) matches the interface contract.
+  - In Go: note whether the receiver is a value type or pointer receiver, since this affects whether the type or *type implements the interface.
+  - If signatures differ or evidence is missing, explicitly state what cannot be verified.
+- **Section 4 — Summary Table**
+  Produce a final summary table:
+    | Struct | Repo | Interface | Methods Satisfied | Notes |
+    |---|---|---|---|---|
+- When generating the final "### Evidence" section, Evidence must only list sources actually referenced in the body text above."""
+
 def answer_question_hybrid(
     user_input: str,
     llm,
@@ -184,6 +229,12 @@ def answer_question_hybrid(
         or "SUBJECT_DEFINITION" in graph_context
         or "REFERENCES_" in graph_context
     )
+    needs_structural = (
+        intent.wants_structural
+        or "[Source: structural-interface]" in graph_context
+        or "INTERFACE_DEFINITION" in graph_context
+        or "IMPLEMENTS_" in graph_context
+    )
 
     if needs_blame:
         prompt_modules.append(_BLAME_MODULE.strip())
@@ -191,6 +242,8 @@ def answer_question_hybrid(
         prompt_modules.append(_COMMIT_FILES_MODULE.strip())
     if needs_impact:
         prompt_modules.append(_IMPACT_MODULE.strip())
+    if needs_structural:
+        prompt_modules.append(_STRUCTURAL_MODULE.strip())
 
     prompt_modules.append(f"CONTEXT:\n{graph_context}")
 

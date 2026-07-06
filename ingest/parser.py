@@ -43,7 +43,7 @@ def _is_noise_file(filename: str) -> bool:
 
 def parse_python_ast(filepath: str, source_code: str) -> dict:
     if not filepath.endswith(".py") or not source_code:
-        return {"functions": [], "calls": []}
+        return {"functions": [], "calls": [], "types": [], "variables": [], "directives": []}
 
     functions = []
     calls = []
@@ -95,28 +95,45 @@ def parse_python_ast(filepath: str, source_code: str) -> dict:
     except Exception:
         pass
 
-    return {"functions": functions, "calls": calls}
+    return {"functions": functions, "calls": calls, "types": [], "variables": [], "directives": []}
 
 
 def parse_go_ast(filepath: str, source_code: str) -> dict:
     if not TREE_SITTER_AVAILABLE or not filepath.endswith(".go") or not source_code:
-        return {"functions": [], "calls": []}
+        return {"functions": [], "calls": [], "types": [], "variables": [], "directives": []}
 
     try:
-        raw_bytes = bytes(source_code, "utf8")
+        raw_bytes = source_code if isinstance(source_code, bytes) else bytes(source_code, "utf8")
         tree = go_parser.parse(raw_bytes)
     except Exception as exc:
         logger.debug("Failed to parse Go AST for %s: %s", filepath, exc)
-        return {"functions": [], "calls": []}
+        return {"functions": [], "calls": [], "types": [], "variables": [], "directives": []}
 
     functions = []
     calls = []
+    types = []
+    variables = []
+    directives = []
+    func_channel_map = {}
 
     def get_text(node):
         return raw_bytes[node.start_byte:node.end_byte].decode("utf8", errors="replace")
 
-    def walk(node, current_func=None):
+    for line in source_code.splitlines():
+        line_str = line.strip()
+        if line_str.startswith("//go:embed ") or line_str.startswith("//go:build ") or line_str.startswith("//go:generate "):
+            parts = line_str.split(None, 1)
+            if len(parts) == 2:
+                directives.append({"directive": parts[0][2:], "args": parts[1].strip()})
+
+    def walk(node, current_func=None, call_context="SYNC"):
         new_func = current_func
+        new_context = call_context
+
+        if node.type == 'go_statement':
+            new_context = "GOROUTINE"
+        elif node.type == 'defer_statement':
+            new_context = "DEFER"
 
         # 1. Identify Function and Method Declarations
         if node.type in ['function_declaration', 'method_declaration']:
@@ -124,6 +141,7 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
             if name_node:
                 name = get_text(name_node)
                 receiver_name = ""
+                recv_node = None
                 if node.type == 'method_declaration':
                     recv_node = node.child_by_field_name('receiver')
                     if recv_node:
@@ -133,39 +151,178 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
                             receiver_name = m.group(1)
                 
                 scoped_name = f"{receiver_name}.{name}" if receiver_name else name
-                new_func = scoped_name  # Track current function scope for call-edge detection
+                new_func = scoped_name
+                func_channel_map[scoped_name] = {"sent": set(), "recv": set()}
                 functions.append({
                     "name":  scoped_name,
                     "id":    f"{filepath}::{scoped_name}",
                     "start": node.start_point[0] + 1,
                     "end":   node.end_point[0] + 1,
                     "code":  get_text(node),
+                    "is_exported": name[0].isupper() if name else False,
+                    "is_pointer_receiver": "*" in get_text(recv_node) if recv_node else False,
                 })
 
-        # 2. Identify Function Calls within a function
-        elif node.type == 'call_expression' and current_func:
-            func_node = node.children[0]
-            if func_node.type == 'identifier':  # e.g., foo()
-                callee_name = get_text(func_node)
-                calls.append((current_func, callee_name, None))
-            elif func_node.type == 'selector_expression':  # e.g., pkg.foo() or obj.foo()
-                parts = []
-                for child in func_node.children:
-                    if child.type == 'field_identifier':
-                        parts.append(get_text(child))
-                    elif child.type == 'identifier':
-                        parts.insert(0, get_text(child))
-                if parts:
-                    callee_name = parts[-1]  # bare name for intra-repo matching
-                    callee_qualified = ".".join(parts)  # e.g., "lipgloss.NewStyle"
-                    calls.append((current_func, callee_name, callee_qualified))
+        # 2. Identify Types (Structs, Interfaces, Type Aliases)
+        elif node.type == 'type_spec':
+            name_node = node.child_by_field_name('name')
+            type_node = node.child_by_field_name('type')
+            if name_node and type_node:
+                type_name = get_text(name_node)
+                kind = "TYPE"
+                fields = []
+                methods = []
+                embedded_types = []
+                tags = []
+
+                if type_node.type == 'struct_type':
+                    kind = "STRUCT"
+                    for child in type_node.children:
+                        if child.type == 'field_declaration_list':
+                            for field in child.children:
+                                if field.type == 'field_declaration':
+                                    f_names = [get_text(c) for c in field.children if c.type == 'field_identifier']
+                                    f_type_node = next((c for c in field.children if c.type not in ['field_identifier', 'raw_string_literal', 'comment']), None)
+                                    f_type = get_text(f_type_node) if f_type_node else ""
+                                    tag_node = next((c for c in field.children if c.type == 'raw_string_literal'), None)
+                                    f_tag = get_text(tag_node) if tag_node else ""
+                                    if f_tag and f_tag not in tags:
+                                        tags.append(f_tag)
+
+                                    if f_names:
+                                        for fn in f_names:
+                                            fields.append({"name": fn, "type": f_type, "tag": f_tag, "is_embedded": False})
+                                    else:
+                                        embed_name = f_type.lstrip("*").split(".")[-1]
+                                        if embed_name:
+                                            embedded_types.append(embed_name)
+                                            fields.append({"name": embed_name, "type": f_type, "tag": f_tag, "is_embedded": True})
+
+                elif type_node.type == 'interface_type':
+                    kind = "INTERFACE"
+
+                    # A1: recursive walk — handles grammars that insert an intermediate
+                    # `interface_body` node (or similar) between `interface_type` and
+                    # the actual `method_elem` / `method_spec` leaves.
+                    _IFACE_SKIP_TYPES = frozenset({'{', '}', ';', 'interface', 'comment'})
+
+                    def _collect_iface_members(n):
+                        for c in n.children:
+                            if c.type in ('method_spec', 'method_elem'):
+                                m_name_node = c.child_by_field_name('name')
+                                if not m_name_node:
+                                    m_name_node = next(
+                                        (gc for gc in c.children
+                                         if gc.type in ('field_identifier', 'identifier')),
+                                        None,
+                                    )
+                                if m_name_node:
+                                    methods.append({
+                                        "name":      get_text(m_name_node),
+                                        "signature": get_text(c),
+                                    })
+                            elif c.type in ('type_identifier', 'selector_expression', 'qualified_type'):
+                                embed_name = get_text(c).split('.')[-1]
+                                if embed_name and embed_name not in embedded_types:
+                                    embedded_types.append(embed_name)
+                            elif c.type not in _IFACE_SKIP_TYPES:
+                                # Recurse into unknown intermediate container nodes
+                                _collect_iface_members(c)
+
+                    _collect_iface_members(type_node)
+
+                    # A3: regex fallback — if tree-sitter found no methods at all
+                    # (grammar mismatch or empty interface), parse the raw source text.
+                    if not methods:
+                        raw_iface = get_text(type_node)
+                        # Match exported method names: CapitalLetter followed by identifier + '('
+                        for m in re.finditer(r'\b([A-Z][A-Za-z0-9_]*)\s*\(', raw_iface):
+                            m_name = m.group(1)
+                            # Skip type-like names that appear in composite literals
+                            if m_name in ('True', 'False', 'Nil'):
+                                continue
+                            line_start = raw_iface.rfind('\n', 0, m.start()) + 1
+                            line_end   = raw_iface.find('\n', m.start())
+                            sig = raw_iface[line_start: line_end if line_end != -1 else len(raw_iface)].strip()
+                            methods.append({"name": m_name, "signature": sig})
+
+                # A2: prepend the `type` keyword so stored code is always valid Go syntax.
+                # get_text(node) on a type_spec returns "TypeName struct/interface {...}"
+                # without the leading `type` keyword — add it back for readability.
+                type_code = "type " + get_text(node)
+
+                types.append({
+                    "name": type_name,
+                    "id": f"{filepath}::{type_name}",
+                    "kind": kind,
+                    "start": node.start_point[0] + 1,
+                    "end":   node.end_point[0] + 1,
+                    "code":  type_code,
+                    "fields": fields,
+                    "methods": methods,
+                    "embedded_types": embedded_types,
+                    "tags": tags,
+                    "is_exported": type_name[0].isupper() if type_name else False,
+                })
+
+        # 3. Identify Package-Level Variables and Constants
+        elif node.type in ['var_declaration', 'const_declaration'] and current_func is None:
+            kind = "VAR" if node.type == 'var_declaration' else "CONST"
+            for child in node.children:
+                if child.type in ['var_spec', 'const_spec', 'value_spec']:
+                    for id_node in child.children:
+                        if id_node.type == 'identifier':
+                            v_name = get_text(id_node)
+                            variables.append({
+                                "name": v_name,
+                                "id": f"{filepath}::{v_name}",
+                                "kind": kind,
+                                "start": child.start_point[0] + 1,
+                                "end": child.end_point[0] + 1,
+                                "code": get_text(child),
+                                "is_exported": v_name[0].isupper() if v_name else False,
+                            })
+
+        # 4. Identify Function Calls and Channel Operations within a function
+        elif current_func:
+            if node.type == 'call_expression':
+                func_node = node.children[0]
+                if func_node.type == 'identifier':
+                    callee_name = get_text(func_node)
+                    calls.append((current_func, callee_name, None, new_context))
+                elif func_node.type == 'selector_expression':
+                    parts = []
+                    for child in func_node.children:
+                        if child.type == 'field_identifier':
+                            parts.append(get_text(child))
+                        elif child.type == 'identifier':
+                            parts.insert(0, get_text(child))
+                    if parts:
+                        callee_name = parts[-1]
+                        callee_qualified = ".".join(parts)
+                        calls.append((current_func, callee_name, callee_qualified, new_context))
+            elif node.type == 'send_statement' and node.children:
+                chan_name = get_text(node.children[0]).split("[")[0].strip()
+                if chan_name and current_func in func_channel_map:
+                    func_channel_map[current_func]["sent"].add(chan_name)
+            elif node.type == 'receive_expression' or (node.type == 'unary_expression' and get_text(node).startswith('<-')):
+                chan_expr = get_text(node).lstrip("<-").strip().split("[")[0].strip()
+                if chan_expr and current_func in func_channel_map:
+                    func_channel_map[current_func]["recv"].add(chan_expr)
 
         # Recurse through children
         for child in node.children:
-            walk(child, new_func)
+            walk(child, new_func, new_context)
 
     walk(tree.root_node)
-    return {"functions": functions, "calls": calls}
+
+    for f in functions:
+        fname = f["name"]
+        if fname in func_channel_map:
+            f["channels_sent"] = sorted(list(func_channel_map[fname]["sent"]))
+            f["channels_received"] = sorted(list(func_channel_map[fname]["recv"]))
+
+    return {"functions": functions, "calls": calls, "types": types, "variables": variables, "directives": directives}
 
 
 def _append_dependency(dependencies: list, filepath: str, target_module: str):
