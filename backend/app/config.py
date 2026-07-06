@@ -4,12 +4,33 @@
 
 import logging
 import os
+from pathlib import Path
 from functools import lru_cache
 from typing import Optional, List
+
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+    else:
+        load_dotenv()
+except ImportError:
+    pass
 
 from fastapi import HTTPException
 from pydantic import BaseModel
 from neo4j import GraphDatabase
+
+def get_google_api_key() -> str:
+    """Return Google/Gemini API key checking multiple standard environment variable names."""
+    return (
+        os.getenv("GOOGLE_API_KEY")
+        or os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_GENAI_API_KEY")
+        or os.getenv("GENAI_API_KEY")
+        or ""
+    )
 
 # ── Google GenAI SDK Availability ────────────────────────────────────────────
 try:

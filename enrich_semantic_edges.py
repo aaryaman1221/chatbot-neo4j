@@ -247,7 +247,7 @@ def pass_5_lifecycle_hooks_and_registry(session, dry_run: bool) -> int:
        OR toLower(f.name) STARTS WITH 'post_' OR toLower(f.name) IN ['init', 'setup', 'teardown', 'startup', 'shutdown', 'middleware']
     OPTIONAL MATCH (t:Type)-[:DECLARES_METHOD]->(f)
     WITH f, coalesce(t, f) AS host
-    WHERE host <> f OR f.entry_point = false
+    WHERE host <> f OR coalesce(f.entry_point, false) = false
     MERGE (host)-[r:LIFECYCLE_HOOK {trigger: case when toLower(f.name) CONTAINS 'pre' or toLower(f.name) CONTAINS 'before' or toLower(f.name) CONTAINS 'init' or toLower(f.name) CONTAINS 'setup' then 'pre_exec' else 'post_exec' end}]->(f)
     RETURN count(r) AS count
     """
@@ -336,18 +336,23 @@ def pass_7_mutates_state_of(session, dry_run: bool) -> int:
 
 
 def main():
+    from pathlib import Path
     parser = argparse.ArgumentParser(description="Generate 10 generalized semantic relationship layers in Neo4j.")
     parser.add_argument("--dry-run", action="store_true", help="Print actions without modifying database.")
     args = parser.parse_args()
 
-    load_dotenv()
+    _env_path = Path(__file__).resolve().parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+    else:
+        load_dotenv()
+
     uri = os.environ.get("NEO4J_URI", "neo4j://localhost:7687")
     user = os.environ.get("NEO4J_USER", "neo4j")
     password = os.environ.get("NEO4J_PASSWORD", "")
 
-    if not password:
-        logger.error("NEO4J_PASSWORD environment variable not set. Please check your .env file.")
-        sys.exit(1)
+    if not password and not os.environ.get("NEO4J_NO_AUTH"):
+        logger.warning("NEO4J_PASSWORD environment variable not set. Using empty password or check your .env file.")
 
     logger.info("Connecting to Neo4j at %s...", uri)
     with GraphDatabase.driver(uri, auth=(user, password)) as driver:

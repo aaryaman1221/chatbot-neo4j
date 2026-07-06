@@ -17,6 +17,7 @@ from .config import (
     _check_neo4j,
     _query_graph_stats,
     _fetch_available_repos,
+    get_google_api_key,
 )
 from .llm_service import answer_question_hybrid
 
@@ -70,9 +71,9 @@ def chat(
     x_neo4j_user: str = Header(...),
     x_neo4j_password: str = Header(...),
 ):
-    google_api_key = os.getenv("GOOGLE_API_KEY")
+    google_api_key = get_google_api_key()
     if not google_api_key:
-        raise HTTPException(status_code=500, detail="GOOGLE_API_KEY not found in environment.")
+        raise HTTPException(status_code=500, detail="Google/Gemini API key not found. Please set GOOGLE_API_KEY or GEMINI_API_KEY in your .env file or environment.")
 
     logger.info(
         "[CHAT] ════════════════════════════════════════════════════════"

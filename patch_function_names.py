@@ -61,17 +61,21 @@ RETURN count(fn) AS updated
 
 
 def patch_graph():
-    load_dotenv()
+    from pathlib import Path
+    _env_path = Path(__file__).resolve().parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+    else:
+        load_dotenv()
     
     github_token = os.environ.get("GITHUB_TOKEN", "")
     neo4j_uri    = os.environ.get("NEO4J_URI", "neo4j://localhost:7687")
     neo4j_user   = os.environ.get("NEO4J_USER", "neo4j")
-    neo4j_pass   = os.environ.get("NEO4J_PASSWORD", "password123")
+    neo4j_pass   = os.environ.get("NEO4J_PASSWORD", "")
     target_repo  = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("TARGET_REPO", "gohugoio/hugo")
 
-    if not neo4j_pass:
-        print("[ERROR] NEO4J_PASSWORD environment variable not set.")
-        return
+    if not neo4j_pass and not os.environ.get("NEO4J_NO_AUTH"):
+        print("[WARN] NEO4J_PASSWORD not set. Using empty password or check your .env file.")
 
     print(f"[*] Connecting to Neo4j at {neo4j_uri} for repo '{target_repo}'...")
     driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_pass))

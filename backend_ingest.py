@@ -23,8 +23,14 @@ from ingest.queries import (
 from ingest.pipeline import bootstrap, resolve_cross_repo_edges
 
 
+from pathlib import Path
+
 if __name__ == "__main__":
-    load_dotenv()
+    _env_path = Path(__file__).resolve().parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+    else:
+        load_dotenv()
 
     if "--link-repos" in sys.argv:
         NEO4J_URI      = os.environ.get("NEO4J_URI",      "neo4j://localhost:7687")
@@ -53,7 +59,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN", "")
-    GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+    GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_GENAI_API_KEY") or ""
     NEO4J_URI      = os.environ.get("NEO4J_URI",      "neo4j://localhost:7687")
     NEO4J_USER     = os.environ.get("NEO4J_USER",     "neo4j")
     NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "")
@@ -64,7 +70,8 @@ if __name__ == "__main__":
 
     missing = []
     if not GITHUB_TOKEN:   missing.append("GITHUB_TOKEN")
-    if not NEO4J_PASSWORD: missing.append("NEO4J_PASSWORD")
+    if not NEO4J_PASSWORD and not os.environ.get("NEO4J_NO_AUTH"):
+        missing.append("NEO4J_PASSWORD")
 
     if missing:
         print(f"[ERROR] Missing required environment variables: {', '.join(missing)}")

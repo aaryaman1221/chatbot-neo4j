@@ -286,7 +286,7 @@ def extract_query_intent(query: str, google_api_key: Optional[str] = None) -> Qu
     Extract structured intent and literal entity mentions from a code-search query.
     Uses Gemini structured output with LRU caching, falling back to regex/keyword heuristics on failure.
     """
-    api_key = google_api_key or os.getenv("GOOGLE_API_KEY") or ""
+    api_key = google_api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_GENAI_API_KEY") or ""
     intent = None
     if api_key:
         intent = _cached_llm_intent(query, api_key)

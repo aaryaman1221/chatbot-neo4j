@@ -70,18 +70,23 @@ RETURN r.full_name AS full_name
 """
 
 def main():
+    from pathlib import Path
     parser = argparse.ArgumentParser(description="Clean up ambiguous CALLS edges and migrate cross-repo links.")
     parser.add_argument("--dry-run", action="store_true", help="Print actions without modifying the database.")
     args = parser.parse_args()
 
-    load_dotenv()
+    _env_path = Path(__file__).resolve().parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+    else:
+        load_dotenv()
+
     uri = os.environ.get("NEO4J_URI", "neo4j://localhost:7687")
     user = os.environ.get("NEO4J_USER", "neo4j")
     password = os.environ.get("NEO4J_PASSWORD", "")
 
-    if not password:
-        logger.error("NEO4J_PASSWORD environment variable not set. Please check your .env file.")
-        sys.exit(1)
+    if not password and not os.environ.get("NEO4J_NO_AUTH"):
+        logger.warning("NEO4J_PASSWORD environment variable not set. Using empty password or check your .env file.")
 
     logger.info("Connecting to Neo4j at %s...", uri)
     with GraphDatabase.driver(uri, auth=(user, password)) as driver:
