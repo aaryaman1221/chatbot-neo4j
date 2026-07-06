@@ -257,7 +257,7 @@ def _run_impact_traversal(
                 if selected_repos else ""
             )
             consumer_cypher = f"""
-            MATCH (consumer)-[rel:DEPENDS_ON|CALLS|USES_REPO|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|EMBEDS|DECLARES_METHOD]->(seed)
+            MATCH (consumer)-[rel:DEPENDS_ON|CALLS|USES_REPO|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD|DECLARES]->(seed)
             WHERE elementId(seed) = $seed_id
               AND (consumer:File OR consumer:Function OR consumer:Module OR consumer:Type OR consumer:Repository)
               {repo_filter}
@@ -326,7 +326,7 @@ def _run_impact_traversal(
 
             # ── Cross-Repo Multi-Hop Traversal ─────────────────────────────────
             multihop_cypher = f"""
-            MATCH (entry:Function)-[:CALLS|DISPATCHES_TO*1..3]->(callee:Function)-[:CALLS|DEPENDS_ON|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|EMBEDS|DECLARES_METHOD]->(seed)
+            MATCH (entry:Function)-[:CALLS|DISPATCHES_TO|FORWARDS_TO*1..3]->(callee:Function)-[:CALLS|DEPENDS_ON|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD]->(seed)
             WHERE elementId(seed) = $seed_id
               AND (
                   coalesce(entry.repo, '') <> coalesce(seed.repo, '') 
@@ -376,7 +376,7 @@ def _run_impact_traversal(
                     })
 
             reverse_cypher = f"""
-            MATCH (seed)-[rel:DEPENDS_ON|CALLS|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|EMBEDS|DECLARES_METHOD]->(dep)
+            MATCH (seed)-[rel:DEPENDS_ON|CALLS|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD]->(dep)
             WHERE elementId(seed) = $seed_id
               AND (dep:File OR dep:Function OR dep:Module OR dep:Type OR dep:Repository)
               {repo_filter.replace('consumer.', 'dep.')}
@@ -445,7 +445,7 @@ def retrieve_code_context(
             "[Source: user-query-intent | LLM Intent Classification]",
             f"Primary Intent : Impact={intent.wants_impact} | Blame={intent.wants_blame} | Commit={intent.wants_commit_files} | Recency={intent.wants_recency}",
             f"Target Subjects: {intent.subjects or 'none explicitly detected'}",
-            f"Modified Fields: {intent.field_hints or 'none detected'}",
+            f"Modified Symbols/Keys: {intent.field_hints or 'none detected'}",
             f"Target Repos   : {intent.repo_hints or 'all / unscoped'}",
         ]
         context_parts.append("\n".join(intent_summary_lines))
@@ -457,6 +457,13 @@ def retrieve_code_context(
     if _is_impact_query:
         impact_subjects  = intent.subjects or _extract_impact_subjects(user_query)
         field_hints_s0   = intent.field_hints or _extract_field_hints(user_query)
+        if field_hints_s0:
+            _expanded_fh = []
+            for h in field_hints_s0:
+                _expanded_fh.append(h)
+                if "." in h:
+                    _expanded_fh.append(h.split(".")[-1])
+            field_hints_s0 = list(dict.fromkeys(_expanded_fh))
         query_repo_hints = intent.repo_hints or _extract_repo_hints_from_query(user_query)
 
         _effective_repos = selected_repos or []
@@ -512,7 +519,14 @@ def retrieve_code_context(
                         "AND (fn.repo IN $selected_repos OR fn.full_name IN $selected_repos OR fn.name IN $selected_repos)"
                         if _effective_repos else ""
                     )
-                    field_rel_label = f"REFERENCES_FIELD_{field.upper()}"
+                    if any(w in _query_lower_s0 for w in ["signature", "param", "arg", "return"]):
+                        field_rel_label = f"REFERENCES_SIGNATURE_{field.upper()}"
+                    elif any(w in _query_lower_s0 for w in ["method", "func", "function"]):
+                        field_rel_label = f"REFERENCES_METHOD_{field.upper()}"
+                    elif any(w in _query_lower_s0 for w in ["key", "config", "setting"]):
+                        field_rel_label = f"REFERENCES_KEY_{field.upper()}"
+                    else:
+                        field_rel_label = f"REFERENCES_FIELD_{field.upper()}"
                     field_grep_cypher = f"""
                     MATCH (fn:Function)
                     WHERE fn.code IS NOT NULL
@@ -533,7 +547,7 @@ def retrieve_code_context(
                                 selected_repos=_effective_repos,
                             ).data()
                         logger.info(
-                            "[RETRIEVE] Stage 0 field-grep '%s' → %d function(s) reference it.",
+                            "[RETRIEVE] Stage 0 symbol-grep '%s' → %d function(s) reference it.",
                             field, len(field_rows),
                         )
                         for r in field_rows:
@@ -544,7 +558,7 @@ def retrieve_code_context(
                         impact_rows.extend(field_rows)
                     except Exception as exc:
                         logger.warning(
-                            "[RETRIEVE] Stage 0 field-grep '%s' failed: %s", field, exc
+                            "[RETRIEVE] Stage 0 symbol-grep '%s' failed: %s", field, exc
                         )
 
             logger.info(
@@ -568,12 +582,14 @@ def retrieve_code_context(
             "AND (node.repo IN $selected_repos OR node.full_name IN $selected_repos OR node.name IN $selected_repos)"
             if selected_repos else ""
         )
+
+        # 1a: Function-level semantic search (code_embeddings)
         vector_cypher = f"""
         CALL db.index.vector.queryNodes('code_embeddings', $top_k, $query_vector)
         YIELD node, score
         WITH node, score
         WHERE node.code IS NOT NULL {repo_clause}
-        OPTIONAL MATCH (node)-[:CALLS|DEPENDS_ON|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|EMBEDS|DECLARES_METHOD]->(connected)
+        OPTIONAL MATCH (node)-[:CALLS|DEPENDS_ON|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD]->(connected)
         WHERE (connected:Function OR connected:File OR connected:Type)
           AND connected.code IS NOT NULL
           {"AND (connected.repo IN $selected_repos OR connected.full_name IN $selected_repos OR connected.name IN $selected_repos)" if selected_repos else ""}
@@ -593,27 +609,71 @@ def retrieve_code_context(
         ORDER BY score DESC
         LIMIT $top_k
         """
+
+        # 1b: Module-level semantic search (module_embeddings).
+        # Finds package/module nodes whose name embedding is semantically close to
+        # the query — important for questions like "code related to color rendering"
+        # that refer to packages rather than individual functions.
+        module_vector_cypher = f"""
+        CALL db.index.vector.queryNodes('module_embeddings', $mod_top_k, $query_vector)
+        YIELD node, score
+        WITH node, score
+        WHERE node.embedding IS NOT NULL {
+            "AND (node.repo IN $selected_repos OR node.name IN $selected_repos)" if selected_repos else ""
+        }
+        OPTIONAL MATCH (f:File)-[:DEPENDS_ON]->(node)
+        {
+            "WHERE f.repo IN $selected_repos" if selected_repos else ""
+        }
+        WITH node, score,
+             collect(DISTINCT f.path)[..6] AS dependent_files
+        RETURN
+          node.name                   AS name,
+          coalesce(node.repo, '')     AS filepath,
+          '(module: ' + node.name + ')\\nDepended on by:\\n' + reduce(s='', p IN dependent_files | s + '  ' + p + '\\n') AS code,
+          []                          AS connected,
+          score
+        ORDER BY score DESC
+        LIMIT $mod_top_k
+        """
+
         logger.info(
             "[RETRIEVE] Stage 1 — vector search (top_k=%d, repo_filter=%s) …",
             top_k, bool(selected_repos),
         )
         try:
             with driver.session() as session:
+                # 1a: function search
                 rows = session.run(
                     vector_cypher,
                     query_vector=query_vector,
                     top_k=top_k,
                     selected_repos=selected_repos or [],
                 ).data()
+
+                # 1b: module search (half of top_k, minimum 3)
+                mod_top_k = max(3, top_k // 2)
+                mod_rows = session.run(
+                    module_vector_cypher,
+                    query_vector=query_vector,
+                    mod_top_k=mod_top_k,
+                    selected_repos=selected_repos or [],
+                ).data()
+
             logger.info(
-                "[RETRIEVE] Stage 1 returned %d seed record(s).", len(rows),
+                "[RETRIEVE] Stage 1 returned %d function record(s) + %d module record(s).",
+                len(rows), len(mod_rows),
             )
             if rows:
                 vector_rows = rows
                 context_parts.append(_build_context_block(rows, "vector-search", global_seen=global_seen_ids))
                 retrieval_path_tags.append("vector")
+            if mod_rows:
+                context_parts.append(_build_context_block(mod_rows, "module-vector", global_seen=global_seen_ids))
+                retrieval_path_tags.append("module-vector")
         except Exception as exc:
             logger.error("[RETRIEVE] ❌ Stage 1 vector search FAILED: %s", exc)
+
     else:
         logger.warning(
             "[RETRIEVE] ⚠️  No query vector — skipping Stage 1 entirely."
@@ -676,6 +736,23 @@ def retrieve_code_context(
         or intent.wants_commit_files
     )
     _needs_recency_sort = intent.wants_recency
+
+    lucene_query = _sanitize_lucene_query(user_query)
+    fulltext_cypher = """
+    CALL db.index.fulltext.queryNodes('commit_summaries', $search_query)
+    YIELD node, score
+    RETURN
+      coalesce(node.sha, node.id, toString(elementId(node))) AS name,
+      coalesce(node.repo, '')                          AS filepath,
+      coalesce(
+        node.summary_text,
+        node.message,
+        node.diff_text,
+        ''
+      )                                               AS code,
+      []                                              AS connected
+    LIMIT 10
+    """
 
     if _needs_commit_context:
         if not context_parts:
@@ -752,30 +829,15 @@ def retrieve_code_context(
             except Exception as exc:
                 logger.error("[RETRIEVE] ❌ Stage 3a recency FAILED: %s", exc)
 
-        lucene_query = _sanitize_lucene_query(user_query)
         logger.info(
             "[RETRIEVE] Stage 3b — fulltext: sanitized=%r (original=%r)",
             lucene_query, user_query,
         )
-        fulltext_cypher = """
-        CALL db.index.fulltext.queryNodes('commit_summaries', $search_query)
-        YIELD node, score
-        RETURN
-          coalesce(node.sha, node.id, toString(elementId(node))) AS name,
-          coalesce(node.repo, '')                          AS filepath,
-          coalesce(
-            node.summary_text,
-            node.message,
-            node.diff_text,
-            ''
-          )                                               AS code,
-          []                                              AS connected
-        LIMIT 10
-        """
+        fulltext_cypher_local = fulltext_cypher
         try:
             with driver.session() as session:
                 rows = session.run(
-                    fulltext_cypher, search_query=lucene_query
+                    fulltext_cypher_local, search_query=lucene_query
                 ).data()
             logger.info("[RETRIEVE] Stage 3b fulltext → %d record(s).", len(rows))
             if rows:
@@ -988,11 +1050,9 @@ def retrieve_code_context(
             r["filepath"] for r in vector_rows if r.get("filepath")
         ))
 
-        fallback_hints: list[str] = []
-        if not semantic_filepaths:
-            logger.info("[RETRIEVE] Stage 4 — no vector results, falling back to NLP hints.")
-            blame_hints  = _extract_blame_hints(user_query)
-            fallback_hints = blame_hints["func_hints"] + blame_hints["file_hints"]
+        blame_hints  = _extract_blame_hints(user_query)
+        intent_subs  = intent.subjects if (intent and intent.subjects) else []
+        fallback_hints = list(dict.fromkeys(blame_hints["func_hints"] + blame_hints["file_hints"] + intent_subs))
 
         logger.info(
             "[RETRIEVE] Stage 4 semantic_filepaths=%s  fallback_hints=%s",
@@ -1093,31 +1153,40 @@ def retrieve_code_context(
         for hint in fallback_hints:
             if selected_repos:
                 blame_hint_cypher = """
-                MATCH (u:User)-[:AUTHORED]->(c:Commit)-[:MODIFIED]->(f:File)
-                WHERE toLower(f.path) CONTAINS toLower($hint)
-                MATCH (c)-[:BELONGS_TO]->(r:Repository)
+                MATCH (u:User)-[:AUTHORED]->(c:Commit)-[:BELONGS_TO]->(r:Repository)
                 WHERE r.full_name IN $selected_repos
+                OPTIONAL MATCH (c)-[:MODIFIED]->(target)
+                WITH u, c, target
+                WHERE toLower(c.message) CONTAINS toLower($hint)
+                   OR toLower(coalesce(c.summary_text, '')) CONTAINS toLower($hint)
+                   OR toLower(coalesce(target.path, target.filepath, '')) CONTAINS toLower($hint)
+                   OR (target:Function AND toLower(target.name) CONTAINS toLower($hint))
                 RETURN
                   u.login       AS author,
                   c.sha         AS commit_sha,
                   coalesce(c.message, c.summary_text, '') AS commit_msg,
                   c.timestamp   AS committed_at,
-                  ''            AS func_name,
-                  f.path        AS filepath
+                  CASE WHEN target:Function THEN target.name ELSE '' END AS func_name,
+                  coalesce(target.filepath, target.path, '') AS filepath
                 ORDER BY c.timestamp DESC
                 LIMIT 5
                 """
             else:
                 blame_hint_cypher = """
-                MATCH (u:User)-[:AUTHORED]->(c:Commit)-[:MODIFIED]->(f:File)
-                WHERE toLower(f.path) CONTAINS toLower($hint)
+                MATCH (u:User)-[:AUTHORED]->(c:Commit)
+                OPTIONAL MATCH (c)-[:MODIFIED]->(target)
+                WITH u, c, target
+                WHERE toLower(c.message) CONTAINS toLower($hint)
+                   OR toLower(coalesce(c.summary_text, '')) CONTAINS toLower($hint)
+                   OR toLower(coalesce(target.path, target.filepath, '')) CONTAINS toLower($hint)
+                   OR (target:Function AND toLower(target.name) CONTAINS toLower($hint))
                 RETURN
                   u.login       AS author,
                   c.sha         AS commit_sha,
                   coalesce(c.message, c.summary_text, '') AS commit_msg,
                   c.timestamp   AS committed_at,
-                  ''            AS func_name,
-                  f.path        AS filepath
+                  CASE WHEN target:Function THEN target.name ELSE '' END AS func_name,
+                  coalesce(target.filepath, target.path, '') AS filepath
                 ORDER BY c.timestamp DESC
                 LIMIT 5
                 """

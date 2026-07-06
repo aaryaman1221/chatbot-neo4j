@@ -19,6 +19,11 @@ MERGE (func:Function {id: $func_id})
     func.embedding       = $embedding,
     func.qualified_calls = $qualified_calls
   ON MATCH SET
+    func.name            = $func_name,
+    func.filepath        = $filepath,
+    func.repo            = $repo_full_name,
+    func.code            = $func_code,
+    func.embedding       = coalesce($embedding, func.embedding),
     func.qualified_calls = $qualified_calls
 MERGE (file)-[:DECLARES]->(func)
 MERGE (repo)-[:DECLARES]->(func)
@@ -85,6 +90,7 @@ MERGE (repo:Repository {full_name: $repo_full_name})
 MERGE (file:File {path: $child_path, repo: $repo_full_name})
   ON CREATE SET file.repo        = $repo_full_name,
                 file.entry_point = $entry_point
+  ON MATCH  SET file.entry_point = coalesce(file.entry_point, $entry_point)
 MERGE (repo)-[:CONTAINS_FILE]->(file)
 WITH file, repo
 OPTIONAL MATCH (parent:Directory {path: $parent_path, repo: $repo_full_name})
@@ -116,8 +122,12 @@ MERGE (f)-[:USES_REPO]->(r)
 CYPHER_LINK_MODULE_TO_REPO = """
 MATCH (m:Module)
 MATCH (r:Repository)
-WHERE toLower(m.name) CONTAINS toLower(r.name)
-   OR toLower(m.name) CONTAINS toLower(r.full_name)
+// Require the module path to end with /repo-name or equal the full_name exactly.
+// This avoids spurious edges where a substring like "bubbles" matches unrelated modules.
+WHERE toLower(m.name) ENDS WITH "/" + toLower(r.name)
+   OR toLower(m.name) = toLower(r.name)
+   OR toLower(m.name) = toLower(r.full_name)
+   OR toLower(m.name) ENDS WITH "/" + toLower(r.full_name)
 MERGE (m)-[:REPRESENTS]->(r)
 """
 
@@ -130,14 +140,31 @@ UNWIND caller.qualified_calls AS qcall
 WITH caller, qcall, split(qcall, '.') AS parts, helper_repo
 WHERE size(parts) >= 2
 WITH caller, qcall, parts[0] AS prefix, parts[-1] AS func_name, helper_repo
+// Match by module suffix — handles aliased imports (e.g. `import lg "github.com/charmbracelet/lipgloss"`)
+// where the in-code prefix ("lg") differs from the repo/package name ("lipgloss").
 OPTIONAL MATCH (m:Module)-[:REPRESENTS]->(helper_repo)
-WHERE toLower(m.name) ENDS WITH "/" + toLower(prefix) OR toLower(m.name) = toLower(prefix)
+WHERE toLower(m.name) ENDS WITH "/" + toLower(prefix)
+   OR toLower(m.name) = toLower(prefix)
+   OR toLower(m.name) ENDS WITH "/" + toLower($helper_prefix)
 WITH caller, qcall, prefix, func_name, helper_repo, m
-WHERE toLower(prefix) = toLower($helper_prefix) OR m IS NOT NULL
+WHERE toLower(prefix) = toLower($helper_prefix)
+   OR m IS NOT NULL
 MATCH (callee:Function {repo: $helper_repo})
-WHERE (toLower(prefix) = toLower($helper_prefix) AND callee.name = func_name)
-   OR (m IS NOT NULL AND (callee.name = func_name OR (func_name IN ['New', 'NewCommand', 'Init', 'Execute', 'Run'] AND callee.name IN ['Command', 'NewCommand', 'Execute', 'RunE', 'Run'])))
+WHERE (callee.name = func_name)
+   OR (func_name IN ['New', 'NewCommand', 'Init', 'Execute', 'Run']
+       AND callee.name IN ['Command', 'NewCommand', 'Execute', 'RunE', 'Run'])
 MERGE (caller)-[:CALLS {cross_repo: true}]->(callee)
+"""
+
+# Second-pass: capture transitive cross-repo calls where parent-repo function A
+# calls intermediate function B (same repo), and B directly calls helper-repo function C.
+# This covers 2-hop chains like: bubbles::progress::Render -> bubbles::util::renderBar -> lipgloss::NewStyle
+# without requiring A to have lipgloss in its own qualified_calls.
+CYPHER_LINK_XREPO_CALLS_TRANSITIVE = """
+MATCH (A:Function {repo: $parent_repo})-[:CALLS]->(B:Function {repo: $parent_repo})
+MATCH (B)-[:CALLS {cross_repo: true}]->(C:Function {repo: $helper_repo})
+WHERE NOT (A)-[:CALLS {cross_repo: true}]->(C)
+MERGE (A)-[:CALLS {cross_repo: true, via: B.name}]->(C)
 """
 
 CYPHER_CROSS_REPO_IMPACT = """
@@ -237,3 +264,9 @@ CYPHER_CLEANUP_UNSCOPED_DIRS  = "MATCH (d:Directory) WHERE d.repo IS NULL DETACH
 CYPHER_CLEANUP_UNSCOPED_FUNCS = "MATCH (f:Function)  WHERE f.repo IS NULL DETACH DELETE f"
 
 CYPHER_MARK_FILE_SCANNED = "MATCH (file:File {path: $filepath, repo: $repo_full_name}) SET file.content_scanned = true"
+
+# Performance index: enables fast repo-wide name lookups in CYPHER_INGEST_CALLS.
+# Without this, every call-edge write triggers a full Function label scan.
+CYPHER_INDEX_FUNC_NAME_REPO = """
+CREATE INDEX func_name_repo IF NOT EXISTS FOR (f:Function) ON (f.name, f.repo)
+"""

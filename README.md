@@ -4,14 +4,21 @@ A powerful Python-based application that ingests GitHub repository data into a N
 
 ## Features
 
+- **One-Click Bootstrap** (`run.sh`):
+  - Automated setup script that creates a template `.env`, starts a Dockerized Neo4j instance with APOC enabled, installs requirements, and runs the ingestion pipeline.
 - **Backend Ingestion Pipeline** (`backend_ingest.py`): 
   - Pure Python CLI to bootstrap a GitHub repository into a Neo4j graph.
   - Parses code structure using Tree-sitter (AST). *(Note: Currently supports only Python and Go code)*
   - Uses Google Gemini for LLM-powered summarization of code and commits.
   - Models repositories, files, functions, commits, and their dependencies in Neo4j.
-- **Backend API & Agent** (`backend/main.py`):
-  - FastAPI server providing endpoints for the agentic chat.
-  - Powered by a LangChain Tool-Calling Agent, Neo4j Vector Retrieval, and GraphCypherQAChain.
+- **Graph Restoration & Enrichment Scripts** (For existing ingestions):
+  - `patch_function_names.py`: Zero-token in-place restoration that fixes AST UTF-8 byte-slicing function truncation without re-running embeddings or LLM summarization.
+  - `migrate_calls_edges.py`: Cleans up ambiguous intra-repository call edges and establishes cross-repository symbol links.
+  - `enrich_semantic_edges.py`: Automated code intelligence engine that adds 10 high-level semantic relationship layers (e.g., `DECLARES_METHOD`, `IMPLEMENTS`, `WRAPS`, `MUTATES_STATE_OF`).
+- **Backend API & Hybrid RAG Agent** (`backend/main.py` & `backend/app/`):
+  - FastAPI server providing endpoints for agentic chat and code intelligence.
+  - Powered by a LangChain Tool-Calling Agent and a Hybrid Retrieval Pipeline (combining vector similarity, full-text commit fallback, structural path hints, and blame traversal).
+  - Specialized reasoning protocols for migration impact analysis, ownership/blame, and modification frequency.
 - **Frontend UI** (`frontend/`):
   - Modern, responsive React application built with Vite.
 
@@ -92,10 +99,29 @@ npm install
 npm run dev
 ```
 
+### 5. Graph Migration & Restoration (For Existing Ingestions)
+
+If you have already ingested a repository into Neo4j before the recent AST bug fixes and semantic enrichment upgrades, you **do not need to re-run the full LLM ingestion**. Instead, run these helper scripts in order to upgrade your knowledge graph in-place:
+
+1. **Restore Function Names & Code Blocks** (Fixes UTF-8 byte-slicing truncation without consuming LLM tokens or regenerating embeddings):
+   ```bash
+   python3 patch_function_names.py
+   ```
+
+2. **Migrate & Clean Up Call Edges** (Resolves ambiguous function calls and links cross-repository dependencies):
+   ```bash
+   python3 migrate_calls_edges.py
+   ```
+
+3. **Enrich Semantic Graph Layers** (Generates 10 high-level code intelligence layers like `IMPLEMENTS`, `WRAPS`, `EMBEDS`, and `MUTATES_STATE_OF`):
+   ```bash
+   python3 enrich_semantic_edges.py
+   ```
+
 ## Architecture Overview
 
-- **Graph Model**: The graph models `Repository`, `File`, `Function`, `Commit`, `User`, and `Module` nodes, with rich relationships such as `DECLARES`, `CALLS`, `MODIFIED`, `AUTHORED`, and `DEPENDS_ON`.
-- **LLM Agent**: The UI utilizes a `create_tool_calling_agent` from LangChain, equipping it with specific tools to perform impact analysis, search commit history, and execute generic Cypher queries against the graph.
+- **Graph Model**: The graph models `Repository`, `File`, `Function`, `Commit`, `User`, and `Module` nodes, with rich relationships such as `DECLARES`, `CALLS`, `MODIFIED`, `AUTHORED`, and `DEPENDS_ON`, plus 10 semantic intelligence layers (e.g., `IMPLEMENTS`, `WRAPS`, `MUTATES_STATE_OF`).
+- **LLM Agent**: The UI utilizes a LangChain Tool-Calling Agent equipped with specific tools to perform impact analysis, search commit history, trace git blame ownership, and execute generic Cypher queries against the graph.
 
 ## Token Optimization & Graph Retrieval
 

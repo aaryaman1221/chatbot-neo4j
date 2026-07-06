@@ -146,6 +146,8 @@ def _extract_blame_hints(query: str) -> Dict[str, List[str]]:
 
 def _extract_impact_subjects(query: str) -> List[str]:
     """Extract candidate package/module/symbol names from an impact query."""
+    # Strip call-syntax parentheses so "NewStyle()" yields "NewStyle" as a subject.
+    query = re.sub(r'\(\s*\)', '', query)
     candidates: list[str] = []
 
     for m in re.finditer(r'[\'"`]([\w_\-\.]+)[\'"`]', query):
@@ -195,25 +197,31 @@ def _extract_impact_subjects(query: str) -> List[str]:
 
 
 def _extract_field_hints(query: str) -> List[str]:
-    """Extract specific field/property/method names that the user mentions removing/modifying."""
+    """Extract specific field/property/method/signature/key names that the user mentions removing/modifying."""
     field_hints: list[str] = []
 
     for m in re.finditer(
         r'\b(?:remov(?:e|ing)|delet(?:e|ing)|dropp?(?:ing)?|renam(?:e|ing)|updat(?:e|ing))\s+'
-        r'(?:the\s+)?([A-Za-z_][\w_]*)\s+(?:field|property|attribute|column|param|parameter|arg|argument)',
+        r'(?:the\s+)?([A-Za-z_][\w_.]*)\s+(?:(?:interface|function|struct|config|method|field|property|attribute|param|parameter|arg|argument|return|setting)\s+)*(?:field|property|attribute|column|param|parameter|arg|argument|method|function|signature|key|config|setting)',
         query, re.IGNORECASE
     ):
         field_hints.append(m.group(1).lower())
 
     for m in re.finditer(
-        r'\b([A-Z][a-z]+|[a-z][a-z0-9]+)\s+[Ff]ield\b',
+        r'\b([A-Z][a-z]+|[a-z][a-z0-9]+)\s+(?:(?:interface|function|struct|config|method|field|property|attribute|param|parameter|arg|argument|return|setting)\s+)*(?:[Ff]ield|[Mm]ethod|[Ff]unction|[Ss]ignature|[Kk]ey|[Pp]roperty|[Pp]arameter|[A]rgument|[S]etting)\b',
         query
     ):
         word = m.group(1).lower()
-        if word not in {"the", "a", "this", "that", "some", "any"}:
+        if word not in {"the", "a", "this", "that", "some", "any", "interface", "function", "struct", "config", "method", "field", "property", "attribute", "param", "parameter", "arg", "argument", "return", "setting"}:
             field_hints.append(word)
 
-    return list(dict.fromkeys(field_hints))
+    expanded_hints = []
+    for h in field_hints:
+        expanded_hints.append(h)
+        if "." in h:
+            expanded_hints.append(h.split(".")[-1])
+
+    return list(dict.fromkeys(expanded_hints))
 
 
 def _extract_repo_hints_from_query(query: str) -> List[str]:
@@ -243,7 +251,7 @@ class QueryIntent(BaseModel):
     wants_recency: bool = Field(default=False, description="True if asking for recent/latest/last N commits, commit history, or most frequently modified/changed files over time")
 
     subjects: List[str] = Field(default_factory=list, description="Literal package, module, or symbol names the user is asking about (e.g. 'spf13/cobra', 'QueryIntent'), exactly as they'd appear as identifiers — do not invent or expand names not implied by the query")
-    field_hints: List[str] = Field(default_factory=list, description="Specific struct fields/properties mentioned as being removed/changed")
+    field_hints: List[str] = Field(default_factory=list, description="Specific struct fields, properties, function signatures, methods, or config keys mentioned as being removed/changed")
     repo_hints: List[str] = Field(default_factory=list, description="Repository names mentioned, e.g. 'gohugoio/hugo'")
     file_hints: List[str] = Field(default_factory=list, description="File name fragments mentioned")
 

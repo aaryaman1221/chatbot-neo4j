@@ -2,6 +2,7 @@
 # ingest/ai_service.py — Gemini LLM Summarization and Embeddings
 # =============================================================================
 
+import re
 import time
 import requests
 from typing import Optional
@@ -60,20 +61,62 @@ def render_diff_text(files: list) -> str:
     return "\n\n".join(sections)
 
 
-def _heuristic_summary(repo_full_name: str, compact_files: list, commit_msg: str) -> str:
+def _extract_patch_symbols(patch: str) -> list:
+    if not patch:
+        return []
+    symbols = set()
+    for line in patch.split("\n"):
+        if line.startswith("@@"):
+            parts = line.split("@@", 2)
+            if len(parts) >= 3:
+                ctx = parts[2].strip()
+                m = re.search(r'(?:(?:async\s+)?def|func|class|function|interface|type|struct)\s+(?:\([^)]+\)\s+)?([a-zA-Z0-9_]+)', ctx)
+                if m:
+                    symbols.add(m.group(1))
+                elif ctx and not ctx.startswith(("#", "//", "/*", "*", "-", "+")):
+                    m2 = re.search(r'([a-zA-Z0-9_]+)\s*(?:\(|:=|=|\{)', ctx)
+                    if m2 and m2.group(1) not in ("if", "for", "while", "return", "switch", "case", "else", "elif"):
+                        symbols.add(m2.group(1))
+        elif line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
+            content = line[1:].strip()
+            m = re.search(r'^(?:export\s+)?(?:async\s+)?(?:def|func|class|function|interface|type|struct)\s+(?:\([^)]+\)\s+)?([a-zA-Z0-9_]+)', content)
+            if m and m.group(1) not in ("if", "for", "while", "return", "switch", "case", "else", "elif", "import", "from", "package", "var", "const", "let"):
+                symbols.add(m.group(1))
+    return sorted(list(symbols))
+
+
+def _heuristic_summary(
+    repo_full_name: str,
+    compact_files: list,
+    commit_msg: str,
+    actor_login: Optional[str] = None,
+) -> str:
     logger.info("heuristic summary used")
+    author_part = f" by {actor_login}" if actor_login and actor_login != "unknown" else ""
+    header = f"Commit in {repo_full_name}{author_part}: {commit_msg[:200].strip()}"
     if not compact_files:
-        return f"Commit in {repo_full_name}: {commit_msg[:200]}"
-    parts = [
-        f"{item['filename']} ({item.get('status','modified')}, "
-        f"+{item.get('additions',0)}/-{item.get('deletions',0)})"
-        for item in compact_files[:5]
-    ]
-    extra = f" and {len(compact_files) - 5} more" if len(compact_files) > 5 else ""
-    return (
-        f"Commit in {repo_full_name}: {commit_msg[:100]}\n"
-        f"Key files: {', '.join(parts)}{extra}."
-    )
+        return header
+
+    total_add = sum(item.get("additions", 0) for item in compact_files)
+    total_del = sum(item.get("deletions", 0) for item in compact_files)
+    stats_line = f"Stats: {len(compact_files)} files changed (+{total_add} / -{total_del})"
+
+    file_lines = []
+    for item in compact_files[:10]:
+        filename = item.get("filename") or item.get("path") or "unknown"
+        status = item.get("status", "modified")
+        adds = item.get("additions", 0)
+        dels = item.get("deletions", 0)
+        line_str = f"- {filename} ({status}, +{adds}/-{dels})"
+        symbols = _extract_patch_symbols(item.get("patch", ""))
+        if symbols:
+            line_str += f"\n  ↳ Modified symbols/functions: {', '.join(symbols[:8])}" if len(symbols) <= 8 else f"\n  ↳ Modified symbols/functions: {', '.join(symbols[:8])} (+{len(symbols)-8} more)"
+        file_lines.append(line_str)
+
+    if len(compact_files) > 10:
+        file_lines.append(f"... and {len(compact_files) - 10} more files.")
+
+    return f"{header}\n\n{stats_line}\n\nKey changes:\n" + "\n".join(file_lines)
 
 
 def summarize_with_llm(
@@ -85,7 +128,7 @@ def summarize_with_llm(
     google_api_key: Optional[str] = None,
 ) -> str:
     if not google_api_key:
-        return _heuristic_summary(repo_full_name, compact_files, commit_msg)
+        return _heuristic_summary(repo_full_name, compact_files, commit_msg, actor_login=actor_login)
 
     file_overview = "\n".join(
         f"- {item['filename']} ({item.get('status','modified')} "
@@ -162,7 +205,7 @@ def summarize_with_llm(
     except Exception as exc:
         logger.debug("REST LLM fallback failed: %s", exc)
 
-    return _heuristic_summary(repo_full_name, compact_files, commit_msg)
+    return _heuristic_summary(repo_full_name, compact_files, commit_msg, actor_login=actor_login)
 
 
 def get_embedding(text: str, api_key: str) -> list:

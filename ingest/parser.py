@@ -11,6 +11,7 @@ from .config import (
     IGNORED_DIRECTORIES,
     IGNORED_FILENAMES,
     IGNORED_SUFFIXES,
+    _GO_TEST_SUFFIXES,
 )
 
 # ── AST Parsing Dependencies ───────────────────────────────────────────────
@@ -34,6 +35,9 @@ def _is_noise_file(filename: str) -> bool:
     name = lower_path.rsplit("/", 1)[-1]
     if name in IGNORED_FILENAMES:
         return True
+    # Skip Go test files — their TestXxx/BenchmarkXxx functions pollute the call graph.
+    if name.endswith(_GO_TEST_SUFFIXES):
+        return True
     return name.endswith(IGNORED_SUFFIXES)
 
 
@@ -46,30 +50,49 @@ def parse_python_ast(filepath: str, source_code: str) -> dict:
 
     try:
         tree = ast.parse(source_code)
-        for node in ast.walk(tree):
+
+        # Only capture top-level functions and class-level methods.
+        # Nested inner functions are skipped to prevent duplicate IDs when two files
+        # share common helper names (e.g. `_flush`, `_retry`).
+        seen_lines: set = set()
+        func_nodes: list = []
+
+        # Collect FunctionDef/AsyncFunctionDef directly inside Module or ClassDef
+        for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                func_code = ast.get_source_segment(source_code, node) or ""
-                functions.append({
-                    "name": node.name,
-                    "id": f"{filepath}::{node.name}",
-                    "start": node.lineno,
-                    "end": node.end_lineno,
-                    "code": func_code
-                })
-                for child in ast.walk(node):
-                    if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
-                        calls.append((node.name, child.func.id, None))
-                    elif isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
-                        parts = []
-                        attr_node = child.func
-                        while isinstance(attr_node, ast.Attribute):
-                            parts.append(attr_node.attr)
-                            attr_node = attr_node.value
-                        if isinstance(attr_node, ast.Name):
-                            parts.append(attr_node.id)
-                        parts.reverse()
-                        qualified_name = ".".join(parts)
-                        calls.append((node.name, child.func.attr, qualified_name))
+                func_nodes.append(node)
+            elif isinstance(node, ast.ClassDef):
+                for child in node.body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        func_nodes.append(child)
+
+
+        for node in func_nodes:
+            if node.lineno in seen_lines:
+                continue
+            seen_lines.add(node.lineno)
+            func_code = ast.get_source_segment(source_code, node) or ""
+            functions.append({
+                "name": node.name,
+                "id": f"{filepath}::{node.name}",
+                "start": node.lineno,
+                "end": node.end_lineno,
+                "code": func_code
+            })
+            for child in ast.walk(node):
+                if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+                    calls.append((node.name, child.func.id, None))
+                elif isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
+                    parts = []
+                    attr_node = child.func
+                    while isinstance(attr_node, ast.Attribute):
+                        parts.append(attr_node.attr)
+                        attr_node = attr_node.value
+                    if isinstance(attr_node, ast.Name):
+                        parts.append(attr_node.id)
+                    parts.reverse()
+                    qualified_name = ".".join(parts)
+                    calls.append((node.name, child.func.attr, qualified_name))
     except Exception:
         pass
 
@@ -81,7 +104,8 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
         return {"functions": [], "calls": []}
 
     try:
-        tree = go_parser.parse(bytes(source_code, "utf8"))
+        raw_bytes = bytes(source_code, "utf8")
+        tree = go_parser.parse(raw_bytes)
     except Exception as exc:
         logger.debug("Failed to parse Go AST for %s: %s", filepath, exc)
         return {"functions": [], "calls": []}
@@ -90,7 +114,7 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
     calls = []
 
     def get_text(node):
-        return source_code[node.start_byte:node.end_byte]
+        return raw_bytes[node.start_byte:node.end_byte].decode("utf8", errors="replace")
 
     def walk(node, current_func=None):
         new_func = current_func
@@ -292,20 +316,33 @@ def extract_temporal_dependencies(compact_files: list) -> dict:
             else _extract_generic_dependencies
         )
 
+        # Split diff lines into addition/deletion buckets, keeping the
+        # +/- prefix so that patch_mode=True can correctly filter them.
         addition_lines: list[str] = []
         deletion_lines: list[str] = []
 
         for raw_line in patch.split("\n"):
             if raw_line.startswith("+") and not raw_line.startswith("+++"):
-                addition_lines.append(raw_line[1:])
+                addition_lines.append(raw_line)   # keep '+' prefix for patch_mode
             elif raw_line.startswith("-") and not raw_line.startswith("---"):
-                deletion_lines.append(raw_line[1:])
+                deletion_lines.append(raw_line)   # keep '-' prefix for patch_mode
 
-        for dep in extractor(source_file, addition_lines, patch_mode=False):
+        # Use patch_mode=True so _extract_*_dependencies strips the prefix
+        # and only considers lines starting with '+' (or ' ' for context).
+        # Previously this used patch_mode=False on pre-stripped lines, which
+        # caused the extractor to try to parse blank-stripped content as
+        # raw source, missing multi-line import blocks.
+        for dep in extractor(source_file, addition_lines, patch_mode=True):
             if dep not in added:
                 added.append(dep)
 
-        for dep in extractor(source_file, deletion_lines, patch_mode=False):
+        # For deletions, temporarily treat '-' lines as '+' lines so the
+        # patch_mode=True filter picks them up.
+        deletion_as_additions = [
+            "+" + line[1:] if line.startswith("-") else line
+            for line in deletion_lines
+        ]
+        for dep in extractor(source_file, deletion_as_additions, patch_mode=True):
             if dep not in removed:
                 removed.append(dep)
 

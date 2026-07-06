@@ -21,6 +21,8 @@ from .config import (
     ENTRY_POINT_NAMES,
     UTILITY_DIRS,
     _GRAPH_FLUSH_BATCH,
+    _EMBED_FUNC_BATCH_SIZE,
+    _GO_TEST_SUFFIXES,
 )
 from .queries import (
     CYPHER_CREATE_REPO,
@@ -36,6 +38,7 @@ from .queries import (
     CYPHER_LINK_REPO_DEPENDENCY,
     CYPHER_LINK_MODULE_TO_REPO,
     CYPHER_LINK_XREPO_CALLS,
+    CYPHER_LINK_XREPO_CALLS_TRANSITIVE,
     CYPHER_VECTOR_INDEX,
     CYPHER_CODE_VECTOR_INDEX,
     CYPHER_MODULE_VECTOR_INDEX,
@@ -43,6 +46,7 @@ from .queries import (
     CYPHER_UPSERT_STATUS,
     CYPHER_CONSTRAINT_FILE_REPO,
     CYPHER_CONSTRAINT_FUNC_ID,
+    CYPHER_INDEX_FUNC_NAME_REPO,
     CYPHER_CLEANUP_UNSCOPED_FILES,
     CYPHER_CLEANUP_UNSCOPED_DIRS,
     CYPHER_CLEANUP_UNSCOPED_FUNCS,
@@ -157,6 +161,21 @@ def resolve_cross_repo_edges(driver, parent_repo: str, helper_repo: str):
             parent_repo,
             helper_repo,
             sum_calls.counters.relationships_created,
+        )
+
+        # Second pass: resolve transitive 2-hop chains (A→B in parent, B→C cross-repo).
+        # Must run after direct CALLS edges are present so B→C already exists.
+        res_trans = session.run(
+            CYPHER_LINK_XREPO_CALLS_TRANSITIVE,
+            parent_repo=parent_repo,
+            helper_repo=helper_repo,
+        )
+        sum_trans = res_trans.consume()
+        logger.info(
+            "Cross-repo CALLS (transitive 2-hop) created (%s → %s): %d",
+            parent_repo,
+            helper_repo,
+            sum_trans.counters.relationships_created,
         )
 
 
@@ -288,13 +307,30 @@ def phase2_scan_file_contents(
                     batch_params.append((source, target, repo_full_name))
 
                 if path.endswith(".go"):
+                    # Skip Go test files from AST scanning — their TestXxx/BenchmarkXxx
+                    # functions pollute the call graph with test-only edges.
+                    if path.endswith(_GO_TEST_SUFFIXES):
+                        with driver.session() as _sm:
+                            _sm.run(CYPHER_MARK_FILE_SCANNED,
+                                    filepath=path, repo_full_name=repo_full_name)
+                        scanned += 1
+                        continue
                     ast_data = parse_go_ast(path, source_code)
                 else:
                     ast_data = parse_python_ast(path, source_code)
+
+                # ── Batch-embed all functions in this file, chunked to _EMBED_FUNC_BATCH_SIZE ──
+                funcs = ast_data["functions"]
+                func_embeddings: list = []
+                if funcs:
+                    for i in range(0, len(funcs), _EMBED_FUNC_BATCH_SIZE):
+                        chunk = funcs[i : i + _EMBED_FUNC_BATCH_SIZE]
+                        texts = [f"{f['name']}\n{f.get('code', '')}" for f in chunk]
+                        func_embeddings.extend(get_embeddings_batch(texts, google_api_key))
+
                 with driver.session() as sess:
-                    for func in ast_data["functions"]:
+                    for func, embedding in zip(funcs, func_embeddings):
                         prefixed_id = f"{repo_full_name}::{func['id']}"
-                        embed_text = f"{func['name']}\n{func.get('code', '')}"
                         qual_calls_set = set()
                         for c in ast_data["calls"]:
                             if c[0] == func["name"]:
@@ -310,7 +346,7 @@ def phase2_scan_file_contents(
                             func_id=prefixed_id,
                             func_name=func["name"],
                             func_code=func.get("code", ""),
-                            embedding=get_embedding(embed_text, google_api_key),
+                            embedding=embedding or None,
                             qualified_calls=func_qual_calls,
                         )
                     for call_record in ast_data["calls"]:
@@ -459,7 +495,7 @@ def phase3_backfill_commits(
                     is_deep_scan = commit_dt >= cutoff_date
 
                 summary_text = (
-                    _heuristic_summary(repo_full_name, compact_files, commit_msg)
+                    _heuristic_summary(repo_full_name, compact_files, commit_msg, actor_login=actor_login)
                     if skip_llm
                     else summarize_with_llm(
                         repo_full_name=repo_full_name,
@@ -596,6 +632,7 @@ def bootstrap(
         (CYPHER_FULLTEXT_INDEX,       "fulltext index commit_summaries"),
         (CYPHER_CONSTRAINT_FILE_REPO, "composite uniqueness: File(path, repo)"),
         (CYPHER_CONSTRAINT_FUNC_ID,   "uniqueness: Function(id)"),
+        (CYPHER_INDEX_FUNC_NAME_REPO, "performance index: Function(name, repo)"),
     ]:
         try:
             with driver.session() as session:

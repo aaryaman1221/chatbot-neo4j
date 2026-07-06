@@ -40,6 +40,9 @@ IGNORED_DIRECTORIES = {
 IGNORED_FILENAMES = {
     ".ds_store", "cargo.lock", "gemfile.lock", "package-lock.json",
     "poetry.lock", "pnpm-lock.yaml", "yarn.lock",
+    # go.sum contains cryptographic hashes, not import paths — scanning it
+    # injects thousands of spurious Module nodes into the graph.
+    "go.sum",
 }
 
 IGNORED_SUFFIXES = (
@@ -49,3 +52,14 @@ IGNORED_SUFFIXES = (
 )
 
 _GRAPH_FLUSH_BATCH = 50
+
+# Maximum number of function texts sent to get_embeddings_batch() in one call.
+# Gemini embed_content accepts up to 100 items per batch request.
+# Large generated Go files (e.g. mocks, protobuf) can have 200+ functions;
+# this cap splits them into safe chunks.
+_EMBED_FUNC_BATCH_SIZE = 80
+
+# Go test file suffixes to skip during AST/call-graph scanning.
+# _test.go functions (TestXxx, BenchmarkXxx, FuzzXxx) pollute the call graph
+# with test-only edges that have nothing to do with the library's public API.
+_GO_TEST_SUFFIXES = ("_test.go",)
