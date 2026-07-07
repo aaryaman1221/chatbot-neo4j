@@ -64,6 +64,51 @@ def _build_context_block(
         rel = rec.get("rel_type") or ""
         if rel:
             lines.append(f"Relation : {rel}")
+            
+        # Metadata / Property Formatting
+        author = rec.get("author")
+        if author:
+            lines.append(f"Author   : {author}")
+        kind = rec.get("kind")
+        if kind:
+            lines.append(f"Kind     : {kind}")
+        chan_elem = rec.get("chan_elem_type")
+        if chan_elem:
+            lines.append(f"ChanType : {chan_elem}")
+        lock_seq = rec.get("lock_sequence")
+        if lock_seq:
+            lines.append(f"Locks    : {', '.join(lock_seq) if isinstance(lock_seq, list) else lock_seq}")
+        ch_sent = rec.get("channels_sent")
+        if ch_sent:
+            lines.append(f"Ch Sent  : {', '.join(ch_sent) if isinstance(ch_sent, list) else ch_sent}")
+        ch_recv = rec.get("channels_received")
+        if ch_recv:
+            lines.append(f"Ch Recv  : {', '.join(ch_recv) if isinstance(ch_recv, list) else ch_recv}")
+        accepts_ctx = rec.get("accepts_context")
+        if accepts_ctx is not None:
+            lines.append(f"AcceptsCtx: {accepts_ctx}")
+        is_test = rec.get("is_test")
+        if is_test is not None:
+            lines.append(f"Is Test  : {is_test}")
+        is_ptr = rec.get("is_pointer_receiver")
+        if is_ptr is not None:
+            lines.append(f"Is PtrRecv: {is_ptr}")
+        prop_errs = rec.get("propagated_errors")
+        if prop_errs:
+            lines.append(f"Propagates: {', '.join(prop_errs) if isinstance(prop_errs, list) else prop_errs}")
+        ret_types = rec.get("return_types")
+        if ret_types:
+            lines.append(f"Returns  : {', '.join(ret_types) if isinstance(ret_types, list) else ret_types}")
+        type_params = rec.get("type_parameters")
+        if type_params:
+            lines.append(f"Generics : {type_params}")
+        tag_maps = rec.get("tag_mappings")
+        if tag_maps:
+            lines.append(f"Tags     : {tag_maps}")
+        fields = rec.get("fields")
+        if fields:
+            lines.append(f"Fields   : {', '.join(fields) if isinstance(fields, list) else fields}")
+
         if code:
             lines.append("Code     :")
             lines.append(code)
@@ -74,13 +119,21 @@ def _build_context_block(
             c_name = conn.get("name") or "<unknown>"
             c_path = conn.get("path") or conn.get("filepath") or ""
             c_code = (conn.get("code") or "").strip()
+            c_call_type = conn.get("call_type") or ""
+            c_is_ptr = conn.get("is_pointer_receiver")
             c_uid  = f"{c_path}::{c_name}"
             if c_uid in seen_ids or (global_seen is not None and c_uid in global_seen) or not c_code:
                 continue
             seen_ids.add(c_uid)
             if global_seen is not None:
                 global_seen.add(c_uid)
-            lines.append(f"\n  ↳ Called/Dep: {c_name}  [{c_path}]")
+            extra_info = []
+            if c_call_type:
+                extra_info.append(f"Call Type: {c_call_type}")
+            if c_is_ptr is not None:
+                extra_info.append(f"Pointer Receiver: {c_is_ptr}")
+            extra_str = f" ({', '.join(extra_info)})" if extra_info else ""
+            lines.append(f"\n  ↳ Called/Dep: {c_name}  [{c_path}]{extra_str}")
             lines.append(f"  {c_code.replace(chr(10), chr(10)+'  ')}")
 
     return "\n".join(lines)
@@ -269,7 +322,7 @@ def _run_impact_traversal(
                 if selected_repos else ""
             )
             consumer_cypher = f"""
-            MATCH (consumer)-[rel:DEPENDS_ON|CALLS|USES_REPO|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD|DECLARES|DECLARES_TYPE|DECLARES_VAR|HAS_DIRECTIVE]->(seed)
+            MATCH (consumer)-[rel:DEPENDS_ON|CALLS|USES_REPO|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD|DECLARES|DECLARES_TYPE|DECLARES_VAR|HAS_DIRECTIVE|PROPAGATES_ERROR|RETURNS|CONSTRAINED_BY|CHAN_ELEM_TYPE|TESTS|GENERATES_TYPE|GENERATES_FILE]->(seed)
             WHERE elementId(seed) = $seed_id
               AND (consumer:File OR consumer:Function OR consumer:Module OR consumer:Type OR consumer:Repository)
               {repo_filter}
@@ -336,9 +389,59 @@ def _run_impact_traversal(
                         "connected": [],
                     })
 
+            # Detailed consumers to get code blocks / name symbols of direct dependers
+            detailed_consumer_cypher = f"""
+            MATCH (consumer)-[rel:DEPENDS_ON|CALLS|USES_REPO|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD|DECLARES|DECLARES_TYPE|DECLARES_VAR|HAS_DIRECTIVE|PROPAGATES_ERROR|RETURNS|CONSTRAINED_BY|CHAN_ELEM_TYPE|TESTS|GENERATES_TYPE|GENERATES_FILE]->(seed)
+            WHERE elementId(seed) = $seed_id
+              AND (consumer:File OR consumer:Function OR consumer:Module OR consumer:Type OR consumer:Repository)
+              {repo_filter}
+            RETURN
+              consumer.name                                             AS name,
+              coalesce(consumer.filepath, consumer.path, '')            AS filepath,
+              coalesce(consumer.repo, '')                               AS repo,
+              coalesce(consumer.code, '')                               AS code,
+              type(rel)                                                 AS rel_type,
+              labels(consumer)[0]                                       AS seed_label
+            LIMIT 30
+            """
+            try:
+                with driver.session() as session:
+                    detail_rows = session.run(
+                        detailed_consumer_cypher,
+                        seed_id=seed_id,
+                        selected_repos=selected_repos or [],
+                    ).data()
+                logger.info(
+                    "[IMPACT] Seed id=%s (%s) → %d detailed consumer(s) fetched.",
+                    seed_id, seed_name, len(detail_rows),
+                )
+            except Exception as exc:
+                logger.warning("[IMPACT] Detailed consumer query for seed id=%s failed: %s", seed_id, exc)
+                detail_rows = []
+
+            for row in detail_rows:
+                c_name = row.get("name") or ""
+                c_path = row.get("filepath") or ""
+                c_repo = row.get("repo") or ""
+                c_code = row.get("code") or ""
+                c_rel  = row.get("rel_type") or "DEPENDS_ON"
+                c_lbl  = row.get("seed_label") or "Node"
+                
+                uid = f"detail::{c_repo}::{c_path}::{c_name}::{c_rel}"
+                if uid not in seen_ids:
+                    seen_ids.add(uid)
+                    results.append({
+                        "name":     c_name,
+                        "filepath": c_path,
+                        "repo":     c_repo,
+                        "rel_type": c_rel,
+                        "code":     c_code,
+                        "connected": [],
+                    })
+
             # ── Cross-Repo Multi-Hop Traversal ─────────────────────────────────
             multihop_cypher = f"""
-            MATCH (entry:Function)-[:CALLS|DISPATCHES_TO|FORWARDS_TO*1..3]->(callee:Function)-[:CALLS|DEPENDS_ON|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD]->(seed)
+            MATCH (entry:Function)-[:CALLS|DISPATCHES_TO|FORWARDS_TO*1..3]->(callee:Function)-[:CALLS|DEPENDS_ON|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD|DECLARES|DECLARES_TYPE|DECLARES_VAR|HAS_DIRECTIVE|PROPAGATES_ERROR|RETURNS|CONSTRAINED_BY|CHAN_ELEM_TYPE|TESTS|GENERATES_TYPE|GENERATES_FILE]->(seed)
             WHERE elementId(seed) = $seed_id
               AND (
                   coalesce(entry.repo, '') <> coalesce(seed.repo, '') 
@@ -388,7 +491,7 @@ def _run_impact_traversal(
                     })
 
             reverse_cypher = f"""
-            MATCH (seed)-[rel:DEPENDS_ON|CALLS|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD]->(dep)
+            MATCH (seed)-[rel:DEPENDS_ON|CALLS|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD|DECLARES|DECLARES_TYPE|DECLARES_VAR|HAS_DIRECTIVE|PROPAGATES_ERROR|RETURNS|CONSTRAINED_BY|CHAN_ELEM_TYPE|TESTS|GENERATES_TYPE|GENERATES_FILE]->(dep)
             WHERE elementId(seed) = $seed_id
               AND (dep:File OR dep:Function OR dep:Module OR dep:Type OR dep:Repository)
               {repo_filter.replace('consumer.', 'dep.')}
@@ -474,6 +577,10 @@ def _run_structural_traversal(
           coalesce(iface.repo, '')                                   AS iface_repo,
           coalesce(iface.method_names, [])                          AS iface_method_names,
           iface_methods
+        ORDER BY 
+          case when toLower(coalesce(iface.name, '')) = toLower($subject) then 0 else 1 end,
+          case when iface:Type then 0 else 1 end,
+          size(coalesce(iface.code, '')) DESC
         LIMIT 30
         """
         try:
@@ -543,15 +650,16 @@ def _run_structural_traversal(
             iface_name = iface.get("iface_name") or subject
 
             impl_cypher = f"""
-            MATCH (impl:Type)-[:IMPLEMENTS]->(iface)
+            MATCH (impl:Type)-[rel:IMPLEMENTS|EMBEDS]->(iface)
             WHERE elementId(iface) = $iface_id
               {target_repo_filter}
             OPTIONAL MATCH (impl)-[:DECLARES_METHOD]->(meth:Function)
-            WITH impl,
+            WITH impl, rel,
                  collect(DISTINCT {{
                    name: meth.name,
                    path: coalesce(meth.filepath, meth.path, ''),
-                   code: coalesce(meth.code, '')
+                   code: coalesce(meth.code, ''),
+                   is_pointer_receiver: meth.is_pointer_receiver
                  }})[..12] AS declared_methods
             RETURN
               impl.name                                   AS name,
@@ -560,6 +668,7 @@ def _run_structural_traversal(
               impl.kind                                   AS kind,
               coalesce(impl.code, '')                     AS code,
               impl.method_names                           AS impl_method_names,
+              type(rel)                                   AS rel_type_raw,
               declared_methods
             ORDER BY size(coalesce(impl.code, '')) DESC
             LIMIT 20
@@ -572,7 +681,7 @@ def _run_structural_traversal(
                         target_repos=target_repos or [],
                     ).data()
                 logger.info(
-                    "[STRUCTURAL] iface=%r → %d implementor(s).", iface_name, len(impl_rows)
+                    "[STRUCTURAL] iface=%r → %d implementor(s)/composition(s).", iface_name, len(impl_rows)
                 )
             except Exception as exc:
                 logger.warning("[STRUCTURAL] Implementor query for iface %r failed: %s", iface_name, exc)
@@ -583,15 +692,16 @@ def _run_structural_traversal(
                 if uid not in seen_ids:
                     seen_ids.add(uid)
                     connected = [
-                        {"name": m.get("name"), "path": m.get("path"), "code": m.get("code")}
+                        {"name": m.get("name"), "path": m.get("path"), "code": m.get("code"), "is_pointer_receiver": m.get("is_pointer_receiver")}
                         for m in (row.get("declared_methods") or [])
                         if m.get("name")
                     ]
+                    rel_type_raw = row.get("rel_type_raw") or "IMPLEMENTS"
                     results.append({
                         "name":      row.get("name") or "<unknown>",
                         "filepath":  row.get("filepath") or "",
                         "repo":      row.get("repo") or "",
-                        "rel_type":  f"IMPLEMENTS_{iface_name.upper()}",
+                        "rel_type":  f"{rel_type_raw}_{iface_name.upper()}",
                         "code":      row.get("code") or "",
                         "connected": connected,
                     })
@@ -924,7 +1034,7 @@ def retrieve_code_context(
         YIELD node, score
         WITH node, score
         WHERE node.code IS NOT NULL {repo_clause}
-        OPTIONAL MATCH (node)-[:CALLS|DEPENDS_ON|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD]->(connected)
+        OPTIONAL MATCH (node)-[r:CALLS|DEPENDS_ON|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD]->(connected)
         WHERE (connected:Function OR connected:File OR connected:Type)
           AND connected.code IS NOT NULL
           {"AND (connected.repo IN $selected_repos OR connected.full_name IN $selected_repos OR connected.name IN $selected_repos)" if selected_repos else ""}
@@ -933,13 +1043,24 @@ def retrieve_code_context(
              collect(DISTINCT {{
                name:     connected.name,
                path:     coalesce(connected.filepath, connected.path),
-               code:     connected.code
+               code:     connected.code,
+               call_type: coalesce(r.call_type, '')
              }})[..4] AS connected_nodes
         RETURN
           node.name                                          AS name,
           coalesce(node.filepath, node.path)                 AS filepath,
           node.code                                          AS code,
           connected_nodes                                    AS connected,
+          node.accepts_context                               AS accepts_context,
+          node.lock_sequence                                 AS lock_sequence,
+          node.channels_sent                                 AS channels_sent,
+          node.channels_received                             AS channels_received,
+          node.is_test                                       AS is_test,
+          node.is_pointer_receiver                           AS is_pointer_receiver,
+          node.propagated_errors                             AS propagated_errors,
+          node.return_types                                  AS return_types,
+          node.type_parameters                               AS type_parameters,
+          node.repo                                          AS repo,
           score
         ORDER BY score DESC
         LIMIT $top_k
@@ -993,6 +1114,10 @@ def retrieve_code_context(
           coalesce(node.filepath, node.repo, '') AS filepath,
           '(type: ' + node.name + ' [' + coalesce(node.kind, '') + '])\\n' + coalesce(node.code, '') AS code,
           connected_nodes                        AS connected,
+          node.tag_mappings                      AS tag_mappings,
+          node.fields                            AS fields,
+          node.type_parameters                   AS type_parameters,
+          node.repo                              AS repo,
           score
         ORDER BY score DESC
         LIMIT $mod_top_k
@@ -1011,6 +1136,9 @@ def retrieve_code_context(
           coalesce(node.filepath, node.repo, '') AS filepath,
           '(var: ' + node.name + ' [' + coalesce(node.kind, '') + '])\\n' + coalesce(node.code, '') AS code,
           []                                     AS connected,
+          node.chan_elem_type                    AS chan_elem_type,
+          node.kind                              AS kind,
+          node.repo                              AS repo,
           score
         ORDER BY score DESC
         LIMIT $mod_top_k
@@ -1103,7 +1231,7 @@ def retrieve_code_context(
             hint_cypher = f"""
             MATCH (fn)
             WHERE (fn:Function OR fn:Type OR fn:Variable)
-              AND toLower(fn.filepath) CONTAINS toLower($hint)
+              AND (toLower(fn.filepath) CONTAINS toLower($hint) OR toLower(fn.name) CONTAINS toLower($hint))
               AND fn.code IS NOT NULL
               {repo_filter_clause}
             RETURN
@@ -1139,6 +1267,453 @@ def retrieve_code_context(
             )
     else:
         logger.info("[RETRIEVE] Stage 2 skipped — no path hints in query.")
+
+    # ── Stage 2.5: Targeted metadata and intent lookups ───────────────────────
+    q_lower = user_query.lower()
+    
+    # 2.5a: Concurrency
+    if intent.wants_concurrency:
+        logger.info("[RETRIEVE] Stage 2.5a — Concurrency targeted lookup triggered.")
+        channel_name = None
+        for s in (intent.subjects + intent.field_hints):
+            if s and s not in ["channel", "channels", "goroutine", "goroutines", "mutex", "lock", "unlock", "context", "defer", "imbalance"]:
+                channel_name = s
+                break
+        if not channel_name:
+            match = re.search(r'\b(?:channel|chan)\s+(?:named\s+)?([a-zA-Z0-9_]+)\b', user_query, re.IGNORECASE)
+            if match:
+                channel_name = match.group(1)
+        
+        repo_filter_clause = (
+            "AND (f.repo IN $selected_repos OR f.full_name IN $selected_repos OR f.name IN $selected_repos)"
+            if selected_repos else ""
+        )
+        if channel_name:
+            concurrency_cypher = f"""
+            MATCH (f:Function)
+            WHERE ($channel IN f.channels_sent OR $channel IN f.channels_received)
+               OR f.accepts_context = true
+               OR size(f.lock_sequence) > 0
+            {repo_filter_clause}
+            RETURN
+              f.name AS name,
+              coalesce(f.filepath, f.path, '') AS filepath,
+              coalesce(f.repo, '') AS repo,
+              coalesce(f.code, '') AS code,
+              f.lock_sequence AS lock_sequence,
+              f.channels_sent AS channels_sent,
+              f.channels_received AS channels_received,
+              f.accepts_context AS accepts_context,
+              'CONCURRENCY_METADATA' AS rel_type,
+              'Function' AS seed_label
+            LIMIT 30
+            """
+            params = {"channel": channel_name, "selected_repos": selected_repos or []}
+        else:
+            concurrency_cypher = f"""
+            MATCH (f:Function)
+            WHERE f.accepts_context = true
+               OR size(f.lock_sequence) > 0
+               OR size(f.channels_sent) > 0
+               OR size(f.channels_received) > 0
+            {repo_filter_clause}
+            RETURN
+              f.name AS name,
+              coalesce(f.filepath, f.path, '') AS filepath,
+              coalesce(f.repo, '') AS repo,
+              coalesce(f.code, '') AS code,
+              f.lock_sequence AS lock_sequence,
+              f.channels_sent AS channels_sent,
+              f.channels_received AS channels_received,
+              f.accepts_context AS accepts_context,
+              'CONCURRENCY_METADATA' AS rel_type,
+              'Function' AS seed_label
+            LIMIT 30
+            """
+            params = {"selected_repos": selected_repos or []}
+            
+        try:
+            with driver.session() as session:
+                concurrency_rows = session.run(concurrency_cypher, **params).data()
+            if concurrency_rows:
+                context_parts.append(_build_context_block(concurrency_rows, "concurrency-metadata", global_seen=global_seen_ids))
+                retrieval_path_tags.append("concurrency-metadata")
+        except Exception as exc:
+            logger.warning("[RETRIEVE] Stage 2.5a concurrency targeted lookup failed: %s", exc)
+
+    # 2.5b: Error Propagation
+    if any(kw in q_lower for kw in ["propagate", "propagation", "error chain", "error propagation"]):
+        logger.info("[RETRIEVE] Stage 2.5b — Error propagation targeted lookup triggered.")
+        prop_subjects = intent.subjects or _extract_impact_subjects(user_query)
+        if prop_subjects:
+            repo_filter_clause = (
+                "AND (f.repo IN $selected_repos OR f.full_name IN $selected_repos)"
+                if selected_repos else ""
+            )
+            prop_cypher = f"""
+            MATCH path = (f:Function)-[:PROPAGATES_ERROR*1..3]->(seed:Function)
+            WHERE toLower(seed.name) = toLower($subject) OR toLower(seed.filepath) CONTAINS toLower($subject)
+              {repo_filter_clause.replace('f.', 'seed.')}
+            RETURN
+              f.name AS name,
+              coalesce(f.filepath, f.path, '') AS filepath,
+              coalesce(f.repo, '') AS repo,
+              coalesce(f.code, '') AS code,
+              f.propagated_errors AS propagated_errors,
+              'PROPAGATES_ERROR' AS rel_type,
+              'Function' AS seed_label
+            LIMIT 20
+            UNION
+            MATCH path = (seed:Function)-[:PROPAGATES_ERROR*1..3]->(f:Function)
+            WHERE toLower(seed.name) = toLower($subject) OR toLower(seed.filepath) CONTAINS toLower($subject)
+              {repo_filter_clause.replace('f.', 'seed.')}
+            RETURN
+              f.name AS name,
+              coalesce(f.filepath, f.path, '') AS filepath,
+              coalesce(f.repo, '') AS repo,
+              coalesce(f.code, '') AS code,
+              f.propagated_errors AS propagated_errors,
+              'PROPAGATES_ERROR' AS rel_type,
+              'Function' AS seed_label
+            LIMIT 20
+            """
+            try:
+                with driver.session() as session:
+                    for subj in prop_subjects:
+                        prop_rows = session.run(prop_cypher, subject=subj, selected_repos=selected_repos or []).data()
+                        if prop_rows:
+                            context_parts.append(_build_context_block(prop_rows, "error-propagation-chain", global_seen=global_seen_ids))
+                            retrieval_path_tags.append("error-propagation")
+            except Exception as exc:
+                logger.warning("[RETRIEVE] Stage 2.5b error propagation lookup failed: %s", exc)
+
+    # 2.5c: Test coverage / tests lookup
+    if intent.wants_test_coverage:
+        logger.info("[RETRIEVE] Stage 2.5c — Test coverage targeted lookup triggered.")
+        test_subjects = intent.subjects or _extract_impact_subjects(user_query)
+        repo_filter_clause = (
+            "AND (fn.repo IN $selected_repos OR fn.full_name IN $selected_repos)"
+            if selected_repos else ""
+        )
+        test_cypher = f"""
+        MATCH (fn:Function)-[:TESTS]->(target)
+        WHERE (toLower(target.name) CONTAINS toLower($subject) OR toLower(fn.name) CONTAINS toLower($subject))
+          {repo_filter_clause}
+        RETURN
+          fn.name AS name,
+          coalesce(fn.filepath, fn.path, '') AS filepath,
+          coalesce(fn.repo, '') AS repo,
+          coalesce(fn.code, '') AS code,
+          fn.is_test AS is_test,
+          'TESTS' AS rel_type,
+          'Function' AS seed_label
+        LIMIT 20
+        """
+        test_direct_cypher = f"""
+        MATCH (fn:Function)
+        WHERE fn.is_test = true
+          AND (toLower(fn.name) CONTAINS toLower($subject) OR toLower(fn.filepath) CONTAINS toLower($subject))
+          {repo_filter_clause}
+        RETURN
+          fn.name AS name,
+          coalesce(fn.filepath, fn.path, '') AS filepath,
+          coalesce(fn.repo, '') AS repo,
+          coalesce(fn.code, '') AS code,
+          fn.is_test AS is_test,
+          'TEST_FUNCTION' AS rel_type,
+          'Function' AS seed_label
+        LIMIT 20
+        """
+        try:
+            with driver.session() as session:
+                for subj in test_subjects:
+                    test_rows = session.run(test_cypher, subject=subj, selected_repos=selected_repos or []).data()
+                    test_direct_rows = session.run(test_direct_cypher, subject=subj, selected_repos=selected_repos or []).data()
+                    combined_test_rows = test_rows + test_direct_rows
+                    if combined_test_rows:
+                        context_parts.append(_build_context_block(combined_test_rows, "test-coverage", global_seen=global_seen_ids))
+                        retrieval_path_tags.append("test-coverage")
+        except Exception as exc:
+            logger.warning("[RETRIEVE] Stage 2.5c tests lookup failed: %s", exc)
+
+    # 2.5d: Return types / RETURNS lookup
+    if intent.wants_schema or intent.wants_structural or any(kw in q_lower for kw in ["return type", "returns", "return a", "returns a"]):
+        logger.info("[RETRIEVE] Stage 2.5d — Return types targeted lookup triggered.")
+        return_subjects = intent.subjects or _extract_impact_subjects(user_query)
+        repo_filter_clause = (
+            "AND (fn.repo IN $selected_repos OR fn.full_name IN $selected_repos)"
+            if selected_repos else ""
+        )
+        return_cypher = f"""
+        MATCH (fn:Function)-[:RETURNS]->(t:Type)
+        WHERE (toLower(t.name) CONTAINS toLower($subject) OR toLower(fn.name) CONTAINS toLower($subject))
+          {repo_filter_clause}
+        RETURN
+          fn.name AS name,
+          coalesce(fn.filepath, fn.path, '') AS filepath,
+          coalesce(fn.repo, '') AS repo,
+          coalesce(fn.code, '') AS code,
+          fn.return_types AS return_types,
+          'RETURNS' AS rel_type,
+          'Function' AS seed_label
+        LIMIT 20
+        """
+        try:
+            with driver.session() as session:
+                for subj in return_subjects:
+                    if subj not in ["error", "type"]:
+                        ret_rows = session.run(return_cypher, subject=subj, selected_repos=selected_repos or []).data()
+                        if ret_rows:
+                            context_parts.append(_build_context_block(ret_rows, "return-types", global_seen=global_seen_ids))
+                            retrieval_path_tags.append("return-types")
+                            
+                # Handle "error" type returns specially
+                if any(kw in q_lower for kw in ["return an error", "returns error", "returns an error", "return error"]):
+                    error_return_cypher = f"""
+                    MATCH (fn:Function)
+                    WHERE "error" IN fn.return_types
+                      {repo_filter_clause}
+                    RETURN
+                      fn.name AS name,
+                      coalesce(fn.filepath, fn.path, '') AS filepath,
+                      coalesce(fn.repo, '') AS repo,
+                      coalesce(fn.code, '') AS code,
+                      fn.return_types AS return_types,
+                      'RETURNS_ERROR' AS rel_type,
+                      'Function' AS seed_label
+                    LIMIT 20
+                    """
+                    err_ret_rows = session.run(error_return_cypher, selected_repos=selected_repos or []).data()
+                    if err_ret_rows:
+                        context_parts.append(_build_context_block(err_ret_rows, "error-return-types", global_seen=global_seen_ids))
+                        retrieval_path_tags.append("error-return-types")
+        except Exception as exc:
+            logger.warning("[RETRIEVE] Stage 2.5d return-types lookup failed: %s", exc)
+
+    # 2.5e: Generics / CONSTRAINED_BY lookup
+    if intent.wants_structural or any(kw in q_lower for kw in ["generic", "generics", "constraint", "constraints", "constrained by", "comparable"]):
+        logger.info("[RETRIEVE] Stage 2.5e — Generics targeted lookup triggered.")
+        generic_subjects = intent.subjects or _extract_impact_subjects(user_query)
+        repo_filter_clause = (
+            "AND (t.repo IN $selected_repos OR t.full_name IN $selected_repos)"
+            if selected_repos else ""
+        )
+        generics_cypher = f"""
+        MATCH (t:Type)-[rel:CONSTRAINED_BY]->(constraint:Type)
+        WHERE (toLower(t.name) CONTAINS toLower($subject) OR toLower(constraint.name) CONTAINS toLower($subject))
+          {repo_filter_clause}
+        RETURN
+          t.name AS name,
+          coalesce(t.filepath, t.repo, '') AS filepath,
+          coalesce(t.repo, '') AS repo,
+          coalesce(t.code, '') AS code,
+          t.type_parameters AS type_parameters,
+          constraint.name AS constraint_name,
+          'CONSTRAINED_BY' AS rel_type,
+          'Type' AS seed_label
+        LIMIT 20
+        """
+        direct_generics_cypher = f"""
+        MATCH (node)
+        WHERE (node:Type OR node:Function)
+          AND node.type_parameters IS NOT NULL
+          AND node.type_parameters <> ""
+          AND node.type_parameters <> "null"
+          AND node.type_parameters <> "[]"
+          {repo_filter_clause.replace('t.', 'node.')}
+        RETURN
+          node.name AS name,
+          coalesce(node.filepath, node.path, '') AS filepath,
+          coalesce(node.repo, '') AS repo,
+          coalesce(node.code, '') AS code,
+          node.type_parameters AS type_parameters,
+          'GENERIC_DEFINITION' AS rel_type,
+          labels(node)[0] AS seed_label
+        LIMIT 20
+        """
+        try:
+            with driver.session() as session:
+                for subj in (generic_subjects or [""]):
+                    gen_rows = session.run(generics_cypher, subject=subj, selected_repos=selected_repos or []).data()
+                    if gen_rows:
+                        context_parts.append(_build_context_block(gen_rows, "generics-constraints", global_seen=global_seen_ids))
+                        retrieval_path_tags.append("generics-constraints")
+                direct_gen_rows = session.run(direct_generics_cypher, selected_repos=selected_repos or []).data()
+                if direct_gen_rows:
+                    context_parts.append(_build_context_block(direct_gen_rows, "generic-definitions", global_seen=global_seen_ids))
+                    retrieval_path_tags.append("generic-definitions")
+        except Exception as exc:
+            logger.warning("[RETRIEVE] Stage 2.5e generics lookup failed: %s", exc)
+
+    # 2.5f: Struct tag / schema mapping lookup
+    if intent.wants_schema:
+        logger.info("[RETRIEVE] Stage 2.5f — Struct tag / schema targeted lookup triggered.")
+        schema_subjects = intent.subjects + intent.field_hints
+        tag_queries = []
+        for tag in ["json", "yaml", "xml", "bson", "db", "toml", "mapstructure"]:
+            if tag in q_lower:
+                tag_queries.append(tag)
+        for s in schema_subjects:
+            if s and s not in ["json", "bson", "db", "tag", "tags", "struct", "field", "fields", "table", "mapping", "hugo", "cobra"]:
+                tag_queries.append(s)
+        quoted_matches = re.findall(r'[\'"`]([^\'"`]+)[\'"`]', user_query)
+        tag_queries.extend(quoted_matches)
+        tag_queries = list(dict.fromkeys(tag_queries))
+        
+        repo_filter_clause = (
+            "AND (t.repo IN $selected_repos OR t.full_name IN $selected_repos)"
+            if selected_repos else ""
+        )
+        tag_cypher = f"""
+        MATCH (t:Type)
+        WHERE t.code IS NOT NULL
+          AND (
+            toLower(coalesce(t.tag_mappings, '')) CONTAINS toLower($tag)
+            OR toLower(t.code) CONTAINS toLower($tag)
+          )
+          {repo_filter_clause}
+        RETURN
+          t.name AS name,
+          coalesce(t.filepath, t.repo, '') AS filepath,
+          coalesce(t.repo, '') AS repo,
+          coalesce(t.code, '') AS code,
+          t.tag_mappings AS tag_mappings,
+          t.fields AS fields,
+          'STRUCT_TAG_MAPPING' AS rel_type,
+          'Type' AS seed_label
+        LIMIT 20
+        """
+        try:
+            with driver.session() as session:
+                for tag in tag_queries:
+                    tag_rows = session.run(tag_cypher, tag=tag, selected_repos=selected_repos or []).data()
+                    if tag_rows:
+                        context_parts.append(_build_context_block(tag_rows, f"schema-tag-{tag}", global_seen=global_seen_ids))
+                        retrieval_path_tags.append(f"schema-tag-{tag}")
+        except Exception as exc:
+            logger.warning("[RETRIEVE] Stage 2.5f struct tag lookup failed: %s", exc)
+
+    # 2.5g: Directives / Compiler directives
+    if intent.wants_directive:
+        logger.info("[RETRIEVE] Stage 2.5g — Directive targeted lookup triggered.")
+        repo_filter_clause = (
+            "AND (d.repo IN $selected_repos OR d.full_name IN $selected_repos)"
+            if selected_repos else ""
+        )
+        dir_terms = []
+        for term in ["go:build", "go:generate", "go:embed", "embed", "generate", "build"]:
+            if term in q_lower:
+                dir_terms.append(term)
+        for word in intent.subjects + intent.field_hints:
+            if word not in ["directive", "directives", "file", "files", "code", "tag", "tags"]:
+                dir_terms.append(word)
+        dir_terms = list(dict.fromkeys(dir_terms))
+        if not dir_terms:
+            dir_terms = [""]
+            
+        directive_cypher = f"""
+        MATCH (d:Directive)
+        WHERE (
+            any(term IN $terms WHERE toLower(d.directive) CONTAINS term OR toLower(coalesce(d.args, '')) CONTAINS term)
+            OR $terms = ['']
+        )
+        {repo_filter_clause}
+        OPTIONAL MATCH (f)-[r:HAS_DIRECTIVE|GENERATES_TYPE|GENERATES_FILE]->(d)
+        WITH d, collect(DISTINCT {{
+            name: coalesce(f.name, f.path, ''),
+            path: coalesce(f.filepath, f.path, ''),
+            code: coalesce(f.code, ''),
+            rel: type(r)
+        }})[..5] AS connected_nodes
+        RETURN
+          d.directive AS name,
+          coalesce(d.filepath, d.path, '') AS filepath,
+          coalesce(d.repo, '') AS repo,
+          coalesce(d.args, '') AS code,
+          connected_nodes AS connected,
+          'Directive' AS seed_label,
+          'DIRECTIVE_METADATA' AS rel_type
+        LIMIT 30
+        """
+        try:
+            with driver.session() as session:
+                dir_rows = session.run(directive_cypher, terms=[t.lower() for t in dir_terms], selected_repos=selected_repos or []).data()
+                if dir_rows:
+                    context_parts.append(_build_context_block(dir_rows, "compiler-directives", allow_no_code=True, global_seen=global_seen_ids))
+                    retrieval_path_tags.append("directives")
+        except Exception as exc:
+            logger.warning("[RETRIEVE] Stage 2.5g directive lookup failed: %s", exc)
+
+    # 2.5h: Variables / Constants
+    if intent.wants_concurrency or any(kw in q_lower for kw in ["variable", "variables", "constant", "constants", "global", "globals", "errchan", "chan_elem_type"]):
+        logger.info("[RETRIEVE] Stage 2.5h — Variable targeted lookup triggered.")
+        var_subjects = intent.subjects + intent.field_hints
+        var_subjects = [s for s in var_subjects if s and s not in ["variable", "variables", "constant", "constants", "global", "globals", "chan", "channel"]]
+        
+        repo_filter_clause = (
+            "AND (v.repo IN $selected_repos OR v.full_name IN $selected_repos)"
+            if selected_repos else ""
+        )
+        if any(kw in q_lower for kw in ["channel variable", "channel variables", "carry", "chan variable", "chan variables"]):
+            var_cypher = f"""
+            MATCH (v:Variable)
+            WHERE v.chan_elem_type IS NOT NULL AND v.chan_elem_type <> ""
+              {repo_filter_clause}
+            RETURN
+              v.name AS name,
+              coalesce(v.filepath, v.repo, '') AS filepath,
+              coalesce(v.repo, '') AS repo,
+              v.code AS code,
+              v.kind AS kind,
+              v.chan_elem_type AS chan_elem_type,
+              'Variable' AS seed_label,
+              'GLOBAL_VARIABLE' AS rel_type
+            LIMIT 20
+            """
+            params = {"selected_repos": selected_repos or []}
+        elif var_subjects:
+            var_cypher = f"""
+            MATCH (v:Variable)
+            WHERE any(subj IN $subjects WHERE toLower(v.name) CONTAINS toLower(subj))
+              {repo_filter_clause}
+            RETURN
+              v.name AS name,
+              coalesce(v.filepath, v.repo, '') AS filepath,
+              coalesce(v.repo, '') AS repo,
+              v.code AS code,
+              v.kind AS kind,
+              v.chan_elem_type AS chan_elem_type,
+              'Variable' AS seed_label,
+              'GLOBAL_VARIABLE' AS rel_type
+            LIMIT 20
+            """
+            params = {"subjects": var_subjects, "selected_repos": selected_repos or []}
+        else:
+            var_cypher = f"""
+            MATCH (v:Variable)
+            WHERE v.kind = "const" OR v.name =~ '^[A-Z].*'
+              {repo_filter_clause}
+            RETURN
+              v.name AS name,
+              coalesce(v.filepath, v.repo, '') AS filepath,
+              coalesce(v.repo, '') AS repo,
+              v.code AS code,
+              v.kind AS kind,
+              v.chan_elem_type AS chan_elem_type,
+              'Variable' AS seed_label,
+              'GLOBAL_VARIABLE' AS rel_type
+            LIMIT 20
+            """
+            params = {"selected_repos": selected_repos or []}
+            
+        try:
+            with driver.session() as session:
+                var_rows = session.run(var_cypher, **params).data()
+                if var_rows:
+                    context_parts.append(_build_context_block(var_rows, "variables-metadata", global_seen=global_seen_ids))
+                    retrieval_path_tags.append("variables-metadata")
+        except Exception as exc:
+            logger.warning("[RETRIEVE] Stage 2.5h variable lookup failed: %s", exc)
 
     # ── Stage 3: Commit retrieval ──────────────────────────────────────────────
     _query_lower = user_query.lower()
@@ -1194,6 +1769,7 @@ def retrieve_code_context(
                 RETURN
                   c.sha                          AS name,
                   r.full_name                    AS filepath,
+                  coalesce(u.login, 'unknown')   AS author,
                   coalesce(c.message, c.summary_text, c.diff_text, '') AS code,
                   []                             AS connected
                 ORDER BY c.timestamp DESC
@@ -1203,9 +1779,11 @@ def retrieve_code_context(
             else:
                 recency_cypher = """
                 MATCH (c:Commit)-[:BELONGS_TO]->(r:Repository)
+                OPTIONAL MATCH (u:User)-[:AUTHORED]->(c)
                 RETURN
                   c.sha       AS name,
                   r.full_name AS filepath,
+                  coalesce(u.login, 'unknown')   AS author,
                   coalesce(c.message, c.summary_text, c.diff_text, '') AS code,
                   []          AS connected
                 ORDER BY c.timestamp DESC
@@ -1216,9 +1794,11 @@ def retrieve_code_context(
                     recency_cypher = """
                     MATCH (c:Commit)-[:BELONGS_TO]->(r:Repository)
                     WHERE r.full_name IN $selected_repos
+                    OPTIONAL MATCH (u:User)-[:AUTHORED]->(c)
                     RETURN
                       c.sha       AS name,
                       r.full_name AS filepath,
+                      coalesce(u.login, 'unknown')   AS author,
                       coalesce(c.message, c.summary_text, c.diff_text, '') AS code,
                       []          AS connected
                     ORDER BY c.timestamp DESC
@@ -1473,10 +2053,14 @@ def retrieve_code_context(
         blame_rows: list[dict] = []
 
         for filepath in semantic_filepaths:
+            normalized_fp = filepath.lstrip("./").lstrip("/")
             if selected_repos:
                 blame_fp_cypher = """
                 MATCH (u:User)-[:AUTHORED]->(c:Commit)-[:MODIFIED]->(f:File)
-                WHERE f.path = $filepath
+                WHERE f.path = $filepath 
+                   OR f.path = $normalized_fp 
+                   OR f.path = "./" + $normalized_fp 
+                   OR f.path ENDS WITH "/" + $normalized_fp
                 MATCH (c)-[:BELONGS_TO]->(r:Repository)
                 WHERE r.full_name IN $selected_repos
                 RETURN
@@ -1492,7 +2076,10 @@ def retrieve_code_context(
             else:
                 blame_fp_cypher = """
                 MATCH (u:User)-[:AUTHORED]->(c:Commit)-[:MODIFIED]->(f:File)
-                WHERE f.path = $filepath
+                WHERE f.path = $filepath 
+                   OR f.path = $normalized_fp 
+                   OR f.path = "./" + $normalized_fp 
+                   OR f.path ENDS WITH "/" + $normalized_fp
                 RETURN
                   u.login       AS author,
                   c.sha         AS commit_sha,
@@ -1508,6 +2095,7 @@ def retrieve_code_context(
                     rows = session.run(
                         blame_fp_cypher,
                         filepath=filepath,
+                        normalized_fp=normalized_fp,
                         selected_repos=selected_repos or [],
                     ).data()
                 logger.info(
@@ -1520,7 +2108,10 @@ def retrieve_code_context(
             if selected_repos:
                 blame_fn_cypher = """
                 MATCH (u:User)-[:AUTHORED]->(c:Commit)-[:MODIFIED]->(fn:Function)
-                WHERE fn.filepath = $filepath
+                WHERE fn.filepath = $filepath 
+                   OR fn.filepath = $normalized_fp 
+                   OR fn.filepath = "./" + $normalized_fp 
+                   OR fn.filepath ENDS WITH "/" + $normalized_fp
                 MATCH (c)-[:BELONGS_TO]->(r:Repository)
                 WHERE r.full_name IN $selected_repos
                 RETURN
@@ -1536,7 +2127,10 @@ def retrieve_code_context(
             else:
                 blame_fn_cypher = """
                 MATCH (u:User)-[:AUTHORED]->(c:Commit)-[:MODIFIED]->(fn:Function)
-                WHERE fn.filepath = $filepath
+                WHERE fn.filepath = $filepath 
+                   OR fn.filepath = $normalized_fp 
+                   OR fn.filepath = "./" + $normalized_fp 
+                   OR fn.filepath ENDS WITH "/" + $normalized_fp
                 RETURN
                   u.login       AS author,
                   c.sha         AS commit_sha,
@@ -1552,6 +2146,7 @@ def retrieve_code_context(
                     rows = session.run(
                         blame_fn_cypher,
                         filepath=filepath,
+                        normalized_fp=normalized_fp,
                         selected_repos=selected_repos or [],
                     ).data()
                 logger.info(

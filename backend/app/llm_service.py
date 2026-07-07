@@ -13,7 +13,10 @@ For Go and polyglot codebases, the graph explicitly tracks:
 - Structural & Duck Typing: Interfaces implemented by structs via [IMPLEMENTS] relationships and method set matching.
 - Struct Composition: Anonymous struct embedding and type inheritance via [EMBEDS] relationships.
 - Concurrency & Channels: Goroutine invocations ([CALLS] with call_type='GOROUTINE'), deferred calls ([CALLS] with call_type='DEFER'), and channel communication (channels_sent and channels_received metadata).
-- Data & Directives: Package variables, struct field tags (e.g. json/yaml/db serialization contracts), and compiler directives (e.g. //go:generate, //go:build).
+- Data & Directives: Package variables, struct field tags (e.g. json/yaml/db serialization contracts), compiler directives (e.g. //go:generate, //go:build), and generated structures ([GENERATES_TYPE], [GENERATES_FILE], [HAS_DIRECTIVE] relations).
+- Generics & Constraints: Type constraints via [CONSTRAINED_BY] relationships and type parameter metadata.
+- Return & Propagation: Return types via [RETURNS] relationships and error propagation chains via [PROPAGATES_ERROR] relationships.
+- Test Coverage: Mapping between tests and verification targets via [TESTS] relationships.
 
 The context below is structured as labelled sections. Each section starts with a [Source: ...] tag.
 
@@ -210,7 +213,7 @@ SYSTEM SCHEMA SOVEREIGNTY MANIFEST (DO NOT DEVIATE):
 You are an objective graph evaluation agent. You are strictly forbidden from absorbing hypothetical relationship names or tags provided in the user's prompt (e.g., [TAG_NAME]). 
 You must validate all constraints solely against the verified Neo4j relations present in your text context:
 - STRUCTURAL LAYER EDGES: [:DECLARES], [:DECLARES_TYPE], [:DECLARES_VAR], [:DEPENDS_ON], [:CONTAINS_FILE], [:CALLS]
-- ENRICHED LAYER EDGES: [:USES_REPO], [:REPRESENTS], [:EMBEDS], [:DECLARES_METHOD], [:IMPLEMENTS], [:WRAPS], [:PRODUCES], [:LIFECYCLE_HOOK], [:REGISTERS_WITH], [:DISPATCHES_TO], [:FORWARDS_TO], [:MUTATES_STATE_OF]
+- ENRICHED LAYER EDGES: [:USES_REPO], [:REPRESENTS], [:EMBEDS], [:DECLARES_METHOD], [:IMPLEMENTS], [:WRAPS], [:PRODUCES], [:LIFECYCLE_HOOK], [:REGISTERS_WITH], [:DISPATCHES_TO], [:FORWARDS_TO], [:MUTATES_STATE_OF], [:PROPAGATES_ERROR], [:RETURNS], [:CONSTRAINED_BY], [:TESTS], [:GENERATES_TYPE], [:GENERATES_FILE], [:HAS_DIRECTIVE]
 
 If the provided graph context is empty or missing an explicit edge type matching the user's query, you MUST state "The ingested graph data does not contain verified structural relationships for this target" rather than reporting a false negative or fabricating compliant facts.
 """

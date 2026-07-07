@@ -206,10 +206,6 @@ def phase2_scan_file_contents(driver, repo_full_name: str, file_paths: list, git
                     import_batch_params.append((source, target, repo_full_name))
 
                 if path.endswith(".go"):
-                    if path.endswith(_GO_TEST_SUFFIXES):
-                        with driver.session() as sess: sess.run(CYPHER_MARK_FILE_SCANNED, filepath=path, repo_full_name=repo_full_name)
-                        scanned += 1
-                        continue
                     ast_data = parse_go_ast(path, source_code)
                 elif path.endswith(".py"):
                     ast_data = parse_python_ast(path, source_code)
@@ -235,6 +231,8 @@ def phase2_scan_file_contents(driver, repo_full_name: str, file_paths: list, git
                 # --- Write Atomic Transaction Block per Component ---
                 with driver.session() as sess:
                     with sess.begin_transaction() as tx:
+                        test_functions = {f["name"] for f in funcs if f.get("is_test")}
+
                         for func, emb in zip(funcs, func_embeds):
                             qcalls = sorted(list({c[2] or c[1] for c in ast_data.get("calls", []) if c[0] == func["name"] and (len(c) > 1 and c[1])}))
                             tx.run(
@@ -242,11 +240,16 @@ def phase2_scan_file_contents(driver, repo_full_name: str, file_paths: list, git
                                 repo_full_name=repo_full_name, filepath=path, func_id=f"{repo_full_name}::{func['id']}",
                                 func_name=func["name"], func_code=func.get("code", ""), embedding=emb or None, qualified_calls=qcalls,
                                 is_exported=func.get("is_exported", False), is_pointer_receiver=func.get("is_pointer_receiver", False),
-                                channels_sent=func.get("channels_sent", []), channels_received=func.get("channels_received", [])
+                                channels_sent=func.get("channels_sent", []), channels_received=func.get("channels_received", []),
+                                return_types=func.get("return_types", []), is_test=func.get("is_test", False),
+                                accepts_context=func.get("accepts_context", False), lock_sequence=func.get("lock_sequence", []),
+                                propagated_errors=func.get("propagated_errors", [])
                             )
 
                         for call in ast_data.get("calls", []):
-                            # Fix: Pass dynamic qualified mapping token to block wide name overlaps
+                            caller_name = call[0]
+                            if caller_name in test_functions:
+                                continue
                             tx.run(
                                 CYPHER_INGEST_CALLS,
                                 caller_id=f"{repo_full_name}::{path}::{call[0]}",
@@ -254,7 +257,9 @@ def phase2_scan_file_contents(driver, repo_full_name: str, file_paths: list, git
                                 callee_qualified=call[2] if len(call) > 2 else None,
                                 caller_filepath=path,
                                 repo_full_name=repo_full_name,
-                                call_type=call[3] if len(call) > 3 else "SYNC"
+                                call_type=call[3] if len(call) > 3 else "SYNC",
+                                propagates_context=call[4] if len(call) > 4 else False,
+                                creates_cancellation_scope=call[5] if len(call) > 5 else False
                             )
 
                         for t, emb in zip(types, type_embeds):
@@ -265,7 +270,9 @@ def phase2_scan_file_contents(driver, repo_full_name: str, file_paths: list, git
                                 type_name=t["name"], kind=t["kind"], code=t.get("code", ""),
                                 fields=[json.dumps(f) for f in raw_f], field_names=[f["name"] for f in raw_f if isinstance(f, dict) and f.get("name")],
                                 methods=[json.dumps(m) for m in raw_m], method_names=[m["name"] for m in raw_m if isinstance(m, dict) and m.get("name")],
-                                tags=t.get("tags", []), embedding=emb or None, is_exported=t.get("is_exported", False)
+                                tags=t.get("tags", []), embedding=emb or None, is_exported=t.get("is_exported", False),
+                                tag_mappings=json.dumps(t.get("tag_mappings", {})),
+                                type_parameters=json.dumps(t.get("type_parameters", []))
                             )
                             for emb_n in t.get("embedded_types", []):
                                 tx.run(CYPHER_INGEST_TYPE_EMBEDDING, outer_id=f"{repo_full_name}::{t['id']}", repo_full_name=repo_full_name, inner_name=emb_n)
@@ -278,7 +285,13 @@ def phase2_scan_file_contents(driver, repo_full_name: str, file_paths: list, git
                                     tx.run(CYPHER_INGEST_IFACE_METHOD, repo_full_name=repo_full_name, filepath=path, type_id=f"{repo_full_name}::{t['id']}", method_id=f"{repo_full_name}::{path}::{scoped_m}", method_name=scoped_m, signature=m.get("signature") or "", is_exported=m_name[0].isupper())
 
                         for v, emb in zip(vars_list, var_embeds):
-                            tx.run(CYPHER_INGEST_VARIABLE, repo_full_name=repo_full_name, filepath=path, var_id=f"{repo_full_name}::{v['id']}", var_name=v["name"], kind=v["kind"], code=v.get("code", ""), embedding=emb or None, is_exported=v.get("is_exported", False))
+                            tx.run(
+                                CYPHER_INGEST_VARIABLE,
+                                repo_full_name=repo_full_name, filepath=path, var_id=f"{repo_full_name}::{v['id']}",
+                                var_name=v["name"], kind=v["kind"], code=v.get("code", ""), embedding=emb or None,
+                                is_exported=v.get("is_exported", False),
+                                chan_elem_type=v.get("chan_elem_type", "")
+                            )
 
                         for d in ast_data.get("directives", []):
                             tx.run(CYPHER_INGEST_DIRECTIVE, filepath=path, repo_full_name=repo_full_name, directive=d["directive"], args=d["args"])
@@ -350,7 +363,6 @@ def phase3_backfill_commits(driver, repo_full_name: str, github_token: str, goog
                 if c_date and datetime.strptime(c_date, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc) >= cutoff_date:
                     for item in compact_files:
                         fp = item["filename"]
-                        if fp.endswith(_GO_TEST_SUFFIXES): continue
                         try:
                             raw_data = _fetch_json(f"{GITHUB_API_BASE}/repos/{repo_full_name}/contents/{fp}?ref={sha}", github_token=github_token)
                             code = base64.b64decode(raw_data["content"]).decode("utf-8")

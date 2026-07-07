@@ -182,7 +182,57 @@ def main():
     logger.info("Connecting to Neo4j instance at %s...", uri)
     with GraphDatabase.driver(uri, auth=(user, password)) as driver:
         with driver.session() as session:
-            
+            # --- Pass 0: AST Scan Local/GitHub ---
+            if not args.dry_run:
+                if args.scan_local:
+                    logger.info("Scanning local directory %s...", args.scan_local)
+                    local_path = Path(args.scan_local)
+                    if not local_path.exists():
+                        logger.error("Local path %s does not exist.", local_path)
+                        sys.exit(1)
+                    
+                    file_items = []
+                    for p in local_path.rglob("*.go"):
+                        if p.is_file():
+                            try:
+                                rel_p = str(p.relative_to(local_path))
+                                file_items.append((rel_p, p.read_text(errors="ignore")))
+                            except Exception as e:
+                                logger.debug("Failed to read local file %s: %s", p, e)
+                    
+                    repo_name = os.environ.get("TARGET_REPO", "local/repo")
+                    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or ""
+                    _process_and_ingest_ast(session, repo_name, file_items, api_key)
+                    logger.info("Local scan and ingestion of AST completed.")
+
+                if args.scan_github:
+                    logger.info("Scanning remote GitHub repository %s...", args.scan_github)
+                    github_token = os.environ.get("GITHUB_TOKEN", "")
+                    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or ""
+                    headers = {}
+                    if github_token:
+                        headers["Authorization"] = f"token {github_token}"
+                    url = f"https://api.github.com/repos/{args.scan_github}/zipball"
+                    logger.info("Downloading zipball from %s...", url)
+                    try:
+                        r = requests.get(url, headers=headers)
+                        r.raise_for_status()
+                        z = zipfile.ZipFile(io.BytesIO(r.content))
+                        file_items = []
+                        for name in z.namelist():
+                            parts = name.split("/", 1)
+                            if len(parts) > 1 and parts[1].endswith(".go"):
+                                try:
+                                    code_str = z.read(name).decode("utf-8", errors="ignore")
+                                    file_items.append((parts[1], code_str))
+                                except Exception as e:
+                                    logger.debug("Failed to decode zip entry %s: %s", name, e)
+                        _process_and_ingest_ast(session, args.scan_github, file_items, api_key)
+                        logger.info("GitHub scan and ingestion of AST completed.")
+                    except Exception as exc:
+                        logger.error("Failed to scan GitHub repo %s: %s", args.scan_github, exc)
+                        sys.exit(1)
+
             # --- Pass 1: Structural Function Re-scan ---
             if not args.dry_run:
                 logger.info("Syncing AST functional definitions from stored text nodes...")

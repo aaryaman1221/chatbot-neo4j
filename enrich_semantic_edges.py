@@ -302,6 +302,206 @@ def pass_7_mutates_state_of(session, dry_run: bool) -> int:
     return session.run(mutates_query).single()["count"] or 0
 
 
+def pass_8_return_types(session, dry_run: bool) -> int:
+    """Pass 8: Link functions to their return types."""
+    logger.info("── Pass 8: Return Types (Function → Type) ──")
+    if dry_run: return 0
+
+    query = """
+    MATCH (f:Function) WHERE f.return_types IS NOT NULL AND size(f.return_types) > 0
+    UNWIND f.return_types AS ret_type
+    MATCH (t:Type {name: ret_type, repo: f.repo})
+    MERGE (f)-[r:RETURNS]->(t)
+    RETURN count(r) AS count
+    """
+    return session.run(query).single()["count"] or 0
+
+
+def pass_9_test_coverage(session, dry_run: bool) -> int:
+    """Pass 9: Connect test functions to target functions they verify."""
+    logger.info("── Pass 9: Test Coverage (TestXxx → target functions) ──")
+    if dry_run: return 0
+
+    query_direct = """
+    MATCH (test:Function {is_test: true})
+    WHERE test.name STARTS WITH 'Test'
+    WITH test, substring(test.name, 4) AS target_name
+    MATCH (target:Function {name: target_name, repo: test.repo, is_test: false})
+    MERGE (test)-[r:TESTS]->(target)
+    RETURN count(r) AS count
+    """
+    count_direct = session.run(query_direct).single()["count"] or 0
+
+    query_method = """
+    MATCH (test:Function {is_test: true})
+    WHERE test.name STARTS WITH 'Test' AND test.name CONTAINS '_'
+    WITH test, substring(test.name, 4) AS raw_name
+    WITH test, split(raw_name, '_')[0] AS struct_name, split(raw_name, '_')[1] AS method_name
+    MATCH (target:Function {name: struct_name + '.' + method_name, repo: test.repo, is_test: false})
+    MERGE (test)-[r:TESTS]->(target)
+    RETURN count(r) AS count
+    """
+    count_method = session.run(query_method).single()["count"] or 0
+
+    return count_direct + count_method
+
+
+def pass_10_error_paths(session, dry_run: bool) -> int:
+    """Pass 10: Track proxy layers and error propagation chains."""
+    logger.info("── Pass 10: Error Path Tracing ──")
+    if dry_run: return 0
+
+    query = """
+    MATCH (caller:Function) WHERE caller.propagated_errors IS NOT NULL AND size(caller.propagated_errors) > 0
+    UNWIND caller.propagated_errors AS callee_name
+    MATCH (callee:Function {name: callee_name, repo: caller.repo})
+    WHERE caller <> callee
+    MERGE (caller)-[r:PROPAGATES_ERROR]->(callee)
+    RETURN count(r) AS count
+    """
+    return session.run(query).single()["count"] or 0
+
+
+def pass_11_generics_constraints(session, dry_run: bool) -> int:
+    """Pass 11: Link generic type parameters to their constraints."""
+    logger.info("── Pass 11: Generic Type Constraints ──")
+    if dry_run: return 0
+
+    builtin_constraints = {"any", "comparable", "error", "string", "int", "int8", "int16", "int32", "int64",
+                           "uint", "uint8", "uint16", "uint32", "uint64", "float32", "float64", "bool", "byte", "rune"}
+
+    type_query = """
+    MATCH (t:Type) WHERE t.type_parameters IS NOT NULL AND t.type_parameters <> '[]'
+    RETURN elementId(t) AS eid, t.repo AS repo, t.type_parameters AS tp
+    """
+    rows_types = session.run(type_query).data()
+
+    func_query = """
+    MATCH (f:Function) WHERE f.type_parameters IS NOT NULL AND f.type_parameters <> '[]'
+    RETURN elementId(f) AS eid, f.repo AS repo, f.type_parameters AS tp
+    """
+    rows_funcs = session.run(func_query).data()
+
+    batch = []
+    for r in rows_types + rows_funcs:
+        tp_str = r.get("tp") or "[]"
+        try:
+            tp_list = json.loads(tp_str) if isinstance(tp_str, str) else tp_str
+            if isinstance(tp_list, list):
+                for tp in tp_list:
+                    constraint = tp.get("constraint") or ""
+                    clean_constraint = constraint.lstrip("*").split(".")[-1].strip()
+                    if clean_constraint and clean_constraint not in builtin_constraints:
+                        batch.append({
+                            "source_eid": r["eid"],
+                            "constraint_name": clean_constraint,
+                            "repo": r["repo"]
+                        })
+        except Exception:
+            pass
+
+    if not batch:
+        return 0
+
+    update_query = """
+    UNWIND $batch AS item
+    MATCH (src) WHERE elementId(src) = item.source_eid
+    MATCH (constraint:Type {name: item.constraint_name, repo: item.repo})
+    WHERE src <> constraint
+    MERGE (src)-[r:CONSTRAINED_BY]->(constraint)
+    RETURN count(r) AS count
+    """
+    return session.run(update_query, batch=batch).single()["count"] or 0
+
+
+def pass_12_channel_elements(session, dry_run: bool) -> int:
+    """Pass 12: Link typed channels to their element types."""
+    logger.info("── Pass 12: Channel Element Types (Variable → Type) ──")
+    if dry_run: return 0
+
+    query = """
+    MATCH (v:Variable {kind: "CHAN"}) 
+    WHERE v.chan_elem_type IS NOT NULL AND v.chan_elem_type <> ""
+    MATCH (t:Type {name: v.chan_elem_type, repo: v.repo})
+    MERGE (v)-[r:CHAN_ELEM_TYPE]->(t)
+    RETURN count(r) AS count
+    """
+    return session.run(query).single()["count"] or 0
+
+
+def pass_13_go_generate(session, dry_run: bool) -> int:
+    """Pass 13: Resolve go:generate directives to output types or files."""
+    logger.info("── Pass 13: go:generate Resolution ──")
+    if dry_run: return 0
+
+    query = """
+    MATCH (d:Directive {directive: "go:generate"})
+    RETURN elementId(d) AS eid, d.filepath AS filepath, d.repo AS repo, d.args AS args
+    """
+    rows = session.run(query).data()
+    batch_files = []
+    batch_types = []
+
+    for r in rows:
+        args = r.get("args") or ""
+        filepath = r.get("filepath") or ""
+        repo = r.get("repo") or ""
+
+        m_type = re.search(r'-type[ =]([A-Za-z0-9_]+)', args)
+        if m_type:
+            type_name = m_type.group(1)
+            batch_types.append({
+                "dir_eid": r["eid"],
+                "type_name": type_name,
+                "repo": repo
+            })
+            gen_file = f"{type_name.lower()}_string.go"
+            parent_dir = filepath.rsplit("/", 1)[0] if "/" in filepath else ""
+            target_path = f"{parent_dir}/{gen_file}" if parent_dir else gen_file
+            batch_files.append({
+                "dir_eid": r["eid"],
+                "target_path": target_path,
+                "repo": repo
+            })
+
+        m_dest = re.search(r'-destination[ =]([A-Za-z0-9_./-]+)', args)
+        if m_dest:
+            dest_val = m_dest.group(1)
+            parent_dir = filepath.rsplit("/", 1)[0] if "/" in filepath else ""
+            if parent_dir and not dest_val.startswith("/"):
+                target_path = os.path.normpath(f"{parent_dir}/{dest_val}").replace("\\", "/")
+            else:
+                target_path = os.path.normpath(dest_val).replace("\\", "/")
+            batch_files.append({
+                "dir_eid": r["eid"],
+                "target_path": target_path,
+                "repo": repo
+            })
+
+    count = 0
+    if batch_types:
+        type_query = """
+        UNWIND $batch AS item
+        MATCH (d:Directive) WHERE elementId(d) = item.dir_eid
+        MATCH (t:Type {name: item.type_name, repo: item.repo})
+        MERGE (d)-[r:GENERATES_TYPE]->(t)
+        RETURN count(r) AS count
+        """
+        count += session.run(type_query, batch=batch_types).single()["count"] or 0
+
+    if batch_files:
+        file_query = """
+        UNWIND $batch AS item
+        MATCH (d:Directive) WHERE elementId(d) = item.dir_eid
+        MATCH (f:File {path: item.target_path, repo: item.repo})
+        MERGE (d)-[r:GENERATES_FILE]->(f)
+        RETURN count(r) AS count
+        """
+        count += session.run(file_query, batch=batch_files).single()["count"] or 0
+
+    return count
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate semantic abstractions over code architecture graphs.")
     parser.add_argument("--dry-run", action="store_true")
@@ -324,8 +524,14 @@ def main():
             t5 = pass_5_lifecycle_hooks_and_registry(session, args.dry_run)
             t6 = pass_6_delegation_and_forwarding(session, args.dry_run)
             t7 = pass_7_mutates_state_of(session, args.dry_run)
+            t8 = pass_8_return_types(session, args.dry_run)
+            t9 = pass_9_test_coverage(session, args.dry_run)
+            t10 = pass_10_error_paths(session, args.dry_run)
+            t11 = pass_11_generics_constraints(session, args.dry_run)
+            t12 = pass_12_channel_elements(session, args.dry_run)
+            t13 = pass_13_go_generate(session, args.dry_run)
 
-            logger.info("🎯 Total Relational Edges Managed: %d", (t0+t1+t2+t3+t4+t5+t6+t7))
+            logger.info("🎯 Total Relational Edges Managed: %d", (t0+t1+t2+t3+t4+t5+t6+t7+t8+t9+t10+t11+t12+t13))
 
 
 if __name__ == "__main__":

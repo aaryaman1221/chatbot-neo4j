@@ -21,7 +21,12 @@ MERGE (func:Function {id: $func_id})
     func.is_exported        = coalesce($is_exported, false),
     func.is_pointer_receiver = coalesce($is_pointer_receiver, false),
     func.channels_sent      = $channels_sent,
-    func.channels_received  = $channels_received
+    func.channels_received  = $channels_received,
+    func.return_types       = $return_types,
+    func.is_test            = coalesce($is_test, false),
+    func.accepts_context    = coalesce($accepts_context, false),
+    func.lock_sequence      = $lock_sequence,
+    func.propagated_errors  = $propagated_errors
   ON MATCH SET
     func.name               = $func_name,
     func.filepath           = $filepath,
@@ -32,7 +37,12 @@ MERGE (func:Function {id: $func_id})
     func.is_exported        = coalesce($is_exported, false),
     func.is_pointer_receiver = coalesce($is_pointer_receiver, false),
     func.channels_sent      = $channels_sent,
-    func.channels_received  = $channels_received
+    func.channels_received  = $channels_received,
+    func.return_types       = $return_types,
+    func.is_test            = coalesce($is_test, false),
+    func.accepts_context    = coalesce($accepts_context, false),
+    func.lock_sequence      = $lock_sequence,
+    func.propagated_errors  = $propagated_errors
 MERGE (file)-[:DECLARES]->(func)
 MERGE (repo)-[:DECLARES]->(func)
 """
@@ -74,8 +84,12 @@ WHERE repo_wide.filepath <> $caller_filepath
 WITH caller, coalesce(local, pkg_local, qual_match, repo_wide) AS callee
 WHERE callee IS NOT NULL AND caller <> callee
 MERGE (caller)-[r:CALLS]->(callee)
-  ON CREATE SET r.call_type = coalesce($call_type, 'SYNC')
-  ON MATCH  SET r.call_type = coalesce($call_type, r.call_type, 'SYNC')
+  ON CREATE SET r.call_type = coalesce($call_type, 'SYNC'),
+                r.propagates_context = coalesce($propagates_context, false),
+                r.creates_cancellation_scope = coalesce($creates_cancellation_scope, false)
+  ON MATCH  SET r.call_type = coalesce($call_type, r.call_type, 'SYNC'),
+                r.propagates_context = coalesce($propagates_context, r.propagates_context, false),
+                r.creates_cancellation_scope = coalesce($creates_cancellation_scope, r.creates_cancellation_scope, false)
 """
 
 CYPHER_INGEST_TYPE = """
@@ -94,7 +108,9 @@ MERGE (type:Type {id: $type_id})
     type.method_names = $method_names,
     type.tags         = $tags,
     type.embedding    = $embedding,
-    type.is_exported  = coalesce($is_exported, false)
+    type.is_exported  = coalesce($is_exported, false),
+    type.tag_mappings = $tag_mappings,
+    type.type_parameters = $type_parameters
   ON MATCH SET
     type.name         = $type_name,
     type.kind         = $kind,
@@ -107,7 +123,9 @@ MERGE (type:Type {id: $type_id})
     type.method_names = $method_names,
     type.tags         = $tags,
     type.embedding    = coalesce($embedding, type.embedding),
-    type.is_exported  = coalesce($is_exported, false)
+    type.is_exported  = coalesce($is_exported, false),
+    type.tag_mappings = $tag_mappings,
+    type.type_parameters = $type_parameters
 MERGE (file)-[:DECLARES_TYPE]->(type)
 MERGE (repo)-[:DECLARES_TYPE]->(type)
 """
@@ -130,7 +148,8 @@ MERGE (var:Variable {id: $var_id})
     var.repo        = $repo_full_name,
     var.code        = $code,
     var.embedding   = $embedding,
-    var.is_exported = coalesce($is_exported, false)
+    var.is_exported = coalesce($is_exported, false),
+    var.chan_elem_type = $chan_elem_type
   ON MATCH SET
     var.name        = $var_name,
     var.kind        = $kind,
@@ -138,7 +157,8 @@ MERGE (var:Variable {id: $var_id})
     var.repo         = $repo_full_name,
     var.code        = $code,
     var.embedding   = coalesce($embedding, var.embedding),
-    var.is_exported = coalesce($is_exported, false)
+    var.is_exported = coalesce($is_exported, false),
+    var.chan_elem_type = $chan_elem_type
 MERGE (file)-[:DECLARES_VAR]->(var)
 MERGE (repo)-[:DECLARES_VAR]->(var)
 """

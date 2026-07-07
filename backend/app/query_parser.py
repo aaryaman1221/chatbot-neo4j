@@ -70,6 +70,14 @@ _COMMIT_KEYWORDS = (
 _RECENCY_KEYWORDS = ("last", "recent", "latest", "newest", "history")
 
 
+_CONCURRENCY_KEYWORDS = (
+    "goroutine", "channel", "chan", "mutex", "lock", "waitgroup", "context", "defer", "concurrency", "go routine", "sync.mutex", "sync.rwmutex", "sync.waitgroup"
+)
+_TEST_COVERAGE_KEYWORDS = ("test", "testing", "tests", "coverage", "covered by tests", "test coverage")
+_DIRECTIVE_KEYWORDS = ("directive", "directives", "go:generate", "go:build", "go:embed", "build tag", "build tags", "compiler tag", "compiler tags", "embed asset", "embed assets")
+_SCHEMA_KEYWORDS = ("schema", "struct tag", "struct tags", "tag mapping", "tag mappings", "json:", "bson:", "db:", "omitempty", "db tag", "json tag", "bson tag", "database table", "database mapping", "serialize", "serialization")
+
+
 def _sanitize_lucene_query(query: str) -> str:
     sanitized = re.sub(r'[/\\\?\*~\^\[\]{}()!]', ' ', query)
     sanitized = re.sub(r'\s+', ' ', sanitized).strip()
@@ -188,6 +196,10 @@ class QueryIntent(BaseModel):
     wants_commit_files: bool = Field(default=False, description="True if asking about commit history, file modification frequency, churn, or what a specific commit touched.")
     wants_recency: bool = Field(default=False, description="True if asking for recent/latest/last N commits or commit history.")
     wants_structural: bool = Field(default=False, description="True if the user is asking about structural/type relationships: which structs implement an interface, duck typing, method sets, etc.")
+    wants_concurrency: bool = Field(default=False, description="True if the user is asking about concurrency, goroutines, channels, mutexes, locks, waitgroups, context, or deferred logic.")
+    wants_test_coverage: bool = Field(default=False, description="True if asking about test coverage, test functions, which tests run/cover a function, or untested code.")
+    wants_directive: bool = Field(default=False, description="True if asking about compiler directives, build tags, go:generate, go:build, or go:embed.")
+    wants_schema: bool = Field(default=False, description="True if asking about database mappings, struct tags, BSON, JSON field tags, or serialization schemas.")
 
     subjects: List[str] = Field(default_factory=list, description="Literal package, module, or symbol names the user is asking about.")
     field_hints: List[str] = Field(default_factory=list, description="Specific struct fields, properties, function signatures, methods, or config keys mentioned.")
@@ -207,6 +219,10 @@ def _cached_llm_intent(query: str, api_key: str) -> Optional[QueryIntent]:
             "IMPORTANT classification rules:\n"
             "- Set wants_structural=True (NOT wants_impact) when the query is about type/interface relationships.\n"
             "- Set wants_impact=True ONLY when the user asks what BREAKS, DEPENDS ON, or IMPORTS something.\n"
+            "- Set wants_concurrency=True when the query is about concurrency, goroutines, channels, mutexes, locks, waitgroups, context, or deferred logic.\n"
+            "- Set wants_test_coverage=True when the query is about test coverage, test functions, which tests cover a struct/function, or untested code.\n"
+            "- Set wants_directive=True when the query is about compiler directives, build tags, go:generate, go:build, or go:embed.\n"
+            "- Set wants_schema=True when the query is about database mappings, struct tags, BSON, JSON field tags, or serialization schemas.\n"
             f"Query: {query}"
         )
         if isinstance(intent, QueryIntent): return intent
@@ -224,8 +240,9 @@ def extract_query_intent(query: str, google_api_key: Optional[str] = None) -> Qu
     
     if intent is not None:
         logger.info(
-            "[QUERY_PARSER] ✅ LLM intent extracted: impact=%s blame=%s commit=%s recency=%s structural=%s subjects=%s",
-            intent.wants_impact, intent.wants_blame, intent.wants_commit_files, intent.wants_recency, intent.wants_structural, intent.subjects,
+            "[QUERY_PARSER] ✅ LLM intent extracted: impact=%s blame=%s commit=%s recency=%s structural=%s concurrency=%s test_coverage=%s directive=%s schema=%s subjects=%s",
+            intent.wants_impact, intent.wants_blame, intent.wants_commit_files, intent.wants_recency, intent.wants_structural,
+            intent.wants_concurrency, intent.wants_test_coverage, intent.wants_directive, intent.wants_schema, intent.subjects,
         )
         return intent
 
@@ -237,11 +254,14 @@ def extract_query_intent(query: str, google_api_key: Optional[str] = None) -> Qu
     wants_blame = bool(_BLAME_PATTERN.search(query))
     wants_commit = any(kw in q_lower for kw in _COMMIT_KEYWORDS)
     wants_recency = any(kw in q_lower for kw in _RECENCY_KEYWORDS)
-    # Fix: Ensure structural flags are extracted via fallback path if the LLM cache fails
     wants_structural = any(kw in q_lower for kw in _STRUCTURAL_KEYWORDS)
+    wants_concurrency = any(kw in q_lower for kw in _CONCURRENCY_KEYWORDS)
+    wants_test_coverage = any(kw in q_lower for kw in _TEST_COVERAGE_KEYWORDS)
+    wants_directive = any(kw in q_lower for kw in _DIRECTIVE_KEYWORDS)
+    wants_schema = any(kw in q_lower for kw in _SCHEMA_KEYWORDS)
     
     # Fix: Backfill subjects for structural lookups if impact keywords aren't present
-    subjects = _extract_impact_subjects(query) if (wants_impact or wants_structural) else []
+    subjects = _extract_impact_subjects(query) if (wants_impact or wants_structural or wants_concurrency or wants_test_coverage or wants_directive or wants_schema) else []
     field_hints = _extract_field_hints(query)
     repo_hints = _extract_repo_hints_from_query(query)
     file_hints = _extract_path_hints(query)
@@ -252,6 +272,10 @@ def extract_query_intent(query: str, google_api_key: Optional[str] = None) -> Qu
         wants_commit_files=wants_commit,
         wants_recency=wants_recency,
         wants_structural=wants_structural,
+        wants_concurrency=wants_concurrency,
+        wants_test_coverage=wants_test_coverage,
+        wants_directive=wants_directive,
+        wants_schema=wants_schema,
         subjects=subjects,
         field_hints=field_hints,
         repo_hints=repo_hints,
