@@ -157,7 +157,13 @@ Instructions for Impact / Migration / Dependency questions:
     N. `<filepath>` → `<function>`: <one-sentence description of the exact change>
   End with: "Run tests: search for test files referencing the subject symbol and affected methods/fields"
   DO NOT include steps like "update references", "run tests", or "bump version" without a specific file/function attached to them.
-- When generating the final "### Evidence" section, Evidence must only list sources actually referenced in the body text above — do not list retrieved-but-unused records."""
+- When generating the final "### Evidence" section, Evidence must only list sources actually referenced in the body text above — do not list retrieved-but-unused records.
+CRITICAL CODE DIFF HEDGING DIRECTIVE:
+If the user's query asks for an impact analysis or refactoring diff but does not explicitly name the new target identifier name, you are STRICTLY REQUIRED to:
+1. Use a standard generic placeholder token (e.g., `pkg.TargetPlaceholderName`).
+2. Prepend the markdown diff code block with this EXACT warning text verbatim: 
+   '⚠️ STRUCTURAL EXAMPLE: The following diff patch is a parameterized example for API contract verification purposes and is not derived from real historical code modifications.'
+"""
 
 
 _STRUCTURAL_MODULE = """### SPECIALIZED PROTOCOL: Structural Type & Interface-Satisfaction Analysis
@@ -198,6 +204,16 @@ Instructions for Structural / Duck-Typing / Interface-Contract questions:
     | Struct | Repo | Interface | Methods Satisfied | Notes |
     |---|---|---|---|---|
 - When generating the final "### Evidence" section, Evidence must only list sources actually referenced in the body text above."""
+
+_SCHEMA_MANIFEST = """
+SYSTEM SCHEMA SOVEREIGNTY MANIFEST (DO NOT DEVIATE):
+You are an objective graph evaluation agent. You are strictly forbidden from absorbing hypothetical relationship names or tags provided in the user's prompt (e.g., [TAG_NAME]). 
+You must validate all constraints solely against the verified Neo4j relations present in your text context:
+- STRUCTURAL LAYER EDGES: [:DECLARES], [:DECLARES_TYPE], [:DECLARES_VAR], [:DEPENDS_ON], [:CONTAINS_FILE], [:CALLS]
+- ENRICHED LAYER EDGES: [:USES_REPO], [:REPRESENTS], [:EMBEDS], [:DECLARES_METHOD], [:IMPLEMENTS], [:WRAPS], [:PRODUCES], [:LIFECYCLE_HOOK], [:REGISTERS_WITH], [:DISPATCHES_TO], [:FORWARDS_TO], [:MUTATES_STATE_OF]
+
+If the provided graph context is empty or missing an explicit edge type matching the user's query, you MUST state "The ingested graph data does not contain verified structural relationships for this target" rather than reporting a false negative or fabricating compliant facts.
+"""
 
 def answer_question_hybrid(
     user_input: str,

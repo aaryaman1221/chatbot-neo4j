@@ -145,6 +145,15 @@ def _fetch_subject_definition(
                 subject, len(rows),
             )
             best = max(rows, key=lambda r: len(r.get("code") or ""))
+            
+            # ─── GENERIC STRUCT TRUNCATION STEP INJECTED HERE ───
+            raw_code = best.get("code", "")
+            lines = raw_code.splitlines()
+            if len(lines) > 50:
+                # Crop the context size dynamically to protect the LLM's token attention span
+                best["code"] = "\n".join(lines[:40]) + f"\n\n... [TRUNCATED: {len(lines)-40} structural lines omitted for context optimization. See local file mapping for full implementation details] ..."
+            # ───────────────────────────────────────────────────────
+
             best["connected"] = []
             return best
     except Exception as exc:
@@ -852,21 +861,22 @@ def retrieve_code_context(
                         field_rel_label = f"REFERENCES_KEY_{field.upper()}"
                     else:
                         field_rel_label = f"REFERENCES_FIELD_{field.upper()}"
+                    # Change the query variable to match the global 'fn' filter token
                     field_grep_cypher = f"""
-                    MATCH (node)
-                    WHERE (node:Function OR node:Type)
-                      AND node.code IS NOT NULL
-                      AND (
-                        toLower(node.code) CONTAINS toLower($field_name)
-                        OR (node:Type AND $field_name IN node.field_names)
-                      )
-                      {repo_filter_fg}
+                    MATCH (fn)
+                    WHERE (fn:Function OR fn:Type)
+                    AND fn.code IS NOT NULL
+                    AND (
+                        toLower(fn.code) CONTAINS toLower($field_name)
+                        OR (fn:Type AND $field_name IN fn.field_names)
+                    )
+                    {repo_filter_fg}
                     RETURN
-                      node.name                                AS name,
-                      coalesce(node.filepath, node.path, '')     AS filepath,
-                      coalesce(node.repo, '')                  AS repo,
-                      node.code                                AS code,
-                      labels(node)[0]                          AS seed_label
+                    fn.name                                  AS name,
+                    coalesce(fn.filepath, fn.path, '')       AS filepath,
+                    coalesce(fn.repo, '')                    AS repo,
+                    fn.code                                  AS code,
+                    labels(fn)[0]                            AS seed_label
                     LIMIT 20
                     """
                     try:

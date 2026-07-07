@@ -182,9 +182,16 @@ def pass_3_duck_typing_implements(session, dry_run: bool) -> int:
     for i in range(len(eids)):
         for j in range(i + 1, len(eids)):
             t1, t2 = type_methods_map[eids[i]], type_methods_map[eids[j]]
-            if t1["repo"] != t2["repo"]:
-                continue  # Bound structural compliance to repo scopes to avoid global sprawl
+            
+            # Skip duplicate nodes or exact matches
+            if t1["name"] == t2["name"] and t1["repo"] == t2["repo"]:
+                continue
                 
+            # Allow same-repo combinations OR valid cross-repo structural matches
+            # but reject pairs where neither node is explicitly marked as an INTERFACE
+            if not ((t1["kind"] == "INTERFACE") or (t2["kind"] == "INTERFACE")):
+                continue
+
             if t2["kind"] == "INTERFACE" and t2["methods"].issubset(t1["methods"]):
                 batch.append({"t1_eid": eids[i], "t2_eid": eids[j]})
             elif t1["kind"] == "INTERFACE" and t1["methods"].issubset(t2["methods"]):
