@@ -97,6 +97,7 @@ def _query_graph_stats(driver) -> dict:
         "commits": 0, "files": 0,
         "issues": 0, "repositories": 0,
         "modules": 0, "users": 0,
+        "types": 0, "variables": 0, "directives": 0,
     }
     queries = {
         "nodes":         "MATCH (n) RETURN count(n) AS c",
@@ -107,6 +108,9 @@ def _query_graph_stats(driver) -> dict:
         "repositories":  "MATCH (r:Repository) RETURN count(r) AS c",
         "modules":       "MATCH (m:Module) RETURN count(m) AS c",
         "users":         "MATCH (u:User) RETURN count(u) AS c",
+        "types":         "MATCH (t:Type) RETURN count(t) AS c",
+        "variables":     "MATCH (v:Variable) RETURN count(v) AS c",
+        "directives":    "MATCH (d:Directive) RETURN count(d) AS c",
     }
     try:
         with driver.session() as session:

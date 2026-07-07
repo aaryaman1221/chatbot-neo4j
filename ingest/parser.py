@@ -1,7 +1,3 @@
-# =============================================================================
-# ingest/parser.py — AST Parsing & Import Dependency Extraction
-# =============================================================================
-
 import ast
 import re
 from typing import Optional
@@ -14,7 +10,6 @@ from .config import (
     _GO_TEST_SUFFIXES,
 )
 
-# ── AST Parsing Dependencies ───────────────────────────────────────────────
 try:
     import tree_sitter_go as tsgo
     from tree_sitter import Language, Parser
@@ -35,10 +30,19 @@ def _is_noise_file(filename: str) -> bool:
     name = lower_path.rsplit("/", 1)[-1]
     if name in IGNORED_FILENAMES:
         return True
-    # Skip Go test files — their TestXxx/BenchmarkXxx functions pollute the call graph.
     if name.endswith(_GO_TEST_SUFFIXES):
         return True
     return name.endswith(IGNORED_SUFFIXES)
+
+
+def _unroll_python_call(node: ast.AST) -> Optional[str]:
+    """Helper to unroll compound Python call attributes cleanly without breaking on indexes."""
+    if isinstance(node, ast.Name):
+        return node.id
+    elif isinstance(node, ast.Attribute):
+        prefix = _unroll_python_call(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    return None
 
 
 def parse_python_ast(filepath: str, source_code: str) -> dict:
@@ -50,14 +54,9 @@ def parse_python_ast(filepath: str, source_code: str) -> dict:
 
     try:
         tree = ast.parse(source_code)
+        seen_lines = set()
+        func_nodes = []
 
-        # Only capture top-level functions and class-level methods.
-        # Nested inner functions are skipped to prevent duplicate IDs when two files
-        # share common helper names (e.g. `_flush`, `_retry`).
-        seen_lines: set = set()
-        func_nodes: list = []
-
-        # Collect FunctionDef/AsyncFunctionDef directly inside Module or ClassDef
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 func_nodes.append((node, node.name))
@@ -71,27 +70,25 @@ def parse_python_ast(filepath: str, source_code: str) -> dict:
                 continue
             seen_lines.add(node.lineno)
             func_code = ast.get_source_segment(source_code, node) or ""
+            is_private = scoped_name.split(".")[-1].startswith("_")
             functions.append({
                 "name": scoped_name,
                 "id": f"{filepath}::{scoped_name}",
                 "start": node.lineno,
                 "end": node.end_lineno,
-                "code": func_code
+                "code": func_code,
+                "is_exported": not is_private,
+                "is_pointer_receiver": "." in scoped_name,  # If it's a class method, it modifies an instance block
+                "channels_sent": [],
+                "channels_received": []
             })
+            
             for child in ast.walk(node):
-                if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
-                    calls.append((scoped_name, child.func.id, None))
-                elif isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
-                    parts = []
-                    attr_node = child.func
-                    while isinstance(attr_node, ast.Attribute):
-                        parts.append(attr_node.attr)
-                        attr_node = attr_node.value
-                    if isinstance(attr_node, ast.Name):
-                        parts.append(attr_node.id)
-                    parts.reverse()
-                    qualified_name = ".".join(parts)
-                    calls.append((scoped_name, child.func.attr, qualified_name))
+                if isinstance(child, ast.Call):
+                    qualified_name = _unroll_python_call(child.func)
+                    if qualified_name:
+                        bare_name = qualified_name.split(".")[-1]
+                        calls.append((scoped_name, bare_name, qualified_name))
     except Exception:
         pass
 
@@ -109,11 +106,7 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
         logger.debug("Failed to parse Go AST for %s: %s", filepath, exc)
         return {"functions": [], "calls": [], "types": [], "variables": [], "directives": []}
 
-    functions = []
-    calls = []
-    types = []
-    variables = []
-    directives = []
+    functions, calls, types, variables, directives = [], [], [], [], []
     func_channel_map = {}
 
     def get_text(node):
@@ -121,7 +114,7 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
 
     for line in source_code.splitlines():
         line_str = line.strip()
-        if line_str.startswith("//go:embed ") or line_str.startswith("//go:build ") or line_str.startswith("//go:generate "):
+        if line_str.startswith(("//go:embed ", "//go:build ", "//go:generate ")):
             parts = line_str.split(None, 1)
             if len(parts) == 2:
                 directives.append({"directive": parts[0][2:], "args": parts[1].strip()})
@@ -135,7 +128,7 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
         elif node.type == 'defer_statement':
             new_context = "DEFER"
 
-        # 1. Identify Function and Method Declarations
+        # 1. Functional Structures Tracking
         if node.type in ['function_declaration', 'method_declaration']:
             name_node = node.child_by_field_name('name')
             if name_node:
@@ -146,7 +139,8 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
                     recv_node = node.child_by_field_name('receiver')
                     if recv_node:
                         recv_text = get_text(recv_node)
-                        m = re.search(r'\*?(?:[A-Za-z0-9_]+\.)?([A-Za-z0-9_]+)(?:\[.*?\])?\s*\)', recv_text)
+                        # Fix: Handles implicit value/pointer structures safely: (r *Type), (*Type), (Type)
+                        m = re.search(r'\b([A-Za-z0-9_]+)(?:\[.*?\])?\s*\)', recv_text)
                         if m:
                             receiver_name = m.group(1)
                 
@@ -163,17 +157,13 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
                     "is_pointer_receiver": "*" in get_text(recv_node) if recv_node else False,
                 })
 
-        # 2. Identify Types (Structs, Interfaces, Type Aliases)
+        # 2. Type Schema Evaluation Blocks
         elif node.type == 'type_spec':
             name_node = node.child_by_field_name('name')
             type_node = node.child_by_field_name('type')
             if name_node and type_node:
                 type_name = get_text(name_node)
-                kind = "TYPE"
-                fields = []
-                methods = []
-                embedded_types = []
-                tags = []
+                kind, fields, methods, embedded_types, tags = "TYPE", [], [], [], []
 
                 if type_node.type == 'struct_type':
                     kind = "STRUCT"
@@ -198,24 +188,16 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
                                             embedded_types.append(embed_name)
                                             fields.append({"name": embed_name, "type": f_type, "tag": f_tag, "is_embedded": True})
 
-                elif type_node.type == 'interface_type':
+                elif type_node.type in ['interface_type', 'interface_body']:
                     kind = "INTERFACE"
-
-                    # A1: recursive walk — handles grammars that insert an intermediate
-                    # `interface_body` node (or similar) between `interface_type` and
-                    # the actual `method_elem` / `method_spec` leaves.
                     _IFACE_SKIP_TYPES = frozenset({'{', '}', ';', 'interface', 'comment'})
 
                     def _collect_iface_members(n):
                         for c in n.children:
                             if c.type in ('method_spec', 'method_elem'):
-                                m_name_node = c.child_by_field_name('name')
-                                if not m_name_node:
-                                    m_name_node = next(
-                                        (gc for gc in c.children
-                                         if gc.type in ('field_identifier', 'identifier')),
-                                        None,
-                                    )
+                                m_name_node = c.child_by_field_name('name') or next(
+                                    (gc for gc in c.children if gc.type in ('field_identifier', 'identifier')), None
+                                )
                                 if m_name_node:
                                     methods.append({
                                         "name":      get_text(m_name_node),
@@ -226,19 +208,14 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
                                 if embed_name and embed_name not in embedded_types:
                                     embedded_types.append(embed_name)
                             elif c.type not in _IFACE_SKIP_TYPES:
-                                # Recurse into unknown intermediate container nodes
                                 _collect_iface_members(c)
 
                     _collect_iface_members(type_node)
 
-                    # A3: regex fallback — if tree-sitter found no methods at all
-                    # (grammar mismatch or empty interface), parse the raw source text.
                     if not methods:
                         raw_iface = get_text(type_node)
-                        # Match exported method names: CapitalLetter followed by identifier + '('
                         for m in re.finditer(r'\b([A-Z][A-Za-z0-9_]*)\s*\(', raw_iface):
                             m_name = m.group(1)
-                            # Skip type-like names that appear in composite literals
                             if m_name in ('True', 'False', 'Nil'):
                                 continue
                             line_start = raw_iface.rfind('\n', 0, m.start()) + 1
@@ -246,18 +223,13 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
                             sig = raw_iface[line_start: line_end if line_end != -1 else len(raw_iface)].strip()
                             methods.append({"name": m_name, "signature": sig})
 
-                # A2: prepend the `type` keyword so stored code is always valid Go syntax.
-                # get_text(node) on a type_spec returns "TypeName struct/interface {...}"
-                # without the leading `type` keyword — add it back for readability.
-                type_code = "type " + get_text(node)
-
                 types.append({
                     "name": type_name,
                     "id": f"{filepath}::{type_name}",
                     "kind": kind,
                     "start": node.start_point[0] + 1,
                     "end":   node.end_point[0] + 1,
-                    "code":  type_code,
+                    "code":  "type " + get_text(node),
                     "fields": fields,
                     "methods": methods,
                     "embedded_types": embedded_types,
@@ -265,7 +237,7 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
                     "is_exported": type_name[0].isupper() if type_name else False,
                 })
 
-        # 3. Identify Package-Level Variables and Constants
+        # 3. Variable/Constants Space Track
         elif node.type in ['var_declaration', 'const_declaration'] and current_func is None:
             kind = "VAR" if node.type == 'var_declaration' else "CONST"
             for child in node.children:
@@ -283,7 +255,7 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
                                 "is_exported": v_name[0].isupper() if v_name else False,
                             })
 
-        # 4. Identify Function Calls and Channel Operations within a function
+        # 4. Expressions & Dynamic Operations Processing
         elif current_func:
             if node.type == 'call_expression':
                 func_node = node.children[0]
@@ -293,24 +265,19 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
                 elif func_node.type == 'selector_expression':
                     parts = []
                     for child in func_node.children:
-                        if child.type == 'field_identifier':
+                        if child.type in ['field_identifier', 'identifier']:
                             parts.append(get_text(child))
-                        elif child.type == 'identifier':
-                            parts.insert(0, get_text(child))
                     if parts:
-                        callee_name = parts[-1]
-                        callee_qualified = ".".join(parts)
-                        calls.append((current_func, callee_name, callee_qualified, new_context))
+                        calls.append((current_func, parts[-1], ".".join(parts), new_context))
             elif node.type == 'send_statement' and node.children:
                 chan_name = get_text(node.children[0]).split("[")[0].strip()
                 if chan_name and current_func in func_channel_map:
                     func_channel_map[current_func]["sent"].add(chan_name)
-            elif node.type == 'receive_expression' or (node.type == 'unary_expression' and get_text(node).startswith('<-')):
+            elif node.type in ['receive_expression', 'unary_expression'] and get_text(node).startswith('<-'):
                 chan_expr = get_text(node).lstrip("<-").strip().split("[")[0].strip()
                 if chan_expr and current_func in func_channel_map:
                     func_channel_map[current_func]["recv"].add(chan_expr)
 
-        # Recurse through children
         for child in node.children:
             walk(child, new_func, new_context)
 
@@ -326,8 +293,7 @@ def parse_go_ast(filepath: str, source_code: str) -> dict:
 
 
 def _append_dependency(dependencies: list, filepath: str, target_module: str):
-    if not target_module:
-        return
+    if not target_module: return
     edge = (filepath, "DEPENDS_ON", target_module)
     if edge not in dependencies:
         dependencies.append(edge)
@@ -348,12 +314,10 @@ def _extract_go_dependencies(filepath: str, lines: list, patch_mode: bool = Fals
     for raw_line in lines:
         line = raw_line.rstrip("\n")
         if patch_mode:
-            if not line or line[0] not in {"+", " "}:
-                continue
+            if not line or line[0] not in {"+", " "}: continue
             line = line[1:].lstrip()
         stripped = line.strip()
-        if not stripped or stripped.startswith("//"):
-            continue
+        if not stripped or stripped.startswith("//"): continue
 
         if stripped.startswith("import ("):
             in_import_block = True; continue
@@ -423,16 +387,14 @@ def _extract_generic_dependencies(filepath: str, lines: list, patch_mode: bool =
     for raw_line in lines:
         line = raw_line.rstrip("\n")
         if patch_mode:
-            if not line or line[0] not in {"+", " "}:
-                continue
+            if not line or line[0] not in {"+", " "}: continue
             line = line[1:].lstrip()
         stripped = line.strip()
         if not stripped or (stripped.startswith("#") and not stripped.startswith("#include")):
             continue
         for pattern in patterns:
             m = re.search(pattern, stripped)
-            if m:
-                _append_dependency(dependencies, filepath, m.group(1))
+            if m: _append_dependency(dependencies, filepath, m.group(1))
     return dependencies
 
 
@@ -445,80 +407,48 @@ def extract_imports_from_source(filepath: str, source_code: str) -> list:
 
 
 def extract_file_dependencies(compact_files: list) -> list:
-    """Legacy additive-only extraction. Kept for backwards compatibility."""
     dependencies = []
     for item in compact_files:
         source_file = item.get("filename")
         patch = item.get("patch", "")
-        if not patch or not source_file:
-            continue
+        if not patch or not source_file: continue
         kind = _go_file_kind(source_file)
         lines = patch.split("\n")
-        if kind in {"go_mod", "go_work", "go_source"}:
-            new_deps = _extract_go_dependencies(source_file, lines, patch_mode=True)
-        else:
-            new_deps = _extract_generic_dependencies(source_file, lines, patch_mode=True)
+        new_deps = _extract_go_dependencies(source_file, lines, patch_mode=True) if kind in {"go_mod", "go_work", "go_source"} else _extract_generic_dependencies(source_file, lines, patch_mode=True)
         for dep in new_deps:
-            if dep not in dependencies:
-                dependencies.append(dep)
+            if dep not in dependencies: dependencies.append(dep)
     return dependencies
 
 
 def extract_temporal_dependencies(compact_files: list) -> dict:
-    """Split a git diff into added and removed import dependencies."""
-    added: list = []
-    removed: list = []
-
+    added, removed = [], []
     for item in compact_files:
         source_file = item.get("filename")
         patch = item.get("patch", "")
-        if not patch or not source_file:
-            continue
+        if not patch or not source_file: continue
 
         kind = _go_file_kind(source_file)
-        extractor = (
-            _extract_go_dependencies
-            if kind in {"go_mod", "go_work", "go_source"}
-            else _extract_generic_dependencies
-        )
-
-        # Split diff lines into addition/deletion buckets, keeping the
-        # +/- prefix so that patch_mode=True can correctly filter them.
-        addition_lines: list[str] = []
-        deletion_lines: list[str] = []
+        extractor = _extract_go_dependencies if kind in {"go_mod", "go_work", "go_source"} else _extract_generic_dependencies
+        addition_lines, deletion_lines = [], []
 
         for raw_line in patch.split("\n"):
             if raw_line.startswith("+") and not raw_line.startswith("+++"):
-                addition_lines.append(raw_line)   # keep '+' prefix for patch_mode
+                addition_lines.append(raw_line)
             elif raw_line.startswith("-") and not raw_line.startswith("---"):
-                deletion_lines.append(raw_line)   # keep '-' prefix for patch_mode
+                deletion_lines.append(raw_line)
 
-        # Use patch_mode=True so _extract_*_dependencies strips the prefix
-        # and only considers lines starting with '+' (or ' ' for context).
-        # Previously this used patch_mode=False on pre-stripped lines, which
-        # caused the extractor to try to parse blank-stripped content as
-        # raw source, missing multi-line import blocks.
         for dep in extractor(source_file, addition_lines, patch_mode=True):
-            if dep not in added:
-                added.append(dep)
+            if dep not in added: added.append(dep)
 
-        # For deletions, temporarily treat '-' lines as '+' lines so the
-        # patch_mode=True filter picks them up.
-        deletion_as_additions = [
-            "+" + line[1:] if line.startswith("-") else line
-            for line in deletion_lines
-        ]
+        deletion_as_additions = ["+" + line[1:] if line.startswith("-") else line for line in deletion_lines]
         for dep in extractor(source_file, deletion_as_additions, patch_mode=True):
-            if dep not in removed:
-                removed.append(dep)
+            if dep not in removed: removed.append(dep)
 
     return {"added": added, "removed": removed}
 
 
 def get_modified_functions(patch_text: str, filepath: str, ast_data: dict) -> list:
-    if not patch_text or not ast_data.get("functions"):
-        return []
-
+    if not patch_text or not ast_data.get("functions"): return []
     modified_lines = set()
 
     for line in patch_text.split("\n"):

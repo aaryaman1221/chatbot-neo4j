@@ -534,9 +534,8 @@ def _run_structural_traversal(
             iface_name = iface.get("iface_name") or subject
 
             impl_cypher = f"""
-            MATCH (impl)-[:IMPLEMENTS]->(iface)
+            MATCH (impl:Type)-[:IMPLEMENTS]->(iface)
             WHERE elementId(iface) = $iface_id
-              AND (impl:Type OR impl:Function)
               {target_repo_filter}
             OPTIONAL MATCH (impl)-[:DECLARES_METHOD]->(meth:Function)
             WITH impl,
@@ -546,11 +545,12 @@ def _run_structural_traversal(
                    code: coalesce(meth.code, '')
                  }})[..12] AS declared_methods
             RETURN
-              coalesce(impl.name, impl.full_name)         AS name,
+              impl.name                                   AS name,
               coalesce(impl.filepath, impl.path, '')      AS filepath,
               coalesce(impl.repo, '')                     AS repo,
-              coalesce(impl.kind, labels(impl)[0])        AS kind,
+              impl.kind                                   AS kind,
               coalesce(impl.code, '')                     AS code,
+              impl.method_names                           AS impl_method_names,
               declared_methods
             ORDER BY size(coalesce(impl.code, '')) DESC
             LIMIT 20
@@ -853,15 +853,20 @@ def retrieve_code_context(
                     else:
                         field_rel_label = f"REFERENCES_FIELD_{field.upper()}"
                     field_grep_cypher = f"""
-                    MATCH (fn:Function)
-                    WHERE fn.code IS NOT NULL
-                      AND toLower(fn.code) CONTAINS toLower($field_name)
+                    MATCH (node)
+                    WHERE (node:Function OR node:Type)
+                      AND node.code IS NOT NULL
+                      AND (
+                        toLower(node.code) CONTAINS toLower($field_name)
+                        OR (node:Type AND $field_name IN node.field_names)
+                      )
                       {repo_filter_fg}
                     RETURN
-                      fn.name                                AS name,
-                      coalesce(fn.filepath, fn.path, '')     AS filepath,
-                      coalesce(fn.repo, '')                  AS repo,
-                      fn.code                                AS code
+                      node.name                                AS name,
+                      coalesce(node.filepath, node.path, '')     AS filepath,
+                      coalesce(node.repo, '')                  AS repo,
+                      node.code                                AS code,
+                      labels(node)[0]                          AS seed_label
                     LIMIT 20
                     """
                     try:
@@ -871,10 +876,7 @@ def retrieve_code_context(
                                 field_name=field,
                                 selected_repos=_effective_repos,
                             ).data()
-                        logger.info(
-                            "[RETRIEVE] Stage 0 symbol-grep '%s' → %d function(s) reference it.",
-                            field, len(field_rows),
-                        )
+                        
                         for r in field_rows:
                             r["rel_type"] = field_rel_label
                             r.setdefault("connected", [])
@@ -882,9 +884,7 @@ def retrieve_code_context(
                                 r["code"] = _extract_relevant_lines(r["code"], field)
                         impact_rows.extend(field_rows)
                     except Exception as exc:
-                        logger.warning(
-                            "[RETRIEVE] Stage 0 symbol-grep '%s' failed: %s", field, exc
-                        )
+                        logger.warning("[RETRIEVE] Stage 0 symbol-grep '%s' failed: %s", field, exc)
 
             logger.info(
                 "[RETRIEVE] Stage 0 returned %d impact record(s) (post-filter).", len(impact_rows)
