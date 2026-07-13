@@ -20,7 +20,7 @@ from ingest.queries import (
     CYPHER_LINK_MODULE_TO_REPO,
     CYPHER_LINK_XREPO_CALLS,
 )
-from ingest.pipeline import bootstrap, resolve_cross_repo_edges
+from ingest.pipeline import bootstrap, resolve_cross_repo_edges, phase2_5_relink_calls
 
 
 from pathlib import Path
@@ -56,6 +56,28 @@ if __name__ == "__main__":
             for h in helpers:
                 resolve_cross_repo_edges(driver, parent, h)
         print("✅ Cross-repo linking COMPLETE.")
+        sys.exit(0)
+
+    if "--relink-calls" in sys.argv:
+        NEO4J_URI      = os.environ.get("NEO4J_URI",      "neo4j://localhost:7687")
+        NEO4J_USER     = os.environ.get("NEO4J_USER",     "neo4j")
+        NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "")
+        GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN",   "")
+        GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_GENAI_API_KEY") or ""
+        idx = sys.argv.index("--relink-calls")
+        args = sys.argv[idx + 1:]
+        if not args:
+            print("[ERROR] --relink-calls requires <repo_full_name> (e.g. gohugoio/hugo)")
+            sys.exit(1)
+        repo_to_relink = args[0]
+        print(f"Running Phase 2.5 CALLS re-resolution for '{repo_to_relink}' …")
+        if not GITHUB_TOKEN:
+            print("[WARN] GITHUB_TOKEN not set — Pass A (empty-stub re-scan) will be skipped.")
+        with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD)) as driver:
+            files_rescanned, edges_b, edges_c = phase2_5_relink_calls(
+                driver, repo_to_relink, github_token=GITHUB_TOKEN, google_api_key=GOOGLE_API_KEY
+            )
+        print(f"✅ Phase 2.5 COMPLETE — files_rescanned={files_rescanned}  edges_B={edges_b}  edges_C={edges_c}")
         sys.exit(0)
 
     GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN", "")

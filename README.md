@@ -5,16 +5,17 @@ A powerful Python-based application that ingests GitHub repository data into a N
 ## Features
 
 - **One-Click Bootstrap** (`run.sh`):
-  - Automated setup script that creates a template `.env`, starts a Dockerized Neo4j instance with APOC enabled, installs requirements, and runs the ingestion pipeline.
+  - Automated setup script that creates a template `.env`, starts a Dockerized Neo4j instance with APOC enabled, installs requirements, and runs the ingestion pipeline (password set to password123 by default).
 - **Backend Ingestion Pipeline** (`backend_ingest.py`): 
   - Pure Python CLI to bootstrap a GitHub repository into a Neo4j graph.
   - Parses code structure using Tree-sitter (AST). *(Note: Currently supports only Python and Go code)*
   - Uses Google Gemini for LLM-powered summarization of code and commits.
-  - Models repositories, files, functions, commits, and their dependencies in Neo4j.
+  - Models repositories, files, functions, commits, modules, interfaces and their dependencies in Neo4j.
 - **Graph Restoration & Enrichment Scripts** (For existing ingestions):
   - `patch_function_names.py`: Zero-token in-place restoration that fixes AST UTF-8 byte-slicing function truncation without re-running embeddings or LLM summarization.
   - `migrate_calls_edges.py`: Cleans up ambiguous intra-repository call edges and establishes cross-repository symbol links.
   - `enrich_semantic_edges.py`: Automated code intelligence engine that adds 10 high-level semantic relationship layers (e.g., `DECLARES_METHOD`, `IMPLEMENTS`, `WRAPS`, `MUTATES_STATE_OF`).
+  - `backfill_embeddings.py`: Some embeddings of certain functions were skipped due to api call timeout, this file creates missing code embeddings.
 - **Backend API & Hybrid RAG Agent** (`backend/main.py` & `backend/app/`):
   - FastAPI server providing endpoints for agentic chat and code intelligence.
   - Powered by a LangChain Tool-Calling Agent and a Hybrid Retrieval Pipeline (combining vector similarity, full-text commit fallback, structural path hints, and blame traversal).
@@ -49,7 +50,7 @@ A powerful Python-based application that ingests GitHub repository data into a N
    GOOGLE_API_KEY=your_gemini_api_key
    NEO4J_URI=neo4j://localhost:7687
    NEO4J_USER=neo4j
-   NEO4J_PASSWORD=your_neo4j_password
+   NEO4J_PASSWORD=password123
    TARGET_REPO=owner/repo # e.g., neo4j/neo4j-graphrag-python
    MAX_COMMITS=200
    FORCE_LLM_UPDATE=false
@@ -64,11 +65,11 @@ You can easily start a Neo4j instance with the APOC plugin using Docker:
 ```bash
 docker run --name neo4j-graphrag \
   -p 7474:7474 -p 7687:7687 \
-  -e NEO4J_AUTH=neo4j/your_neo4j_password \
+  -e NEO4J_AUTH=neo4j/password123 \
   -e NEO4J_PLUGINS='["apoc"]' \
   -e NEO4J_apoc_export_file_enabled=true \
   -e NEO4J_apoc_import_file_enabled=true \
-  -e NEO4J_dbms_security_procedures_unrestricted=apoc.* \
+  -e NEO4J_dbms_security_procedures_unrestricted="apoc.*" \
   neo4j:5.20
 ```
 
@@ -118,10 +119,86 @@ If you have already ingested a repository into Neo4j before the recent AST bug f
    python3 enrich_semantic_edges.py
    ```
 
+4. **Backfill Embeddings** Some embeddings weren't ingested in previous versions, File for backwards compatibility:
+   ```bash
+   python3 backfill_embeddings.py
+   ```
+
 ## Architecture Overview
 
-- **Graph Model**: The graph models `Repository`, `File`, `Function`, `Commit`, `User`, and `Module` nodes, with rich relationships such as `DECLARES`, `CALLS`, `MODIFIED`, `AUTHORED`, and `DEPENDS_ON`, plus 10 semantic intelligence layers (e.g., `IMPLEMENTS`, `WRAPS`, `MUTATES_STATE_OF`).
-- **LLM Agent**: The UI utilizes a LangChain Tool-Calling Agent equipped with specific tools to perform impact analysis, search commit history, trace git blame ownership, and execute generic Cypher queries against the graph.
+### Graph Schema (Nodes & Relationships)
+
+The knowledge graph models the entire software lifecycle and codebase structure. It contains the following node types and relationship layers:
+
+#### Core Nodes
+- **Repository**: Represents the GitHub repository.
+- **Directory**: Represents the folder hierarchy within the repository.
+- **File**: Represents source code files (supports Python and Go).
+- **Function**: Represents declared functions and methods (including interface method declarations).
+- **Type**: Represents structured types, classes, and interfaces (e.g., structs and interfaces in Go, classes in Python).
+- **Variable**: Represents package-level variables and typed channels (e.g., Go `CHAN` variables).
+- **Directive**: Represents compiler or code-generation instructions (e.g., `go:generate`).
+- **Commit**: Represents git commits parsed from repository history.
+- **User**: Represents git authors/committers.
+- **Module**: Represents imported third-party modules or external packages.
+
+#### Relationships & Semantic Layers
+The pipeline builds explicit structural and semantic links between nodes, categorized into:
+- **Structural AST Edges**:
+  - `CONTAINS` (Directory -> Directory/File): Models filesystem nesting.
+  - `CONTAINS_FILE`/`CONTAINS_DIR` (Repository -> File/Directory).
+  - `DECLARES` (File/Repository -> Function).
+  - `DECLARES_TYPE` (File/Repository -> Type).
+  - `DECLARES_VAR` (File/Repository -> Variable).
+  - `DECLARES_METHOD` (Type -> Function): Binds receiver methods to their parent structs/classes.
+  - `HAS_DIRECTIVE` (File -> Directive).
+  - `DEPENDS_ON` (File -> Module): Represents dependency imports.
+- **Semantic Code Intelligence Edges**:
+  - `EMBEDS` (Type -> Type): Represents struct composition or subclass inheritance.
+  - `IMPLEMENTS` (Type -> Type): Connects structs to structural interfaces they satisfy (Go duck-typing resolution).
+  - `RETURNS` (Function -> Type): Maps functions/methods to their returned types.
+  - `MUTATES_STATE_OF` (Function -> Type): Identifies functions/methods that modify receiver state (e.g., pointer receivers, setter methods).
+  - `TESTS` (Function -> Function): Connects test functions to the units they cover (e.g., `TestFoo` -> `Foo`).
+  - `PROPAGATES_ERROR` (Function -> Function): Traces error handling and bubble-up flows.
+  - `CONSTRAINED_BY` (Function/Type -> Type): Binds generic type parameters to their constraints.
+  - `CHAN_ELEM_TYPE` (Variable -> Type): Identifies elements transmitted over channels.
+  - `GENERATES_TYPE`/`GENERATES_FILE` (Directive -> Type/File): Tracks generated assets.
+  - `LIFECYCLE_HOOK` (Type/Function -> Function): Flags lifecycle callbacks and handlers.
+  - `REGISTERS_WITH` (Function -> Function): Captures callback registration events.
+  - `DISPATCHES_TO`/`FORWARDS_TO` (Function -> Function): Maps message dispatching and proxy forwarding.
+- **Git History & Blame Edges**:
+  - `AUTHORED` (User -> Commit).
+  - `BELONGS_TO` (Commit -> Repository).
+  - `MODIFIED` (Commit -> File/Function).
+
+### Cross-Repository Functionality
+
+When multiple interconnected repositories are ingested into the same Neo4j database, the graph links them at both the dependency and call levels. This cross-repository architecture enables multi-repo impact analysis and cross-module tracking via the following pipeline stages:
+
+1. **Dependency Ingest (`DEPENDS_ON`):**
+   When files are parsed, their external imports are saved as `Module` nodes with a `DEPENDS_ON` relationship from the importing `File`.
+2. **Module-to-Repo Mapping (`REPRESENTS`):**
+   The migration engine maps imported `Module` packages to concrete ingested `Repository` nodes using fuzzy suffix matching:
+   $$\text{Module(name: "github.com/org/helper")} \xrightarrow{\text{REPRESENTS}} \text{Repository(full\_name: "org/helper")}$$
+3. **Cross-Repo File Coupling (`USES_REPO`):**
+   If a parent file's `DEPENDS_ON` module represents another repository in the database, a `USES_REPO` edge is created directly from the parent `File` to that `Repository`.
+4. **Cross-Repo Call Edge Resolution (`CALLS {cross_repo: true}`):**
+   The engine scans AST-parsed qualified calls (e.g., `helper.ComputeData()`) inside a function:
+   - If the package prefix (`helper`) matches a resolved `USES_REPO` repository, and that target repository declares a function named `ComputeData`, a cross-repo `CALLS` edge is established:
+     $$(\text{Function}_{\text{parent}}) \xrightarrow{\text{CALLS } \{\text{cross\_repo: true}\}} (\text{Function}_{\text{helper}})$$
+5. **Transitive Call Propagation (`CALLS {cross_repo: true, via: ...}`):**
+   If local function `A` calls local function `B`, and `B` has a cross-repo call to `C` in the external repository, a transitive edge `(A)-[:CALLS {cross_repo: true, via: B.name}]->(C)` is established to simplify deep upstream query traversals.
+6. **Cross-Repo Impact Analysis:**
+   Using the `CYPHER_CROSS_REPO_IMPACT` logic, users can query downstream impacts of a commit in a dependency repo. For example:
+   ```cypher
+   // Trace from a modified function in the helper repo back to the callers in the parent repo
+   MATCH (c:Commit {sha: $sha})-[:MODIFIED]->(helperFunc:Function)
+   MATCH (parentFunc:Function)-[:CALLS {cross_repo: true}]->(helperFunc)
+   RETURN parentFunc.filepath, parentFunc.name
+   ```
+
+### LLM Agent Workflow
+The UI utilizes a LangChain Tool-Calling Agent equipped with specific tools to perform impact analysis, search commit history, trace git blame ownership, and execute generic Cypher queries against the graph.
 
 ## Token Optimization & Graph Retrieval
 

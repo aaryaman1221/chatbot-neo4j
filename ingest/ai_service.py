@@ -213,7 +213,7 @@ def get_embedding(text: str, api_key: str) -> list:
         return []
     if GENAI_AVAILABLE:
         try:
-            client = google_genai.Client(api_key=api_key, http_options={'timeout': 60.0})
+            client = google_genai.Client(api_key=api_key)
             resp = client.models.embed_content(model="gemini-embedding-2", contents=text)
             return list(resp.embeddings[0].values)
         except Exception as exc:
@@ -226,10 +226,17 @@ def get_embeddings_batch(texts: list, api_key: str) -> list:
     if not texts or not api_key:
         return [[] for _ in texts]
     if GENAI_AVAILABLE:
-        try:
-            client = google_genai.Client(api_key=api_key, http_options={'timeout': 60.0})
-            resp = client.models.embed_content(model="gemini-embedding-2", contents=texts)
-            return [list(emb.values) for emb in resp.embeddings]
-        except Exception as exc:
-            logger.debug("Batch embed failed — falling back to individual calls: %s", exc)
-    return [get_embedding(t, api_key) for t in texts]
+        for attempt in range(5):
+            try:
+                client = google_genai.Client(api_key=api_key)
+                contents_wrapped = [
+                    genai_types.Content(parts=[genai_types.Part.from_text(text=t)]) for t in texts
+                ]
+                resp = client.models.embed_content(model="gemini-embedding-2", contents=contents_wrapped)
+                return [list(emb.values) for emb in resp.embeddings]
+            except Exception as exc:
+                sleep_time = 10 * (attempt + 1)
+                logger.warning("Batch embedding attempt %d failed: %s. Sleeping for %d seconds...", attempt + 1, exc, sleep_time)
+                time.sleep(sleep_time)
+    logger.warning("Batch embedding failed completely after 5 attempts.")
+    return [[] for _ in texts]

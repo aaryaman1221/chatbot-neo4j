@@ -77,6 +77,13 @@ _TEST_COVERAGE_KEYWORDS = ("test", "testing", "tests", "coverage", "covered by t
 _DIRECTIVE_KEYWORDS = ("directive", "directives", "go:generate", "go:build", "go:embed", "build tag", "build tags", "compiler tag", "compiler tags", "embed asset", "embed assets")
 _SCHEMA_KEYWORDS = ("schema", "struct tag", "struct tags", "tag mapping", "tag mappings", "json:", "bson:", "db:", "omitempty", "db tag", "json tag", "bson tag", "database table", "database mapping", "serialize", "serialization")
 
+# Shared keywords for Stage 2.5 context checks
+_SCHEMA_TAGS = ["json", "yaml", "xml", "bson", "db", "toml", "mapstructure"]
+_VARIABLE_KEYWORDS = ["variable", "variables", "constant", "constants", "global", "globals", "errchan", "chan_elem_type"]
+_RETURN_KEYWORDS = ["return type", "returns", "return a", "returns a"]
+_ERROR_RETURN_KEYWORDS = ["return an error", "returns error", "returns an error", "return error"]
+_GENERIC_KEYWORDS = ["generic", "generics", "constraint", "constraints", "constrained by", "comparable"]
+
 
 def _sanitize_lucene_query(query: str) -> str:
     sanitized = re.sub(r'[/\\\?\*~\^\[\]{}()!]', ' ', query)
@@ -200,6 +207,7 @@ class QueryIntent(BaseModel):
     wants_test_coverage: bool = Field(default=False, description="True if asking about test coverage, test functions, which tests run/cover a function, or untested code.")
     wants_directive: bool = Field(default=False, description="True if asking about compiler directives, build tags, go:generate, go:build, or go:embed.")
     wants_schema: bool = Field(default=False, description="True if asking about database mappings, struct tags, BSON, JSON field tags, or serialization schemas.")
+    wants_general: bool = Field(default=False, description="True if the query is a general repository overview or catch-all question with no other specific intent.")
 
     subjects: List[str] = Field(default_factory=list, description="Literal package, module, or symbol names the user is asking about.")
     field_hints: List[str] = Field(default_factory=list, description="Specific struct fields, properties, function signatures, methods, or config keys mentioned.")
@@ -223,6 +231,8 @@ def _cached_llm_intent(query: str, api_key: str) -> Optional[QueryIntent]:
             "- Set wants_test_coverage=True when the query is about test coverage, test functions, which tests cover a struct/function, or untested code.\n"
             "- Set wants_directive=True when the query is about compiler directives, build tags, go:generate, go:build, or go:embed.\n"
             "- Set wants_schema=True when the query is about database mappings, struct tags, BSON, JSON field tags, or serialization schemas.\n"
+            "- Set wants_general=True if the query is a general repository overview or catch-all question with no other specific intent.\n"
+            "- If a subject or repo name has an obvious typo (wrong case, one transposed/missing character) and you are confident of the correction, correct it. If two identifiers are both plausible, extract the literal text as written — do not guess.\n"
             f"Query: {query}"
         )
         if isinstance(intent, QueryIntent): return intent
@@ -240,11 +250,11 @@ def extract_query_intent(query: str, google_api_key: Optional[str] = None) -> Qu
     
     if intent is not None:
         logger.info(
-            "[QUERY_PARSER] ✅ LLM intent extracted: impact=%s blame=%s commit=%s recency=%s structural=%s concurrency=%s test_coverage=%s directive=%s schema=%s subjects=%s",
+            "[QUERY_PARSER] ✅ LLM intent extracted: impact=%s blame=%s commit=%s recency=%s structural=%s concurrency=%s test_coverage=%s directive=%s schema=%s general=%s subjects=%s",
             intent.wants_impact, intent.wants_blame, intent.wants_commit_files, intent.wants_recency, intent.wants_structural,
-            intent.wants_concurrency, intent.wants_test_coverage, intent.wants_directive, intent.wants_schema, intent.subjects,
+            intent.wants_concurrency, intent.wants_test_coverage, intent.wants_directive, intent.wants_schema, intent.wants_general, intent.subjects,
         )
-        return intent
+        return intent.model_copy(deep=True)
 
     # --- Robust Heuristic Fallback Pipeline ---
     logger.info("[QUERY_PARSER] Using fallback regex/keyword intent extraction for query: %r", query[:100])
@@ -259,9 +269,35 @@ def extract_query_intent(query: str, google_api_key: Optional[str] = None) -> Qu
     wants_test_coverage = any(kw in q_lower for kw in _TEST_COVERAGE_KEYWORDS)
     wants_directive = any(kw in q_lower for kw in _DIRECTIVE_KEYWORDS)
     wants_schema = any(kw in q_lower for kw in _SCHEMA_KEYWORDS)
+
+    # Apply priority order: blame > structural > concurrency > test_coverage > directive > schema > commit > recency > impact
+    if wants_blame:
+        wants_structural = wants_concurrency = wants_test_coverage = wants_directive = wants_schema = wants_commit = wants_recency = wants_impact = False
+    elif wants_structural:
+        wants_concurrency = wants_test_coverage = wants_directive = wants_schema = wants_commit = wants_recency = wants_impact = False
+    elif wants_concurrency:
+        wants_test_coverage = wants_directive = wants_schema = wants_commit = wants_recency = wants_impact = False
+    elif wants_test_coverage:
+        wants_directive = wants_schema = wants_commit = wants_recency = wants_impact = False
+    elif wants_directive:
+        wants_schema = wants_commit = wants_recency = wants_impact = False
+    elif wants_schema:
+        wants_commit = wants_recency = wants_impact = False
+    elif wants_commit:
+        wants_recency = wants_impact = False
+    elif wants_recency:
+        wants_impact = False
+
+    wants_general = not (wants_impact or wants_blame or wants_commit or wants_recency or wants_structural or wants_concurrency or wants_test_coverage or wants_directive or wants_schema)
     
-    # Fix: Backfill subjects for structural lookups if impact keywords aren't present
-    subjects = _extract_impact_subjects(query) if (wants_impact or wants_structural or wants_concurrency or wants_test_coverage or wants_directive or wants_schema) else []
+    subjects = []
+    if wants_impact or wants_structural or wants_concurrency or wants_test_coverage or wants_directive or wants_schema:
+        subjects.extend(_extract_impact_subjects(query))
+    if wants_blame or wants_commit:
+        blame_hints = _extract_blame_hints(query)
+        subjects.extend(blame_hints["func_hints"])
+    subjects = list(dict.fromkeys(s.lower() for s in subjects))
+
     field_hints = _extract_field_hints(query)
     repo_hints = _extract_repo_hints_from_query(query)
     file_hints = _extract_path_hints(query)
@@ -276,6 +312,7 @@ def extract_query_intent(query: str, google_api_key: Optional[str] = None) -> Qu
         wants_test_coverage=wants_test_coverage,
         wants_directive=wants_directive,
         wants_schema=wants_schema,
+        wants_general=wants_general,
         subjects=subjects,
         field_hints=field_hints,
         repo_hints=repo_hints,

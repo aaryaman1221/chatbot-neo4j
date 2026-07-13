@@ -3,7 +3,14 @@
 # =============================================================================
 
 import re
+import time
 from typing import List, Optional, Dict, Set
+
+try:
+    from rapidfuzz import process, utils as fuzz_utils
+    _RAPIDFUZZ_AVAILABLE = True
+except ImportError:
+    _RAPIDFUZZ_AVAILABLE = False
 
 from .config import logger
 from .embeddings import get_embedding
@@ -16,7 +23,91 @@ from .query_parser import (
     _extract_repo_hints_from_query,
     extract_query_intent,
     QueryIntent,
+    _SCHEMA_TAGS,
+    _VARIABLE_KEYWORDS,
+    _RETURN_KEYWORDS,
+    _ERROR_RETURN_KEYWORDS,
+    _GENERIC_KEYWORDS,
+    _DIRECTIVE_KEYWORDS,
 )
+
+
+def _repo_filter(var: str, selected_repos: Optional[List[str]]) -> str:
+    """Build a repo-scoping Cypher clause for the given variable name.
+    Replaces the old fragile .replace('consumer.', 'entry.') string-patching."""
+    if not selected_repos:
+        return ""
+    return f"AND ({var}.repo IN $selected_repos OR {var}.full_name IN $selected_repos OR {var}.name IN $selected_repos)"
+
+
+_NAMES_CACHE = {"timestamp": 0.0, "names": []}
+
+def _get_all_graph_names(driver) -> List[str]:
+    now = time.time()
+    if now - _NAMES_CACHE["timestamp"] < 300.0 and _NAMES_CACHE["names"]:
+        return _NAMES_CACHE["names"]
+    
+    query = """
+    MATCH (n)
+    WHERE (n:Repository OR n:Module OR n:File OR n:Function OR n:Type OR n:Variable OR n:Directive)
+    RETURN DISTINCT coalesce(n.name, '') AS name, coalesce(n.full_name, '') AS full_name, coalesce(n.field_names, []) AS f_names
+    """
+    names = set()
+    try:
+        with driver.session() as session:
+            records = session.run(query).data()
+            for r in records:
+                name = r.get("name")
+                if name:
+                    names.add(name)
+                full_name = r.get("full_name")
+                if full_name:
+                    names.add(full_name)
+                for fn in r.get("f_names", []):
+                    if fn:
+                        names.add(fn)
+    except Exception as exc:
+        logger.warning("[FUZZY] Failed to fetch graph names for normalization: %s", exc)
+        
+    res = list(names)
+    _NAMES_CACHE["timestamp"] = now
+    _NAMES_CACHE["names"] = res
+    return res
+
+
+def _normalize_subjects(driver, subjects: List[str]) -> List[str]:
+    if not subjects:
+        return subjects
+    
+    if not _RAPIDFUZZ_AVAILABLE:
+        return subjects
+    
+    all_names = _get_all_graph_names(driver)
+    if not all_names:
+        return subjects
+        
+    normalized = []
+    for subj in subjects:
+        match_res = process.extractOne(
+            subj,
+            all_names,
+            processor=fuzz_utils.default_process,
+            score_cutoff=80.0
+        )
+        if match_res:
+            matched_name = match_res[0]
+            # Prevent short generic names (e.g. "ng") from matching long queries
+            if len(matched_name) <= 3 and len(subj) > len(matched_name) + 2:
+                logger.info("[FUZZY] Rejected short match %r for subject %r", matched_name, subj)
+                normalized.append(subj)
+            else:
+                logger.info("[FUZZY] Normalized subject %r -> %r (score: %.1f)", subj, matched_name, match_res[1])
+                normalized.append(matched_name)
+        else:
+            normalized.append(subj)
+            
+    return list(dict.fromkeys(normalized))
+
 
 
 def _build_context_block(
@@ -254,282 +345,275 @@ def _run_impact_traversal(
     subjects: List[str],
     selected_repos: Optional[List[str]] = None,
 ) -> list[dict]:
-    """Traverse the graph to find every File and Function that depends on/imports/calls the subjects."""
+    """Traverse the graph to find every File and Function that depends on/imports/calls the subjects.
+
+    Batched version: seed discovery still runs per-subject (subject text differs per query),
+    but every downstream traversal (consumer aggregation, detailed consumers, multi-hop,
+    reverse deps) runs ONCE per query-type across ALL seeds found, via UNWIND — instead of
+    once per seed. This turns O(subjects * seeds * 4) round trips into O(subjects + 4).
+    """
     results: list[dict] = []
     seen_ids: set[str] = set()
+    all_seeds: list[dict] = []  # [{seed_id, seed_label, seed_name, seed_path}, ...]
 
-    for subject in subjects:
-        subject_lower = subject.lower()
+    with driver.session() as session:
+        # ── Phase 1: seed discovery (per-subject — text differs, can't batch this part) ──
+        for subject in subjects:
+            subject_lower = subject.lower()
 
-        seed_cypher = """
-        MATCH (seed)
-        WHERE (
-            seed:Repository OR seed:Module OR seed:File OR seed:Function OR seed:Type OR seed:Variable OR seed:Directive
-        )
-        AND NOT toLower(coalesce(seed.path, seed.filepath, '')) =~ '.*\\.(md|txt|json|yaml|yml|html|css|rst|toml)$'
-        AND (
-            toLower(coalesce(seed.name, ''))     CONTAINS $subject
-            OR toLower(coalesce(seed.path, ''))  CONTAINS $subject
-            OR toLower(coalesce(seed.full_name, '')) CONTAINS $subject
-        )
-        RETURN
-          elementId(seed)                                         AS seed_id,
-          labels(seed)[0]                                  AS seed_label,
-          coalesce(seed.name, seed.path, seed.full_name)   AS seed_name,
-          coalesce(seed.path, seed.filepath, seed.full_name, '') AS seed_path
-        LIMIT 20
-        """
-        try:
-            with driver.session() as session:
-                seed_rows = session.run(seed_cypher, subject=subject_lower).data()
-        except Exception as exc:
-            logger.warning("[IMPACT] Seed query for %r failed: %s", subject, exc)
-            seed_rows = []
-
-        logger.info(
-            "[IMPACT] Subject=%r → %d seed node(s) found.", subject, len(seed_rows)
-        )
-
-        if not seed_rows:
-            fallback_cypher = """
-            MATCH (f:File)
-            WHERE toLower(f.path) CONTAINS $subject
-              AND NOT toLower(f.path) =~ '.*\\.(md|txt|json|yaml|yml|html|css|rst|toml)$'
-            RETURN
-              elementId(f)     AS seed_id,
-              'File'    AS seed_label,
-              f.path    AS seed_name,
-              f.path    AS seed_path
-            LIMIT 10
-            """
-            try:
-                with driver.session() as session:
-                    seed_rows = session.run(fallback_cypher, subject=subject_lower).data()
-                logger.info(
-                    "[IMPACT] Fallback file-path search %r → %d result(s).",
-                    subject, len(seed_rows),
-                )
-            except Exception as exc:
-                logger.warning("[IMPACT] Fallback query for %r failed: %s", subject, exc)
-
-        for seed in seed_rows:
-            seed_id   = seed["seed_id"]
-            seed_name = seed["seed_name"]
-            seed_path = seed["seed_path"]
-
-            repo_filter = (
-                "AND (consumer.repo IN $selected_repos OR consumer.full_name IN $selected_repos OR consumer.name IN $selected_repos)"
-                if selected_repos else ""
+            seed_cypher = """
+            MATCH (seed)
+            WHERE (
+                seed:Repository OR seed:Module OR seed:File OR seed:Function OR seed:Type OR seed:Variable OR seed:Directive
             )
-            consumer_cypher = f"""
-            MATCH (consumer)-[rel:DEPENDS_ON|CALLS|USES_REPO|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD|DECLARES|DECLARES_TYPE|DECLARES_VAR|HAS_DIRECTIVE|PROPAGATES_ERROR|RETURNS|CONSTRAINED_BY|CHAN_ELEM_TYPE|TESTS|GENERATES_TYPE|GENERATES_FILE]->(seed)
-            WHERE elementId(seed) = $seed_id
-              AND (consumer:File OR consumer:Function OR consumer:Module OR consumer:Type OR consumer:Repository)
-              {repo_filter}
-            WITH coalesce(consumer.repo, 'local / unscoped') AS repository,
-                 type(rel) AS dependency_type,
-                 labels(consumer)[0] AS consumer_type,
-                 consumer
-            RETURN repository,
-                   dependency_type,
-                   consumer_type,
-                   count(consumer) AS total_impacted_items,
-                   collect(DISTINCT case 
-                       when consumer:Function then coalesce(consumer.filepath, consumer.path, '') + ' :: ' + consumer.name 
-                       else coalesce(consumer.path, consumer.filepath, '') 
-                   end)[0..25] AS top_sample_locations
-            ORDER BY total_impacted_items DESC
-            """
-            try:
-                with driver.session() as session:
-                    consumer_rows = session.run(
-                        consumer_cypher,
-                        seed_id=seed_id,
-                        selected_repos=selected_repos or [],
-                    ).data()
-                logger.info(
-                    "[IMPACT] Seed id=%s (%s) → %d aggregated repo group(s).",
-                    seed_id, seed_name, len(consumer_rows),
-                )
-            except Exception as exc:
-                logger.warning("[IMPACT] Consumer aggregation traversal for seed id=%s failed: %s", seed_id, exc)
-                consumer_rows = []
-
-            seed_uid = f"{seed_path}::{seed_name}"
-            if seed_uid not in seen_ids:
-                seen_ids.add(seed_uid)
-                results.append({
-                    "name":     seed_name,
-                    "filepath": seed_path,
-                    "repo":     "",
-                    "rel_type": "SUBJECT (being moved/refactored)",
-                    "code":     "",
-                    "connected": [],
-                })
-
-            for row in consumer_rows:
-                repo_name = row.get("repository") or "unknown"
-                dep_type = row.get("dependency_type") or "DEPENDS_ON"
-                cons_type = row.get("consumer_type") or "Node"
-                count_items = row.get("total_impacted_items") or 0
-                samples = row.get("top_sample_locations") or []
-                
-                uid = f"agg::{repo_name}::{dep_type}::{seed_name}"
-                if uid not in seen_ids:
-                    seen_ids.add(uid)
-                    sample_str = "\n".join(f"  • {loc}" for loc in samples)
-                    omitted_cnt = count_items - len(samples)
-                    omitted_note = f"\n  ... and {omitted_cnt} additional dependent items not shown in this summary." if omitted_cnt > 0 else ""
-                    results.append({
-                        "name":     f"Repo: {repo_name} ({count_items} impacted {cons_type}s)",
-                        "filepath": f"Aggregated Impact Summary | Repo: {repo_name}",
-                        "repo":     repo_name,
-                        "rel_type": f"AGGREGATED_{dep_type} ({count_items} items affected)",
-                        "code":     f"The graph reports exactly {count_items} dependent items in repository '{repo_name}'.\nRetrieved sample locations ({len(samples)} of {count_items} shown):\n{sample_str}{omitted_note}",
-                        "connected": [],
-                    })
-
-            # Detailed consumers to get code blocks / name symbols of direct dependers
-            detailed_consumer_cypher = f"""
-            MATCH (consumer)-[rel:DEPENDS_ON|CALLS|USES_REPO|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD|DECLARES|DECLARES_TYPE|DECLARES_VAR|HAS_DIRECTIVE|PROPAGATES_ERROR|RETURNS|CONSTRAINED_BY|CHAN_ELEM_TYPE|TESTS|GENERATES_TYPE|GENERATES_FILE]->(seed)
-            WHERE elementId(seed) = $seed_id
-              AND (consumer:File OR consumer:Function OR consumer:Module OR consumer:Type OR consumer:Repository)
-              {repo_filter}
+            AND NOT toLower(coalesce(seed.path, seed.filepath, '')) =~ '.*\\.(md|txt|json|yaml|yml|html|css|rst|toml)$'
+            AND (
+                toLower(coalesce(seed.name, ''))     CONTAINS $subject
+                OR toLower(coalesce(seed.path, ''))  CONTAINS $subject
+                OR toLower(coalesce(seed.full_name, '')) CONTAINS $subject
+            )
             RETURN
-              consumer.name                                             AS name,
-              coalesce(consumer.filepath, consumer.path, '')            AS filepath,
-              coalesce(consumer.repo, '')                               AS repo,
-              coalesce(consumer.code, '')                               AS code,
-              type(rel)                                                 AS rel_type,
-              labels(consumer)[0]                                       AS seed_label
-            LIMIT 30
-            """
-            try:
-                with driver.session() as session:
-                    detail_rows = session.run(
-                        detailed_consumer_cypher,
-                        seed_id=seed_id,
-                        selected_repos=selected_repos or [],
-                    ).data()
-                logger.info(
-                    "[IMPACT] Seed id=%s (%s) → %d detailed consumer(s) fetched.",
-                    seed_id, seed_name, len(detail_rows),
-                )
-            except Exception as exc:
-                logger.warning("[IMPACT] Detailed consumer query for seed id=%s failed: %s", seed_id, exc)
-                detail_rows = []
-
-            for row in detail_rows:
-                c_name = row.get("name") or ""
-                c_path = row.get("filepath") or ""
-                c_repo = row.get("repo") or ""
-                c_code = row.get("code") or ""
-                c_rel  = row.get("rel_type") or "DEPENDS_ON"
-                c_lbl  = row.get("seed_label") or "Node"
-                
-                uid = f"detail::{c_repo}::{c_path}::{c_name}::{c_rel}"
-                if uid not in seen_ids:
-                    seen_ids.add(uid)
-                    results.append({
-                        "name":     c_name,
-                        "filepath": c_path,
-                        "repo":     c_repo,
-                        "rel_type": c_rel,
-                        "code":     c_code,
-                        "connected": [],
-                    })
-
-            # ── Cross-Repo Multi-Hop Traversal ─────────────────────────────────
-            multihop_cypher = f"""
-            MATCH (entry:Function)-[:CALLS|DISPATCHES_TO|FORWARDS_TO*1..3]->(callee:Function)-[:CALLS|DEPENDS_ON|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD|DECLARES|DECLARES_TYPE|DECLARES_VAR|HAS_DIRECTIVE|PROPAGATES_ERROR|RETURNS|CONSTRAINED_BY|CHAN_ELEM_TYPE|TESTS|GENERATES_TYPE|GENERATES_FILE]->(seed)
-            WHERE elementId(seed) = $seed_id
-              AND (
-                  coalesce(entry.repo, '') <> coalesce(seed.repo, '') 
-                  OR entry.entry_point = true 
-                  OR entry.name IN ['main', 'init', 'execute', 'run', 'ServeHTTP']
-                  OR entry.name STARTS WITH 'Test'
-              )
-              {repo_filter.replace('consumer.', 'entry.')}
-            RETURN coalesce(entry.repo, 'local') AS repository,
-                   coalesce(entry.filepath, entry.path, '') AS entrypoint_file,
-                   entry.name AS entrypoint_func,
-                   count(*) AS call_paths
-            ORDER BY call_paths DESC
-            LIMIT 15
-            """
-            try:
-                with driver.session() as session:
-                    multihop_rows = session.run(
-                        multihop_cypher,
-                        seed_id=seed_id,
-                        selected_repos=selected_repos or [],
-                    ).data()
-                logger.info(
-                    "[IMPACT] Seed id=%s (%s) → %d multi-hop entrypoint(s).",
-                    seed_id, seed_name, len(multihop_rows),
-                )
-            except Exception as exc:
-                logger.warning("[IMPACT] Multi-hop traversal for seed id=%s failed: %s", seed_id, exc)
-                multihop_rows = []
-
-            for row in multihop_rows:
-                repo_name = row.get("repository") or "unknown"
-                efile = row.get("entrypoint_file") or ""
-                efunc = row.get("entrypoint_func") or "<unknown>"
-                paths_cnt = row.get("call_paths") or 1
-                
-                uid = f"mh::{repo_name}::{efile}::{efunc}"
-                if uid not in seen_ids:
-                    seen_ids.add(uid)
-                    results.append({
-                        "name":     efunc,
-                        "filepath": efile,
-                        "repo":     repo_name,
-                        "rel_type": f"MULTI_HOP_ENTRYPOINT (via {paths_cnt} transitive call path(s))",
-                        "code":     f"Critical entrypoint or top-level workflow in repository '{repo_name}' that transitively depends on '{seed_name}'.",
-                        "connected": [],
-                    })
-
-            reverse_cypher = f"""
-            MATCH (seed)-[rel:DEPENDS_ON|CALLS|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD|DECLARES|DECLARES_TYPE|DECLARES_VAR|HAS_DIRECTIVE|PROPAGATES_ERROR|RETURNS|CONSTRAINED_BY|CHAN_ELEM_TYPE|TESTS|GENERATES_TYPE|GENERATES_FILE]->(dep)
-            WHERE elementId(seed) = $seed_id
-              AND (dep:File OR dep:Function OR dep:Module OR dep:Type OR dep:Repository)
-              {repo_filter.replace('consumer.', 'dep.')}
-            RETURN
-              dep.name                                         AS name,
-              coalesce(dep.filepath, dep.path, '')             AS filepath,
-              coalesce(dep.repo, '')                           AS repo,
-              type(rel)                                        AS rel_type_raw,
-              coalesce(dep.code, '')                           AS code
+              elementId(seed)                                         AS seed_id,
+              labels(seed)[0]                                  AS seed_label,
+              coalesce(seed.name, seed.path, seed.full_name)   AS seed_name,
+              coalesce(seed.path, seed.filepath, seed.full_name, '') AS seed_path
+            ORDER BY case when toLower(coalesce(seed.name, seed.full_name, '')) = $subject then 0 else 1 end
             LIMIT 20
             """
             try:
-                with driver.session() as session:
-                    dep_rows = session.run(
-                        reverse_cypher,
-                        seed_id=seed_id,
-                        selected_repos=selected_repos or [],
-                    ).data()
-                logger.info(
-                    "[IMPACT] Seed id=%s outbound deps → %d node(s).",
-                    seed_id, len(dep_rows),
-                )
+                seed_rows = session.run(seed_cypher, subject=subject_lower).data()
             except Exception as exc:
-                logger.warning("[IMPACT] Reverse traversal for seed id=%s failed: %s", seed_id, exc)
-                dep_rows = []
+                logger.warning("[IMPACT] Seed query for %r failed: %s", subject, exc)
+                seed_rows = []
 
-            for row in dep_rows:
-                uid = f"{row.get('filepath')}::{row.get('name')}"
-                if uid not in seen_ids:
-                    seen_ids.add(uid)
+            logger.info("[IMPACT] Subject=%r → %d seed node(s) found.", subject, len(seed_rows))
+
+            if not seed_rows:
+                fallback_cypher = """
+                MATCH (f:File)
+                WHERE toLower(f.path) CONTAINS $subject
+                  AND NOT toLower(f.path) =~ '.*\\.(md|txt|json|yaml|yml|html|css|rst|toml)$'
+                RETURN
+                  elementId(f)     AS seed_id,
+                  'File'    AS seed_label,
+                  f.path    AS seed_name,
+                  f.path    AS seed_path
+                LIMIT 10
+                """
+                try:
+                    seed_rows = session.run(fallback_cypher, subject=subject_lower).data()
+                    logger.info(
+                        "[IMPACT] Fallback file-path search %r → %d result(s).",
+                        subject, len(seed_rows),
+                    )
+                except Exception as exc:
+                    logger.warning("[IMPACT] Fallback query for %r failed: %s", subject, exc)
+
+            for seed in seed_rows:
+                seed_uid = f"{seed['seed_path']}::{seed['seed_name']}"
+                if seed_uid not in seen_ids:
+                    seen_ids.add(seed_uid)
                     results.append({
-                        "name":     row.get("name") or "<unknown>",
-                        "filepath": row.get("filepath") or "",
-                        "repo":     row.get("repo") or "",
-                        "rel_type": "OUTBOUND_" + (row.get("rel_type_raw") or "EDGE"),
-                        "code":     row.get("code") or "",
+                        "name":     seed["seed_name"],
+                        "filepath": seed["seed_path"],
+                        "repo":     "",
+                        "rel_type": "SUBJECT (being moved/refactored)",
+                        "code":     "",
                         "connected": [],
                     })
+                all_seeds.append(seed)
+
+        if not all_seeds:
+            return results
+
+        seed_ids = list({s["seed_id"] for s in all_seeds})
+        seed_meta = {s["seed_id"]: s for s in all_seeds}  # for attribution back to seed_name
+
+        rel_types = (
+            "DEPENDS_ON|CALLS|USES_REPO|IMPLEMENTS|WRAPS|PRODUCES|LIFECYCLE_HOOK|"
+            "REGISTERS_WITH|DISPATCHES_TO|FORWARDS_TO|EMBEDS|DECLARES_METHOD|DECLARES|"
+            "DECLARES_TYPE|DECLARES_VAR|HAS_DIRECTIVE|PROPAGATES_ERROR|RETURNS|"
+            "CONSTRAINED_BY|CHAN_ELEM_TYPE|TESTS|GENERATES_TYPE|GENERATES_FILE"
+        )
+        consumer_filter = _repo_filter("consumer", selected_repos)
+        entry_filter    = _repo_filter("entry", selected_repos)
+        dep_filter      = _repo_filter("dep", selected_repos)
+
+        # ── Phase 2a: batched consumer aggregation across ALL seeds ────────────
+        consumer_cypher = f"""
+        UNWIND $seed_ids AS sid
+        MATCH (consumer)-[rel:{rel_types}]->(seed)
+        WHERE elementId(seed) = sid
+          AND (consumer:File OR consumer:Function OR consumer:Module OR consumer:Type OR consumer:Repository)
+          {consumer_filter}
+        WITH sid, coalesce(consumer.repo, 'local / unscoped') AS repository,
+             type(rel) AS dependency_type,
+             labels(consumer)[0] AS consumer_type,
+             consumer
+        RETURN sid,
+               repository,
+               dependency_type,
+               consumer_type,
+               count(consumer) AS total_impacted_items,
+               collect(DISTINCT case
+                   when consumer:Function then coalesce(consumer.filepath, consumer.path, '') + ' :: ' + consumer.name
+                   else coalesce(consumer.path, consumer.filepath, '')
+               end)[0..25] AS top_sample_locations
+        ORDER BY total_impacted_items DESC
+        """
+        try:
+            consumer_rows = session.run(
+                consumer_cypher, seed_ids=seed_ids, selected_repos=selected_repos or [],
+            ).data()
+            logger.info("[IMPACT] Batched consumer aggregation → %d row(s) across %d seed(s).",
+                        len(consumer_rows), len(seed_ids))
+        except Exception as exc:
+            logger.warning("[IMPACT] Batched consumer aggregation failed: %s", exc)
+            consumer_rows = []
+
+        for row in consumer_rows:
+            seed_name = seed_meta.get(row["sid"], {}).get("seed_name", "")
+            repo_name = row.get("repository") or "unknown"
+            dep_type = row.get("dependency_type") or "DEPENDS_ON"
+            cons_type = row.get("consumer_type") or "Node"
+            count_items = row.get("total_impacted_items") or 0
+            samples = row.get("top_sample_locations") or []
+
+            uid = f"agg::{repo_name}::{dep_type}::{seed_name}"
+            if uid not in seen_ids:
+                seen_ids.add(uid)
+                sample_str = "\n".join(f"  • {loc}" for loc in samples)
+                omitted_cnt = count_items - len(samples)
+                omitted_note = (
+                    f"\n  ... and {omitted_cnt} additional dependent items not shown in this summary."
+                    if omitted_cnt > 0 else ""
+                )
+                results.append({
+                    "name":     f"Repo: {repo_name} ({count_items} impacted {cons_type}s)",
+                    "filepath": f"Aggregated Impact Summary | Repo: {repo_name}",
+                    "repo":     repo_name,
+                    "rel_type": f"AGGREGATED_{dep_type} ({count_items} items affected)",
+                    "code":     f"The graph reports exactly {count_items} dependent items in repository '{repo_name}'.\nRetrieved sample locations ({len(samples)} of {count_items} shown):\n{sample_str}{omitted_note}",
+                    "connected": [],
+                })
+
+        # ── Phase 2b: batched detailed consumers (code blocks) across ALL seeds ─
+        detailed_consumer_cypher = f"""
+        UNWIND $seed_ids AS sid
+        MATCH (consumer)-[rel:{rel_types}]->(seed)
+        WHERE elementId(seed) = sid
+          AND (consumer:File OR consumer:Function OR consumer:Module OR consumer:Type OR consumer:Repository)
+          {consumer_filter}
+        RETURN
+          sid,
+          consumer.name                                             AS name,
+          coalesce(consumer.filepath, consumer.path, '')            AS filepath,
+          coalesce(consumer.repo, '')                               AS repo,
+          coalesce(consumer.code, '')                                AS code,
+          type(rel)                                                 AS rel_type,
+          labels(consumer)[0]                                       AS seed_label
+        LIMIT 300
+        """
+        try:
+            detail_rows = session.run(
+                detailed_consumer_cypher, seed_ids=seed_ids, selected_repos=selected_repos or [],
+            ).data()
+            logger.info("[IMPACT] Batched detailed consumers → %d row(s).", len(detail_rows))
+        except Exception as exc:
+            logger.warning("[IMPACT] Batched detailed consumer query failed: %s", exc)
+            detail_rows = []
+
+        for row in detail_rows:
+            c_name, c_path, c_repo = row.get("name") or "", row.get("filepath") or "", row.get("repo") or ""
+            c_code, c_rel = row.get("code") or "", row.get("rel_type") or "DEPENDS_ON"
+            uid = f"detail::{c_repo}::{c_path}::{c_name}::{c_rel}"
+            if uid not in seen_ids:
+                seen_ids.add(uid)
+                results.append({
+                    "name": c_name, "filepath": c_path, "repo": c_repo,
+                    "rel_type": c_rel, "code": c_code, "connected": [],
+                })
+
+        # ── Phase 2c: batched cross-repo multi-hop entrypoints across ALL seeds ─
+        multihop_cypher = f"""
+        UNWIND $seed_ids AS sid
+        MATCH (entry:Function)-[:CALLS|DISPATCHES_TO|FORWARDS_TO*1..3]->(callee:Function)-[:{rel_types}]->(seed)
+        WHERE elementId(seed) = sid
+          AND (
+              coalesce(entry.repo, '') <> coalesce(seed.repo, '')
+              OR entry.entry_point = true
+              OR entry.name IN ['main', 'init', 'execute', 'run', 'ServeHTTP']
+              OR entry.name STARTS WITH 'Test'
+          )
+          {entry_filter}
+        WITH sid, coalesce(entry.repo, 'local') AS repository,
+             coalesce(entry.filepath, entry.path, '') AS entrypoint_file,
+             entry.name AS entrypoint_func
+        RETURN sid, repository, entrypoint_file, entrypoint_func, count(*) AS call_paths
+        ORDER BY call_paths DESC
+        LIMIT 150
+        """
+        try:
+            multihop_rows = session.run(
+                multihop_cypher, seed_ids=seed_ids, selected_repos=selected_repos or [],
+            ).data()
+            logger.info("[IMPACT] Batched multi-hop entrypoints → %d row(s).", len(multihop_rows))
+        except Exception as exc:
+            logger.warning("[IMPACT] Batched multi-hop traversal failed: %s", exc)
+            multihop_rows = []
+
+        for row in multihop_rows:
+            seed_name = seed_meta.get(row["sid"], {}).get("seed_name", "")
+            repo_name = row.get("repository") or "unknown"
+            efile, efunc = row.get("entrypoint_file") or "", row.get("entrypoint_func") or "<unknown>"
+            paths_cnt = row.get("call_paths") or 1
+            uid = f"mh::{repo_name}::{efile}::{efunc}"
+            if uid not in seen_ids:
+                seen_ids.add(uid)
+                results.append({
+                    "name": efunc, "filepath": efile, "repo": repo_name,
+                    "rel_type": f"MULTI_HOP_ENTRYPOINT (via {paths_cnt} transitive call path(s))",
+                    "code": f"Critical entrypoint or top-level workflow in repository '{repo_name}' that transitively depends on '{seed_name}'.",
+                    "connected": [],
+                })
+
+        # ── Phase 2d: batched reverse (outbound) deps across ALL seeds ──────────
+        reverse_cypher = f"""
+        UNWIND $seed_ids AS sid
+        MATCH (seed)-[rel:{rel_types}]->(dep)
+        WHERE elementId(seed) = sid
+          AND (dep:File OR dep:Function OR dep:Module OR dep:Type OR dep:Repository)
+          {dep_filter}
+        RETURN
+          sid,
+          dep.name                                         AS name,
+          coalesce(dep.filepath, dep.path, '')             AS filepath,
+          coalesce(dep.repo, '')                           AS repo,
+          type(rel)                                        AS rel_type_raw,
+          coalesce(dep.code, '')                            AS code
+        LIMIT 200
+        """
+        try:
+            dep_rows = session.run(
+                reverse_cypher, seed_ids=seed_ids, selected_repos=selected_repos or [],
+            ).data()
+            logger.info("[IMPACT] Batched reverse traversal → %d row(s).", len(dep_rows))
+        except Exception as exc:
+            logger.warning("[IMPACT] Batched reverse traversal failed: %s", exc)
+            dep_rows = []
+
+        for row in dep_rows:
+            uid = f"{row.get('filepath')}::{row.get('name')}"
+            if uid not in seen_ids:
+                seen_ids.add(uid)
+                results.append({
+                    "name": row.get("name") or "<unknown>",
+                    "filepath": row.get("filepath") or "",
+                    "repo": row.get("repo") or "",
+                    "rel_type": "OUTBOUND_" + (row.get("rel_type_raw") or "EDGE"),
+                    "code": row.get("code") or "",
+                    "connected": [],
+                })
 
     return results
 
@@ -548,113 +632,115 @@ def _run_structural_traversal(
     3. Optionally filter implementors by target_repos.
     4. For each implementor, fetch the DECLARES_METHOD edges to surface the
        specific methods that satisfy the interface contract.
-    5. As a fallback, text-grep Function nodes whose code contains both a
+    5. As a fallback, text-grep Function/Type nodes whose code contains both a
        subject interface name and a method receiver pattern.
     """
     results: list[dict] = []
     seen_ids: set[str] = set()
+    all_ifaces = []
+    iface_meta = {}
 
-    for subject in subjects:
-        subject_lower = subject.lower()
+    with driver.session() as session:
+        for subject in subjects:
+            subject_lower = subject.lower()
 
-        # ── Step 1: locate interface / type seed nodes ────────────────────────
-        iface_cypher = """
-        MATCH (iface)
-        WHERE (iface:Type OR iface:Function)
-          AND (
-              toLower(coalesce(iface.name, ''))      CONTAINS $subject
-           OR toLower(coalesce(iface.full_name, '')) CONTAINS $subject
-           OR toLower(coalesce(iface.path, ''))      CONTAINS $subject
-          )
-        OPTIONAL MATCH (iface)-[:DECLARES_METHOD]->(meth:Function)
-        WITH iface, collect(DISTINCT {name: meth.name, code: coalesce(meth.code, '')})[..20] AS iface_methods
-        RETURN
-          elementId(iface)                                           AS iface_id,
-          coalesce(iface.name, iface.full_name, iface.path)         AS iface_name,
-          coalesce(iface.kind, labels(iface)[0])                    AS iface_kind,
-          coalesce(iface.code, '')                                   AS iface_code,
-          coalesce(iface.filepath, iface.path, iface.full_name, '') AS iface_path,
-          coalesce(iface.repo, '')                                   AS iface_repo,
-          coalesce(iface.method_names, [])                          AS iface_method_names,
-          iface_methods
-        ORDER BY 
-          case when toLower(coalesce(iface.name, '')) = toLower($subject) then 0 else 1 end,
-          case when iface:Type then 0 else 1 end,
-          size(coalesce(iface.code, '')) DESC
-        LIMIT 30
-        """
-        try:
-            with driver.session() as session:
+            # ── Step 1: locate interface / type seed nodes ────────────────────────
+            iface_cypher = """
+            MATCH (iface)
+            WHERE (iface:Type OR iface:Function)
+              AND (
+                  toLower(coalesce(iface.name, ''))      CONTAINS $subject
+               OR toLower(coalesce(iface.full_name, '')) CONTAINS $subject
+               OR toLower(coalesce(iface.path, ''))      CONTAINS $subject
+              )
+            OPTIONAL MATCH (iface)-[:DECLARES_METHOD]->(meth:Function)
+            WITH iface, collect(DISTINCT {name: meth.name, code: coalesce(meth.code, '')})[..20] AS iface_methods
+            RETURN
+              elementId(iface)                                           AS iface_id,
+              coalesce(iface.name, iface.full_name, iface.path)         AS iface_name,
+              coalesce(iface.kind, labels(iface)[0])                    AS iface_kind,
+              coalesce(iface.code, '')                                   AS iface_code,
+              coalesce(iface.filepath, iface.path, iface.full_name, '') AS iface_path,
+              coalesce(iface.repo, '')                                   AS iface_repo,
+              coalesce(iface.method_names, [])                          AS iface_method_names,
+              iface_methods
+            ORDER BY 
+              case when toLower(coalesce(iface.name, '')) = toLower($subject) then 0 else 1 end,
+              case when iface:Type then 0 else 1 end,
+              size(coalesce(iface.code, '')) DESC
+            LIMIT 30
+            """
+            try:
                 iface_rows = session.run(iface_cypher, subject=subject_lower).data()
-        except Exception as exc:
-            logger.warning("[STRUCTURAL] Interface seed query for %r failed: %s", subject, exc)
-            iface_rows = []
+            except Exception as exc:
+                logger.warning("[STRUCTURAL] Interface seed query for %r failed: %s", subject, exc)
+                iface_rows = []
 
-        logger.info(
-            "[STRUCTURAL] subject=%r → %d interface/type seed(s).", subject, len(iface_rows)
-        )
+            logger.info(
+                "[STRUCTURAL] subject=%r → %d interface/type seed(s).", subject, len(iface_rows)
+            )
 
-        # Always emit the interface definition itself as context.
-        # C2: when code is absent, synthesise a contract block from method_names /
-        # materialised DECLARES_METHOD Function nodes so the LLM is never blind.
-        for iface in iface_rows:
-            uid = f"iface::{iface.get('iface_path')}::{iface.get('iface_name')}"
-            if uid not in seen_ids:
-                seen_ids.add(uid)
+            # Always emit the interface definition itself as context.
+            for iface in iface_rows:
+                iface_id = iface["iface_id"]
+                if iface_id not in iface_meta:
+                    iface_meta[iface_id] = iface
+                    all_ifaces.append(iface)
 
-                raw_code      = (iface.get("iface_code") or "").strip()
-                method_names  = iface.get("iface_method_names") or []
-                iface_methods = iface.get("iface_methods") or []
+                uid = f"iface::{iface.get('iface_path')}::{iface.get('iface_name')}"
+                if uid not in seen_ids:
+                    seen_ids.add(uid)
 
-                # Build a synthetic interface contract block if code is missing
-                if not raw_code:
-                    # Prefer full signatures from materialised Function nodes
-                    sigs = [
-                        m["code"].strip()
+                    raw_code      = (iface.get("iface_code") or "").strip()
+                    method_names  = iface.get("iface_method_names") or []
+                    iface_methods = iface.get("iface_methods") or []
+
+                    # Build a synthetic interface contract block if code is missing
+                    if not raw_code:
+                        # Prefer full signatures from materialised Function nodes
+                        sigs = [
+                            m["code"].strip()
+                            for m in iface_methods
+                            if m.get("name") and m.get("code", "").strip()
+                        ]
+                        if not sigs and method_names:
+                            sigs = [f"    {mn}(...)" for mn in method_names]
+                        if sigs:
+                            iface_name = iface.get("iface_name") or subject
+                            raw_code = (
+                                f"type {iface_name} interface {{\n"
+                                + "\n".join(f"    {s}" if not s.startswith("    ") else s for s in sigs)
+                                + "\n}"
+                            )
+
+                    # Build connected list from materialised DECLARES_METHOD methods
+                    connected = [
+                        {"name": m.get("name"), "path": iface.get("iface_path"), "code": m.get("code")}
                         for m in iface_methods
                         if m.get("name") and m.get("code", "").strip()
                     ]
-                    if not sigs and method_names:
-                        sigs = [f"    {mn}(...)" for mn in method_names]
-                    if sigs:
-                        iface_name = iface.get("iface_name") or subject
-                        raw_code = (
-                            f"type {iface_name} interface {{\n"
-                            + "\n".join(f"    {s}" if not s.startswith("    ") else s for s in sigs)
-                            + "\n}"
-                        )
 
-                # Build connected list from materialised DECLARES_METHOD methods
-                connected = [
-                    {"name": m.get("name"), "path": iface.get("iface_path"), "code": m.get("code")}
-                    for m in iface_methods
-                    if m.get("name") and m.get("code", "").strip()
-                ]
+                    results.append({
+                        "name":      iface.get("iface_name") or "<unknown>",
+                        "filepath":  iface.get("iface_path") or "",
+                        "repo":      iface.get("iface_repo") or "",
+                        "rel_type":  "INTERFACE_DEFINITION",
+                        "code":      raw_code,
+                        "connected": connected,
+                    })
 
-                results.append({
-                    "name":      iface.get("iface_name") or "<unknown>",
-                    "filepath":  iface.get("iface_path") or "",
-                    "repo":      iface.get("iface_repo") or "",
-                    "rel_type":  "INTERFACE_DEFINITION",
-                    "code":      raw_code,
-                    "connected": connected,
-                })
-
-        # ── Step 2 & 3: find implementors via IMPLEMENTS edges ─────────────────
-        target_repo_filter = (
-            "AND (impl.repo IN $target_repos OR impl.full_name IN $target_repos OR impl.name IN $target_repos)"
-            if target_repos else ""
-        )
-        for iface in iface_rows:
-            iface_id = iface["iface_id"]
-            iface_name = iface.get("iface_name") or subject
+        # ── Step 2 & 3: find implementors via IMPLEMENTS edges (batched) ────────
+        if all_ifaces:
+            iface_ids = list(iface_meta.keys())
+            target_repo_filter = _repo_filter("impl", target_repos)
 
             impl_cypher = f"""
+            UNWIND $iface_ids AS iface_id
             MATCH (impl:Type)-[rel:IMPLEMENTS|EMBEDS]->(iface)
-            WHERE elementId(iface) = $iface_id
+            WHERE elementId(iface) = iface_id
               {target_repo_filter}
             OPTIONAL MATCH (impl)-[:DECLARES_METHOD]->(meth:Function)
-            WITH impl, rel,
+            WITH iface_id, impl, rel,
                  collect(DISTINCT {{
                    name: meth.name,
                    path: coalesce(meth.filepath, meth.path, ''),
@@ -662,6 +748,7 @@ def _run_structural_traversal(
                    is_pointer_receiver: meth.is_pointer_receiver
                  }})[..12] AS declared_methods
             RETURN
+              iface_id,
               impl.name                                   AS name,
               coalesce(impl.filepath, impl.path, '')      AS filepath,
               coalesce(impl.repo, '')                     AS repo,
@@ -671,20 +758,20 @@ def _run_structural_traversal(
               type(rel)                                   AS rel_type_raw,
               declared_methods
             ORDER BY size(coalesce(impl.code, '')) DESC
-            LIMIT 20
+            LIMIT 200
             """
             try:
-                with driver.session() as session:
-                    impl_rows = session.run(
-                        impl_cypher,
-                        iface_id=iface_id,
-                        target_repos=target_repos or [],
-                    ).data()
+                impl_rows = session.run(
+                    impl_cypher,
+                    iface_ids=iface_ids,
+                    target_repos=target_repos or [],
+                ).data()
                 logger.info(
-                    "[STRUCTURAL] iface=%r → %d implementor(s)/composition(s).", iface_name, len(impl_rows)
+                    "[STRUCTURAL] Batched implementors query → %d row(s) across %d interface(s).",
+                    len(impl_rows), len(iface_ids)
                 )
             except Exception as exc:
-                logger.warning("[STRUCTURAL] Implementor query for iface %r failed: %s", iface_name, exc)
+                logger.warning("[STRUCTURAL] Batched implementors query failed: %s", exc)
                 impl_rows = []
 
             for row in impl_rows:
@@ -697,6 +784,8 @@ def _run_structural_traversal(
                         if m.get("name")
                     ]
                     rel_type_raw = row.get("rel_type_raw") or "IMPLEMENTS"
+                    iface_id = row.get("iface_id")
+                    iface_name = iface_meta.get(iface_id, {}).get("iface_name", "interface")
                     results.append({
                         "name":      row.get("name") or "<unknown>",
                         "filepath":  row.get("filepath") or "",
@@ -707,107 +796,102 @@ def _run_structural_traversal(
                     })
 
         # ── Step 4: Text/code-grep fallback ───────────────────────────────────
-        # Search for Function nodes whose code mentions the subject (interface name)
-        # and that live in the target repos — catches cases where IMPLEMENTS edges
-        # were not explicitly ingested but the code clearly references the interface.
-        repo_grep_filter = (
-            "AND (fn.repo IN $target_repos OR fn.full_name IN $target_repos)"
-            if target_repos else ""
-        )
-        grep_cypher = f"""
-        MATCH (fn:Function)
-        WHERE fn.code IS NOT NULL
-          AND toLower(fn.code) CONTAINS toLower($subject)
-          {repo_grep_filter}
-        RETURN
-          fn.name                                AS name,
-          coalesce(fn.filepath, fn.path, '')     AS filepath,
-          coalesce(fn.repo, '')                  AS repo,
-          fn.code                                AS code
-        ORDER BY size(fn.code) DESC
-        LIMIT 15
-        """
-        try:
-            with driver.session() as session:
+        for subject in subjects:
+            subject_lower = subject.lower()
+            repo_grep_filter = _repo_filter("fn", target_repos)
+
+            grep_cypher = f"""
+            MATCH (fn:Function)
+            WHERE fn.code IS NOT NULL
+              AND toLower(fn.code) CONTAINS toLower($subject)
+              {repo_grep_filter}
+            RETURN
+              fn.name                                AS name,
+              coalesce(fn.filepath, fn.path, '')     AS filepath,
+              coalesce(fn.repo, '')                  AS repo,
+              fn.code                                AS code
+            ORDER BY size(fn.code) DESC
+            LIMIT 15
+            """
+            try:
                 grep_rows = session.run(
                     grep_cypher,
                     subject=subject_lower,
                     target_repos=target_repos or [],
                 ).data()
-            logger.info(
-                "[STRUCTURAL] code-grep for subject=%r → %d function(s).", subject, len(grep_rows)
-            )
-        except Exception as exc:
-            logger.warning("[STRUCTURAL] code-grep for %r failed: %s", subject, exc)
-            grep_rows = []
+                logger.info(
+                    "[STRUCTURAL] code-grep for subject=%r → %d function(s).", subject, len(grep_rows)
+                )
+            except Exception as exc:
+                logger.warning("[STRUCTURAL] code-grep for %r failed: %s", subject, exc)
+                grep_rows = []
 
-        for row in grep_rows:
-            uid = f"grep::{row.get('filepath')}::{row.get('name')}"
-            if uid not in seen_ids:
-                seen_ids.add(uid)
-                results.append({
-                    "name":      row.get("name") or "<unknown>",
-                    "filepath":  row.get("filepath") or "",
-                    "repo":      row.get("repo") or "",
-                    "rel_type":  "CODE_REFERENCES_INTERFACE",
-                    "code":      _extract_relevant_lines(row.get("code") or "", subject),
-                    "connected": [],
-                })
+            for row in grep_rows:
+                uid = f"grep::{row.get('filepath')}::{row.get('name')}"
+                if uid not in seen_ids:
+                    seen_ids.add(uid)
+                    results.append({
+                        "name":      row.get("name") or "<unknown>",
+                        "filepath":  row.get("filepath") or "",
+                        "repo":      row.get("repo") or "",
+                        "rel_type":  "CODE_REFERENCES_INTERFACE",
+                        "code":      _extract_relevant_lines(row.get("code") or "", subject),
+                        "connected": [],
+                    })
 
-        # ── Step 5: Type node grep — look for structs in target repos that ─────
-        # declare methods whose names match the known cobra interface methods.
-        type_grep_cypher = f"""
-        MATCH (t:Type)
-        WHERE t.code IS NOT NULL
-          AND toLower(t.code) CONTAINS toLower($subject)
-          {repo_grep_filter.replace('fn.', 't.')}
-        OPTIONAL MATCH (t)-[:DECLARES_METHOD|EMBEDS]->(m:Function)
-        WITH t, collect(DISTINCT {{
-          name: m.name,
-          path: coalesce(m.filepath, m.path, ''),
-          code: coalesce(m.code, '')
-        }})[..8] AS methods
-        RETURN
-          coalesce(t.name, t.full_name)          AS name,
-          coalesce(t.filepath, t.repo, '')       AS filepath,
-          coalesce(t.repo, '')                   AS repo,
-          coalesce(t.kind, 'Type')               AS kind,
-          coalesce(t.code, '')                   AS code,
-          methods
-        ORDER BY size(coalesce(t.code, '')) DESC
-        LIMIT 10
-        """
-        try:
-            with driver.session() as session:
+            # ── Step 5: Type node grep ────────────────────────────────────────
+            type_repo_filter = _repo_filter("t", target_repos)
+            type_grep_cypher = f"""
+            MATCH (t:Type)
+            WHERE t.code IS NOT NULL
+              AND toLower(t.code) CONTAINS toLower($subject)
+              {type_repo_filter}
+            OPTIONAL MATCH (t)-[:DECLARES_METHOD|EMBEDS]->(m:Function)
+            WITH t, collect(DISTINCT {{
+              name: m.name,
+              path: coalesce(m.filepath, m.path, ''),
+              code: coalesce(m.code, '')
+            }})[..8] AS methods
+            RETURN
+              coalesce(t.name, t.full_name)          AS name,
+              coalesce(t.filepath, t.repo, '')       AS filepath,
+              coalesce(t.repo, '')                   AS repo,
+              coalesce(t.kind, 'Type')               AS kind,
+              coalesce(t.code, '')                   AS code,
+              methods
+            ORDER BY size(coalesce(t.code, '')) DESC
+            LIMIT 10
+            """
+            try:
                 type_rows = session.run(
                     type_grep_cypher,
                     subject=subject_lower,
                     target_repos=target_repos or [],
                 ).data()
-            logger.info(
-                "[STRUCTURAL] type-grep for subject=%r → %d type(s).", subject, len(type_rows)
-            )
-        except Exception as exc:
-            logger.warning("[STRUCTURAL] type-grep for %r failed: %s", subject, exc)
-            type_rows = []
+                logger.info(
+                    "[STRUCTURAL] type-grep for subject=%r → %d type(s).", subject, len(type_rows)
+                )
+            except Exception as exc:
+                logger.warning("[STRUCTURAL] type-grep for %r failed: %s", subject, exc)
+                type_rows = []
 
-        for row in type_rows:
-            uid = f"type_grep::{row.get('filepath')}::{row.get('name')}"
-            if uid not in seen_ids:
-                seen_ids.add(uid)
-                connected = [
-                    {"name": m.get("name"), "path": m.get("path"), "code": m.get("code")}
-                    for m in (row.get("methods") or [])
-                    if m.get("name")
-                ]
-                results.append({
-                    "name":      row.get("name") or "<unknown>",
-                    "filepath":  row.get("filepath") or "",
-                    "repo":      row.get("repo") or "",
-                    "rel_type":  "TYPE_REFERENCES_INTERFACE",
-                    "code":      row.get("code") or "",
-                    "connected": connected,
-                })
+            for row in type_rows:
+                uid = f"type_grep::{row.get('filepath')}::{row.get('name')}"
+                if uid not in seen_ids:
+                    seen_ids.add(uid)
+                    connected = [
+                        {"name": m.get("name"), "path": m.get("path"), "code": m.get("code")}
+                        for m in (row.get("methods") or [])
+                        if m.get("name")
+                    ]
+                    results.append({
+                        "name":      row.get("name") or "<unknown>",
+                        "filepath":  row.get("filepath") or "",
+                        "repo":      row.get("repo") or "",
+                        "rel_type":  "TYPE_REFERENCES_INTERFACE",
+                        "code":      row.get("code") or "",
+                        "connected": connected,
+                    })
 
     return results
 
@@ -828,8 +912,21 @@ def retrieve_code_context(
     query_vector  = get_embedding(user_query, google_api_key)
     path_hints    = _extract_path_hints(user_query)
     intent        = extract_query_intent(user_query, google_api_key)
-    context_parts: list[str] = []
+    if intent and intent.subjects:
+        intent.subjects = _normalize_subjects(driver, intent.subjects)
+    context_parts: list[dict] = []
     retrieval_path_tags: list[str] = []
+
+    def add_context(content: str, tag: str, priority: int):
+        if content and content.strip():
+            context_parts.append({
+                "index": len(context_parts),
+                "priority": priority,
+                "tag": tag,
+                "content": content
+            })
+            retrieval_path_tags.append(tag)
+
     global_seen_ids: set[str] = set()
     vector_rows:   list[dict] = []
 
@@ -841,7 +938,7 @@ def retrieve_code_context(
             f"Modified Symbols/Keys: {intent.field_hints or 'none detected'}",
             f"Target Repos   : {intent.repo_hints or 'all / unscoped'}",
         ]
-        context_parts.append("\n".join(intent_summary_lines))
+        add_context("\n".join(intent_summary_lines), "intent-summary", 100)
         logger.info("[RETRIEVE] Prepended [Source: user-query-intent] metadata block.")
 
     # ── Stage 0a: Structural / Interface-satisfaction traversal ──────────────
@@ -886,8 +983,7 @@ def retrieve_code_context(
                     structural_rows, "structural-interface", allow_no_code=True, global_seen=global_seen_ids
                 )
                 if struct_block:
-                    context_parts.append(struct_block)
-                    retrieval_path_tags.append("structural")
+                    add_context(struct_block, "structural", 80)
         else:
             logger.warning(
                 "[RETRIEVE] ⚠️  Stage 0a: structural query detected but no subjects extracted."
@@ -1012,8 +1108,7 @@ def retrieve_code_context(
             if impact_rows:
                 impact_block = _build_context_block(impact_rows, "dependency-impact", allow_no_code=True, global_seen=global_seen_ids)
                 if impact_block:
-                    context_parts.append(impact_block)
-                    retrieval_path_tags.append("impact")
+                    add_context(impact_block, "impact", 80)
         else:
             logger.warning(
                 "[RETRIEVE] ⚠️  Stage 0: impact query detected but no subjects extracted."
@@ -1098,9 +1193,10 @@ def retrieve_code_context(
         CALL db.index.vector.queryNodes('type_embeddings', $mod_top_k, $query_vector)
         YIELD node, score
         WITH node, score
-        WHERE node.code IS NOT NULL {
-            "AND (node.repo IN $selected_repos OR node.name IN $selected_repos)" if selected_repos else ""
-        }
+        WHERE node.code IS NOT NULL
+          AND node.code <> ''
+          AND size(node.code) > 10
+          {"AND (node.repo IN $selected_repos OR node.name IN $selected_repos)" if selected_repos else ""}
         OPTIONAL MATCH (node)-[:EMBEDS|IMPLEMENTS|DECLARES_METHOD]->(connected)
         WHERE (connected:Function OR connected:Type OR connected:Module)
         WITH node, score,
@@ -1112,7 +1208,7 @@ def retrieve_code_context(
         RETURN
           node.name                              AS name,
           coalesce(node.filepath, node.repo, '') AS filepath,
-          '(type: ' + node.name + ' [' + coalesce(node.kind, '') + '])\\n' + coalesce(node.code, '') AS code,
+          '(type: ' + node.name + ' [' + coalesce(node.kind, '') + '])\\n' + node.code AS code,
           connected_nodes                        AS connected,
           node.tag_mappings                      AS tag_mappings,
           node.fields                            AS fields,
@@ -1128,13 +1224,14 @@ def retrieve_code_context(
         CALL db.index.vector.queryNodes('var_embeddings', $mod_top_k, $query_vector)
         YIELD node, score
         WITH node, score
-        WHERE node.code IS NOT NULL {
-            "AND (node.repo IN $selected_repos OR node.name IN $selected_repos)" if selected_repos else ""
-        }
+        WHERE node.code IS NOT NULL
+          AND node.code <> ''
+          AND size(node.code) > 5
+          {"AND (node.repo IN $selected_repos OR node.name IN $selected_repos)" if selected_repos else ""}
         RETURN
           node.name                              AS name,
           coalesce(node.filepath, node.repo, '') AS filepath,
-          '(var: ' + node.name + ' [' + coalesce(node.kind, '') + '])\\n' + coalesce(node.code, '') AS code,
+          '(var: ' + node.name + ' [' + coalesce(node.kind, '') + '])\\n' + node.code AS code,
           []                                     AS connected,
           node.chan_elem_type                    AS chan_elem_type,
           node.kind                              AS kind,
@@ -1195,20 +1292,16 @@ def retrieve_code_context(
             )
             if rows:
                 vector_rows = rows
-                context_parts.append(_build_context_block(rows, "vector-search", global_seen=global_seen_ids))
-                retrieval_path_tags.append("vector")
+                add_context(_build_context_block(rows, "vector-search", global_seen=global_seen_ids), "vector", 70)
             if mod_rows:
                 vector_rows.extend(mod_rows)
-                context_parts.append(_build_context_block(mod_rows, "module-vector", global_seen=global_seen_ids))
-                retrieval_path_tags.append("module-vector")
+                add_context(_build_context_block(mod_rows, "module-vector", global_seen=global_seen_ids), "module-vector", 70)
             if type_rows:
                 vector_rows.extend(type_rows)
-                context_parts.append(_build_context_block(type_rows, "type-vector", global_seen=global_seen_ids))
-                retrieval_path_tags.append("type-vector")
+                add_context(_build_context_block(type_rows, "type-vector", global_seen=global_seen_ids), "type-vector", 70)
             if var_rows:
                 vector_rows.extend(var_rows)
-                context_parts.append(_build_context_block(var_rows, "var-vector", global_seen=global_seen_ids))
-                retrieval_path_tags.append("var-vector")
+                add_context(_build_context_block(var_rows, "var-vector", global_seen=global_seen_ids), "var-vector", 70)
         except Exception as exc:
             logger.error("[RETRIEVE] ❌ Stage 1 vector search FAILED: %s", exc)
 
@@ -1259,8 +1352,7 @@ def retrieve_code_context(
                 )
 
         if hint_rows:
-            context_parts.append(_build_context_block(hint_rows, "path-hint-boost", global_seen=global_seen_ids))
-            retrieval_path_tags.append("path-hint")
+            add_context(_build_context_block(hint_rows, "path-hint-boost", global_seen=global_seen_ids), "path-hint", 60)
         else:
             logger.warning(
                 "[RETRIEVE] ⚠️  Stage 2 path-hints produced 0 results."
@@ -1307,6 +1399,37 @@ def retrieve_code_context(
               'CONCURRENCY_METADATA' AS rel_type,
               'Function' AS seed_label
             LIMIT 30
+            UNION
+            MATCH (t:Type)
+            WHERE toLower(t.name) CONTAINS toLower($channel)
+               OR any(field IN t.fields WHERE toLower(field) CONTAINS toLower($channel))
+            RETURN
+              t.name AS name,
+              coalesce(t.filepath, '') AS filepath,
+              coalesce(t.repo, '') AS repo,
+              coalesce(t.code, '') AS code,
+              [] AS lock_sequence,
+              [] AS channels_sent,
+              [] AS channels_received,
+              false AS accepts_context,
+              'CONCURRENCY_TYPE' AS rel_type,
+              'Type' AS seed_label
+            LIMIT 30
+            UNION
+            MATCH (v:Variable)
+            WHERE toLower(v.name) CONTAINS toLower($channel)
+            RETURN
+              v.name AS name,
+              coalesce(v.filepath, '') AS filepath,
+              coalesce(v.repo, '') AS repo,
+              coalesce(v.code, '') AS code,
+              [] AS lock_sequence,
+              [] AS channels_sent,
+              [] AS channels_received,
+              false AS accepts_context,
+              'CONCURRENCY_VAR' AS rel_type,
+              'Variable' AS seed_label
+            LIMIT 30
             """
             params = {"channel": channel_name, "selected_repos": selected_repos or []}
         else:
@@ -1336,8 +1459,7 @@ def retrieve_code_context(
             with driver.session() as session:
                 concurrency_rows = session.run(concurrency_cypher, **params).data()
             if concurrency_rows:
-                context_parts.append(_build_context_block(concurrency_rows, "concurrency-metadata", global_seen=global_seen_ids))
-                retrieval_path_tags.append("concurrency-metadata")
+                add_context(_build_context_block(concurrency_rows, "concurrency-metadata", global_seen=global_seen_ids), "concurrency-metadata", 50)
         except Exception as exc:
             logger.warning("[RETRIEVE] Stage 2.5a concurrency targeted lookup failed: %s", exc)
 
@@ -1382,8 +1504,7 @@ def retrieve_code_context(
                     for subj in prop_subjects:
                         prop_rows = session.run(prop_cypher, subject=subj, selected_repos=selected_repos or []).data()
                         if prop_rows:
-                            context_parts.append(_build_context_block(prop_rows, "error-propagation-chain", global_seen=global_seen_ids))
-                            retrieval_path_tags.append("error-propagation")
+                            add_context(_build_context_block(prop_rows, "error-propagation-chain", global_seen=global_seen_ids), "error-propagation", 50)
             except Exception as exc:
                 logger.warning("[RETRIEVE] Stage 2.5b error propagation lookup failed: %s", exc)
 
@@ -1431,13 +1552,12 @@ def retrieve_code_context(
                     test_direct_rows = session.run(test_direct_cypher, subject=subj, selected_repos=selected_repos or []).data()
                     combined_test_rows = test_rows + test_direct_rows
                     if combined_test_rows:
-                        context_parts.append(_build_context_block(combined_test_rows, "test-coverage", global_seen=global_seen_ids))
-                        retrieval_path_tags.append("test-coverage")
+                        add_context(_build_context_block(combined_test_rows, "test-coverage", global_seen=global_seen_ids), "test-coverage", 50)
         except Exception as exc:
             logger.warning("[RETRIEVE] Stage 2.5c tests lookup failed: %s", exc)
 
     # 2.5d: Return types / RETURNS lookup
-    if intent.wants_schema or intent.wants_structural or any(kw in q_lower for kw in ["return type", "returns", "return a", "returns a"]):
+    if intent.wants_schema or intent.wants_structural or any(kw in q_lower for kw in _RETURN_KEYWORDS):
         logger.info("[RETRIEVE] Stage 2.5d — Return types targeted lookup triggered.")
         return_subjects = intent.subjects or _extract_impact_subjects(user_query)
         repo_filter_clause = (
@@ -1464,11 +1584,10 @@ def retrieve_code_context(
                     if subj not in ["error", "type"]:
                         ret_rows = session.run(return_cypher, subject=subj, selected_repos=selected_repos or []).data()
                         if ret_rows:
-                            context_parts.append(_build_context_block(ret_rows, "return-types", global_seen=global_seen_ids))
-                            retrieval_path_tags.append("return-types")
+                            add_context(_build_context_block(ret_rows, "return-types", global_seen=global_seen_ids), "return-types", 40)
                             
                 # Handle "error" type returns specially
-                if any(kw in q_lower for kw in ["return an error", "returns error", "returns an error", "return error"]):
+                if any(kw in q_lower for kw in _ERROR_RETURN_KEYWORDS):
                     error_return_cypher = f"""
                     MATCH (fn:Function)
                     WHERE "error" IN fn.return_types
@@ -1485,13 +1604,12 @@ def retrieve_code_context(
                     """
                     err_ret_rows = session.run(error_return_cypher, selected_repos=selected_repos or []).data()
                     if err_ret_rows:
-                        context_parts.append(_build_context_block(err_ret_rows, "error-return-types", global_seen=global_seen_ids))
-                        retrieval_path_tags.append("error-return-types")
+                        add_context(_build_context_block(err_ret_rows, "error-return-types", global_seen=global_seen_ids), "error-return-types", 40)
         except Exception as exc:
             logger.warning("[RETRIEVE] Stage 2.5d return-types lookup failed: %s", exc)
 
     # 2.5e: Generics / CONSTRAINED_BY lookup
-    if intent.wants_structural or any(kw in q_lower for kw in ["generic", "generics", "constraint", "constraints", "constrained by", "comparable"]):
+    if intent.wants_structural or any(kw in q_lower for kw in _GENERIC_KEYWORDS):
         logger.info("[RETRIEVE] Stage 2.5e — Generics targeted lookup triggered.")
         generic_subjects = intent.subjects or _extract_impact_subjects(user_query)
         repo_filter_clause = (
@@ -1536,12 +1654,10 @@ def retrieve_code_context(
                 for subj in (generic_subjects or [""]):
                     gen_rows = session.run(generics_cypher, subject=subj, selected_repos=selected_repos or []).data()
                     if gen_rows:
-                        context_parts.append(_build_context_block(gen_rows, "generics-constraints", global_seen=global_seen_ids))
-                        retrieval_path_tags.append("generics-constraints")
+                        add_context(_build_context_block(gen_rows, "generics-constraints", global_seen=global_seen_ids), "generics-constraints", 50)
                 direct_gen_rows = session.run(direct_generics_cypher, selected_repos=selected_repos or []).data()
                 if direct_gen_rows:
-                    context_parts.append(_build_context_block(direct_gen_rows, "generic-definitions", global_seen=global_seen_ids))
-                    retrieval_path_tags.append("generic-definitions")
+                    add_context(_build_context_block(direct_gen_rows, "generic-definitions", global_seen=global_seen_ids), "generic-definitions", 50)
         except Exception as exc:
             logger.warning("[RETRIEVE] Stage 2.5e generics lookup failed: %s", exc)
 
@@ -1550,7 +1666,7 @@ def retrieve_code_context(
         logger.info("[RETRIEVE] Stage 2.5f — Struct tag / schema targeted lookup triggered.")
         schema_subjects = intent.subjects + intent.field_hints
         tag_queries = []
-        for tag in ["json", "yaml", "xml", "bson", "db", "toml", "mapstructure"]:
+        for tag in _SCHEMA_TAGS:
             if tag in q_lower:
                 tag_queries.append(tag)
         for s in schema_subjects:
@@ -1588,8 +1704,7 @@ def retrieve_code_context(
                 for tag in tag_queries:
                     tag_rows = session.run(tag_cypher, tag=tag, selected_repos=selected_repos or []).data()
                     if tag_rows:
-                        context_parts.append(_build_context_block(tag_rows, f"schema-tag-{tag}", global_seen=global_seen_ids))
-                        retrieval_path_tags.append(f"schema-tag-{tag}")
+                        add_context(_build_context_block(tag_rows, f"schema-tag-{tag}", global_seen=global_seen_ids), f"schema-tag-{tag}", 50)
         except Exception as exc:
             logger.warning("[RETRIEVE] Stage 2.5f struct tag lookup failed: %s", exc)
 
@@ -1601,7 +1716,7 @@ def retrieve_code_context(
             if selected_repos else ""
         )
         dir_terms = []
-        for term in ["go:build", "go:generate", "go:embed", "embed", "generate", "build"]:
+        for term in _DIRECTIVE_KEYWORDS:
             if term in q_lower:
                 dir_terms.append(term)
         for word in intent.subjects + intent.field_hints:
@@ -1639,13 +1754,12 @@ def retrieve_code_context(
             with driver.session() as session:
                 dir_rows = session.run(directive_cypher, terms=[t.lower() for t in dir_terms], selected_repos=selected_repos or []).data()
                 if dir_rows:
-                    context_parts.append(_build_context_block(dir_rows, "compiler-directives", allow_no_code=True, global_seen=global_seen_ids))
-                    retrieval_path_tags.append("directives")
+                    add_context(_build_context_block(dir_rows, "compiler-directives", allow_no_code=True, global_seen=global_seen_ids), "directives", 50)
         except Exception as exc:
             logger.warning("[RETRIEVE] Stage 2.5g directive lookup failed: %s", exc)
 
     # 2.5h: Variables / Constants
-    if intent.wants_concurrency or any(kw in q_lower for kw in ["variable", "variables", "constant", "constants", "global", "globals", "errchan", "chan_elem_type"]):
+    if intent.wants_concurrency or any(kw in q_lower for kw in _VARIABLE_KEYWORDS):
         logger.info("[RETRIEVE] Stage 2.5h — Variable targeted lookup triggered.")
         var_subjects = intent.subjects + intent.field_hints
         var_subjects = [s for s in var_subjects if s and s not in ["variable", "variables", "constant", "constants", "global", "globals", "chan", "channel"]]
@@ -1710,8 +1824,7 @@ def retrieve_code_context(
             with driver.session() as session:
                 var_rows = session.run(var_cypher, **params).data()
                 if var_rows:
-                    context_parts.append(_build_context_block(var_rows, "variables-metadata", global_seen=global_seen_ids))
-                    retrieval_path_tags.append("variables-metadata")
+                    add_context(_build_context_block(var_rows, "variables-metadata", global_seen=global_seen_ids), "variables", 50)
         except Exception as exc:
             logger.warning("[RETRIEVE] Stage 2.5h variable lookup failed: %s", exc)
 
@@ -1752,9 +1865,10 @@ def retrieve_code_context(
 
         if _needs_recency_sort:
             _repo_matches = re.findall(r'\b[\w\-]+/[\w\-]+\b', user_query)
-            _repo_hint = _repo_matches[0] if _repo_matches else None
+            _repo_hint = (intent.repo_hints or _repo_matches)[:1]
+            _repo_hint = _repo_hint[0] if _repo_hint else None
 
-            _limit_match = re.search(r'\b(\d+)\b', user_query)
+            _limit_match = re.search(r'\b(?:last|latest|recent)\s+(\d+)\b', user_query, re.IGNORECASE)
             _commit_limit = min(int(_limit_match.group(1)), 20) if _limit_match else 10
 
             logger.info(
@@ -1813,10 +1927,7 @@ def retrieve_code_context(
                     "[RETRIEVE] Stage 3a recency → %d commit(s).", len(rows)
                 )
                 if rows:
-                    context_parts.append(
-                        _build_context_block(rows, "recent-commits", global_seen=global_seen_ids)
-                    )
-                    retrieval_path_tags.append("recent-commits")
+                    add_context(_build_context_block(rows, "recent-commits", global_seen=global_seen_ids), "recent-commits", 30)
             except Exception as exc:
                 logger.error("[RETRIEVE] ❌ Stage 3a recency FAILED: %s", exc)
 
@@ -1824,18 +1935,14 @@ def retrieve_code_context(
             "[RETRIEVE] Stage 3b — fulltext: sanitized=%r (original=%r)",
             lucene_query, user_query,
         )
-        fulltext_cypher_local = fulltext_cypher
         try:
             with driver.session() as session:
                 rows = session.run(
-                    fulltext_cypher_local, search_query=lucene_query
+                    fulltext_cypher, search_query=lucene_query
                 ).data()
             logger.info("[RETRIEVE] Stage 3b fulltext → %d record(s).", len(rows))
             if rows:
-                context_parts.append(
-                    _build_context_block(rows, "fulltext-commits", global_seen=global_seen_ids)
-                )
-                retrieval_path_tags.append("fulltext")
+                add_context(_build_context_block(rows, "fulltext-commits", global_seen=global_seen_ids), "fulltext", 30)
         except Exception as exc:
             logger.error("[RETRIEVE] ❌ Stage 3b fulltext FAILED: %s", exc)
 
@@ -1982,8 +2089,7 @@ def retrieve_code_context(
         if commit_file_rows:
             block = _build_context_block(commit_file_rows, "commit-file-lookup", allow_no_code=True, global_seen=global_seen_ids)
             if block:
-                context_parts.append(block)
-                retrieval_path_tags.append("commit-files")
+                add_context(block, "commit-files", 60)
             logger.info(
                 "[RETRIEVE] Stage 3c — %d commit-file record(s) added to context.",
                 len(commit_file_rows),
@@ -2025,9 +2131,7 @@ def retrieve_code_context(
             if freq_rows:
                 block = _build_context_block(freq_rows, "commit-file-lookup", allow_no_code=True, global_seen=global_seen_ids)
                 if block:
-                    context_parts.append(block)
-                    if "commit-files" not in retrieval_path_tags:
-                        retrieval_path_tags.append("commit-files")
+                    add_context(block, "commit-files", 60)
         except Exception as exc:
             logger.warning("[RETRIEVE] Stage 3d frequency failed: %s", exc)
 
@@ -2244,8 +2348,7 @@ def retrieve_code_context(
                 logger.warning("[RETRIEVE] Stage 4c failed: %s", exc)
 
         if blame_rows:
-            context_parts.append(_build_blame_context_block(blame_rows, global_seen=global_seen_ids))
-            retrieval_path_tags.append("blame")
+            add_context(_build_blame_context_block(blame_rows, global_seen=global_seen_ids), "blame", 20)
             logger.info("[RETRIEVE] Stage 4 — %d blame record(s) added to context.", len(blame_rows))
         else:
             logger.warning(
@@ -2254,7 +2357,7 @@ def retrieve_code_context(
     else:
         logger.info("[RETRIEVE] Stage 4 skipped — no blame keywords in query.")
 
-    # ── Final assembly ────────────────────────────────────────────────────────
+    # ── Final assembly & Budget Check ──────────────────────────────────────────
     if not context_parts:
         logger.error(
             "[RETRIEVE] ❌ ALL stages returned 0 results. "
@@ -2264,7 +2367,66 @@ def retrieve_code_context(
         )
         return "No relevant context found in the knowledge graph.", intent
 
-    full_context = "\n\n".join(context_parts)
+    # Enforce budget limit: MAX_CONTEXT_CHARS
+    MAX_CONTEXT_CHARS = 100000  # approximately 20k-25k tokens
+    
+    # Calculate current size
+    total_len = sum(len(part["content"]) for part in context_parts) + (len(context_parts) - 1) * 2
+    if total_len > MAX_CONTEXT_CHARS:
+        logger.info(
+            "[RETRIEVE] Context size %d exceeds budget of %d chars. Pruning lowest-priority blocks...",
+            total_len, MAX_CONTEXT_CHARS
+        )
+        # Define robust scoring logic: explicit relationship hooks are retained over raw vector matches
+        def get_chunk_score(part):
+            tag = part.get("tag", "")
+            if tag == "intent-summary":
+                return 1000
+            # High priority: Explicit structural relationships & dependencies
+            if tag in ["impact", "structural"]:
+                return 900
+            if tag == "directives":
+                return 850
+            if tag in ["concurrency-metadata", "error-propagation", "test-coverage", "generics-constraints", "generic-definitions"] or tag.startswith("schema-tag-"):
+                return 800
+            # Medium priority: Direct queries / path hints / commits files
+            if tag in ["path-hint", "commit-files"]:
+                return 700
+            if tag in ["return-types", "error-return-types"]:
+                return 600
+            # Low priority: Raw vector matches (prune these first before graph relations!)
+            if tag in ["vector", "type-vector", "var-vector", "module-vector", "variables"]:
+                return 400
+            # Lowest priority: chronological history / blame
+            if tag in ["recent-commits", "fulltext"]:
+                return 300
+            if tag == "blame":
+                return 200
+            return part.get("priority", 50) * 10
+
+        # Sort by priority ascending, then by index descending (discard lowest priority first)
+        sorted_parts = sorted(context_parts, key=lambda x: (get_chunk_score(x), -x["index"]))
+        
+        discarded_tags = []
+        # We start discarding from the beginning of sorted_parts (lowest priority)
+        while total_len > MAX_CONTEXT_CHARS and sorted_parts:
+            discarded = sorted_parts.pop(0)
+            discarded_tags.append(discarded["tag"])
+            # Remove from the unsorted context_parts list
+            context_parts = [p for p in context_parts if p["index"] != discarded["index"]]
+            # Recalculate length
+            total_len = sum(len(part["content"]) for part in context_parts) + (len(context_parts) - 1) * 2
+            
+        logger.info(
+            "[RETRIEVE] Discarded blocks due to budget limit: %s. New size: %d chars.",
+            ", ".join(discarded_tags), total_len
+        )
+        # Re-sync retrieval_path_tags
+        retrieval_path_tags = [p["tag"] for p in sorted(context_parts, key=lambda x: x["index"])]
+
+    # Join in their original order
+    ordered_parts = sorted(context_parts, key=lambda x: x["index"])
+    full_context = "\n\n".join(part["content"] for part in ordered_parts)
     retrieval_path = "+".join(retrieval_path_tags) or "none"
     logger.info(
         "[RETRIEVE] ✅ path=%-20s | context_chars=%d",

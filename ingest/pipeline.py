@@ -66,6 +66,11 @@ from .queries import (
     CYPHER_CONSTRAINT_DIRECTIVE_UNIQUE,
     CYPHER_INGEST_IFACE_METHOD,
     CYPHER_LINK_DECLARES_METHOD,
+    CYPHER_RELINK_UNRESOLVED_CALLS,
+    CYPHER_PATCH_EMPTY_CODE_STUBS,
+    CYPHER_FIND_EMPTY_CODE_FILES,
+    CYPHER_UNMARK_FILES_FOR_RESCAN,
+    CYPHER_RELINK_CALLS_BY_CODE_GREP,
 )
 from .parser import (
     _is_noise_file,
@@ -312,6 +317,125 @@ def phase2_scan_file_contents(driver, repo_full_name: str, file_paths: list, git
     return scanned
 
 
+def phase2_5_relink_calls(
+    driver,
+    repo_full_name: str,
+    github_token: str = "",
+    google_api_key: str = "",
+) -> tuple[int, int, int]:
+    """Phase 2.5 — Three-pass post-scan repair.
+
+    Runs three passes after phase2_scan_file_contents has finished:
+
+    Pass A — Re-scan files whose Function nodes have empty/null code.
+        The root cause: CYPHER_MODIFIED_FUNCTION creates a bare stub with only
+        an `id` property.  Phase 2's CYPHER_INGEST_FUNCTION fills it in via
+        ON MATCH SET — but only if Phase 2 SUCCESSFULLY PARSED that file.  If
+        the file's parse raised an exception that was caught silently, or if
+        the file was already marked content_scanned=true from a prior partial
+        run, Phase 2 skips it and the stub stays empty forever.
+        Fix: find those filepaths, unmark them, and re-run phase2 for them.
+        Requires github_token (network call to fetch file contents).
+
+    Pass B — Re-link CALLS edges via stored qualified_calls.
+        CYPHER_INGEST_CALLS runs once per call at parse time.  If the callee
+        node didn't exist yet, the edge is silently dropped.  This pass
+        re-attempts resolution for all entries in caller.qualified_calls.
+
+    Pass C — Code-grep fallback for same-package calls.
+        For functions with code but empty/null qualified_calls, text-match the
+        callee name inside the caller's source across same-directory files.
+
+    Returns (files_rescanned, edges_from_B, edges_from_C).
+    """
+    # ── Legacy/Existing Stub Migration ────────────────────────────────────────
+    try:
+        with driver.session() as session:
+            migrate_query = """
+            MATCH (f:Function)
+            WHERE f.id STARTS WITH $repo_full_name + '::'
+              AND (f.repo IS NULL OR f.filepath IS NULL)
+              AND f.id CONTAINS '::'
+            WITH f, split(f.id, '::') AS parts
+            WHERE size(parts) >= 3
+            SET f.repo = parts[0],
+                f.filepath = parts[1],
+                f.name = parts[2]
+            RETURN count(f) AS migrated_count
+            """
+            res = session.run(migrate_query, repo_full_name=repo_full_name).single()
+            migrated_cnt = res["migrated_count"] if res else 0
+            if migrated_cnt > 0:
+                logger.info("Phase 2.5 — Migrated %d legacy stubs with repo/filepath.", migrated_cnt)
+    except Exception as exc:
+        logger.warning("Phase 2.5 — Legacy stubs migration failed (non-fatal): %s", exc)
+
+    logger.info("Phase 2.5 — Pass A: finding Function nodes with empty code …")
+    files_rescanned = 0
+    try:
+        with driver.session() as session:
+            rows = session.run(CYPHER_FIND_EMPTY_CODE_FILES, repo_full_name=repo_full_name).data()
+        empty_files = [r["filepath"] for r in rows]
+    except Exception as exc:
+        logger.warning("Phase 2.5 — Pass A: query failed: %s", exc)
+        empty_files = []
+
+    if not empty_files:
+        logger.info("Phase 2.5 — Pass A: no empty-code stubs found. Graph is clean.")
+    elif not github_token:
+        logger.warning(
+            "Phase 2.5 — Pass A: %d file(s) with empty-code stubs detected but "
+            "no GITHUB_TOKEN provided — skipping re-scan. "
+            "Run with GITHUB_TOKEN set to fix these stubs: %s",
+            len(empty_files), empty_files[:5],
+        )
+    else:
+        logger.info(
+            "Phase 2.5 — Pass A: %d file(s) need re-scanning: %s",
+            len(empty_files), empty_files[:5],
+        )
+        try:
+            with driver.session() as session:
+                session.run(CYPHER_UNMARK_FILES_FOR_RESCAN, repo_full_name=repo_full_name, paths=empty_files)
+            logger.info("Phase 2.5 — Pass A: unmarked %d file(s) for re-scan.", len(empty_files))
+            files_rescanned = phase2_scan_file_contents(
+                driver, repo_full_name, empty_files, github_token, google_api_key
+            )
+            logger.info("Phase 2.5 — Pass A complete: re-scanned %d file(s).", files_rescanned)
+        except Exception as exc:
+            logger.warning("Phase 2.5 — Pass A: re-scan failed (non-fatal): %s", exc)
+
+    # ── Pass B: re-link via qualified_calls ───────────────────────────────────
+    logger.info("Phase 2.5 — Pass B: re-linking unresolved CALLS via qualified_calls …")
+    edges_b = 0
+    try:
+        with driver.session() as session:
+            result = session.run(CYPHER_RELINK_UNRESOLVED_CALLS, repo_full_name=repo_full_name)
+            summary = result.single()
+            edges_b = summary["edges_created"] if summary else 0
+        logger.info("Phase 2.5 — Pass B complete: %d new CALLS edge(s).", edges_b)
+    except Exception as exc:
+        logger.warning("Phase 2.5 — Pass B failed (non-fatal): %s", exc)
+
+    # ── Pass C: code-grep fallback for same-package calls ────────────────────
+    logger.info("Phase 2.5 — Pass C: code-grep same-package call fallback …")
+    edges_c = 0
+    try:
+        with driver.session() as session:
+            result = session.run(CYPHER_RELINK_CALLS_BY_CODE_GREP, repo_full_name=repo_full_name)
+            summary = result.single()
+            edges_c = summary["edges_created"] if summary else 0
+        logger.info("Phase 2.5 — Pass C complete: %d new CALLS edge(s) via code-grep.", edges_c)
+    except Exception as exc:
+        logger.warning("Phase 2.5 — Pass C failed (non-fatal): %s", exc)
+
+    logger.info(
+        "Phase 2.5 summary — files_rescanned=%d  edges_B=%d  edges_C=%d",
+        files_rescanned, edges_b, edges_c,
+    )
+    return files_rescanned, edges_b, edges_c
+
+
 def phase3_backfill_commits(driver, repo_full_name: str, github_token: str, google_api_key: str, max_commits: int = 200, deep_scan_days: int = 7, skip_llm: bool = False, force_llm_update: bool = False) -> int:
     logger.info("Phase 3 — Chronological commit trace synchronization…")
     processed = 0
@@ -368,7 +492,16 @@ def phase3_backfill_commits(driver, repo_full_name: str, github_token: str, goog
                             code = base64.b64decode(raw_data["content"]).decode("utf-8")
                             h_ast = parse_go_ast(fp, code) if fp.endswith(".go") else parse_python_ast(fp, code)
                             for f_id in get_modified_functions(item.get("patch", ""), fp, h_ast):
-                                with driver.session() as sess: sess.run(CYPHER_MODIFIED_FUNCTION, commit_sha=sha, func_id=f"{repo_full_name}::{f_id}")
+                                func_name = f_id.split("::")[-1]
+                                with driver.session() as sess:
+                                    sess.run(
+                                        CYPHER_MODIFIED_FUNCTION,
+                                        commit_sha=sha,
+                                        func_id=f"{repo_full_name}::{f_id}",
+                                        func_name=func_name,
+                                        filepath=fp,
+                                        repo_full_name=repo_full_name,
+                                    )
                         except Exception:
                             pass
                 processed += 1
@@ -415,7 +548,16 @@ def bootstrap(repo_full_name: str, github_token: str, google_api_key: str, neo4j
     
     unscanned = get_unprocessed_files(driver, repo_full_name, src_files)
     scanned_cnt = phase2_scan_file_contents(driver, repo_full_name, unscanned, github_token, google_api_key)
-    
+
+    _set_status(driver, repo_full_name, "in_progress", "Running Phase 2.5 CALLS re-resolution…")
+    files_rescanned, edges_b, edges_c = phase2_5_relink_calls(
+        driver, repo_full_name, github_token=github_token, google_api_key=google_api_key
+    )
+    logger.info(
+        "Phase 2.5 summary — files_rescanned=%d  edges_B=%d  edges_C=%d",
+        files_rescanned, edges_b, edges_c,
+    )
+
     commits_cnt = phase3_backfill_commits(driver, repo_full_name, github_token, google_api_key, max_commits, skip_llm=skip_llm, force_llm_update=force_llm_update)
     _set_status(driver, repo_full_name, "completed", "Processing finalized.", commits_processed=commits_cnt, files_scanned=scanned_cnt)
     driver.close()

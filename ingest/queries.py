@@ -172,6 +172,10 @@ MERGE (file)-[:HAS_DIRECTIVE]->(dir)
 CYPHER_MODIFIED_FUNCTION = """
 MERGE (commit:Commit {sha: $commit_sha})
 MERGE (func:Function {id: $func_id})
+  ON CREATE SET
+    func.name         = $func_name,
+    func.filepath     = $filepath,
+    func.repo         = $repo_full_name
 MERGE (commit)-[:MODIFIED]->(func)
 """
 
@@ -466,4 +470,149 @@ WHERE f.filepath = $filepath
 WITH f, split(f.name, '.')[0] AS receiver_name
 MATCH (t:Type {name: receiver_name, repo: $repo_full_name})
 MERGE (t)-[:DECLARES_METHOD]->(f)
+"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Post-scan CALLS re-resolution pass
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Re-attempts to create CALLS edges for any Function whose qualified_calls list
+# contains names that could not be resolved at initial ingest time (because the
+# callee's file hadn't been parsed yet when the caller's file was processed).
+#
+# Resolution priority (mirrors CYPHER_INGEST_CALLS):
+#   1. File-local (same filepath, same repo)
+#   2. Package-local (same directory, same repo)
+#   3. Qualified last-segment match (uses stored qualified call string)
+#   4. Repo-wide heuristic (cross-directory, non-generic names >= 5 chars)
+#
+# We scope to $repo_full_name so a single driver call handles one repo at a
+# time, keeping transaction size predictable.
+CYPHER_RELINK_UNRESOLVED_CALLS = """
+MATCH (caller:Function {repo: $repo_full_name})
+WHERE caller.qualified_calls IS NOT NULL
+  AND size(caller.qualified_calls) > 0
+UNWIND caller.qualified_calls AS qcall
+WITH caller, qcall,
+     split(qcall, '.')[-1]  AS callee_bare,
+     split(qcall, '.')[0]   AS callee_prefix
+
+// 1. File-local
+OPTIONAL MATCH (local:Function {name: callee_bare, filepath: caller.filepath, repo: $repo_full_name})
+
+// 2. Package-local (same directory, different file)
+OPTIONAL MATCH (pkg_local:Function {name: callee_bare, repo: $repo_full_name})
+WHERE pkg_local.filepath <> caller.filepath
+  AND split(pkg_local.filepath, '/')[0..-1] = split(caller.filepath, '/')[0..-1]
+
+// 3. Qualified last-segment match (cross-directory, package-prefixed call)
+OPTIONAL MATCH (qual_match:Function {repo: $repo_full_name})
+WHERE callee_prefix <> callee_bare        // only if there actually is a prefix
+  AND qual_match.name = callee_bare
+  AND toLower(qual_match.filepath) CONTAINS toLower(callee_prefix)
+
+// 4. Repo-wide heuristic for unambiguous names
+OPTIONAL MATCH (repo_wide:Function {name: callee_bare, repo: $repo_full_name})
+WHERE repo_wide.filepath <> caller.filepath
+  AND split(repo_wide.filepath, '/')[0..-1] <> split(caller.filepath, '/')[0..-1]
+  AND callee_prefix = callee_bare          // no package prefix → unqualified call
+  AND NOT callee_bare IN ['New', 'Run', 'Execute', 'Close', 'Open', 'Init',
+                           'String', 'Read', 'Write', 'Update', 'Start', 'Stop', 'Reset']
+  AND size(callee_bare) >= 5
+
+WITH caller, coalesce(local, pkg_local, qual_match, repo_wide) AS callee
+WHERE callee IS NOT NULL
+  AND caller <> callee
+  AND NOT (caller)-[:CALLS]->(callee)   // skip already-linked pairs
+MERGE (caller)-[r:CALLS]->(callee)
+  ON CREATE SET r.call_type = 'SYNC', r.relinked = true
+RETURN count(r) AS edges_created
+"""
+
+# Patches Function stub nodes that were created by CYPHER_MODIFIED_FUNCTION
+# (commit ingestion writes MERGE (func:Function {id: $func_id}) with NO code)
+# before their source file was processed by phase2_scan_file_contents.
+#
+# After phase2 runs, any stub whose source file is now marked content_scanned
+# but still has an empty/null code property should be back-filled from the
+# fully-parsed sibling Function node that phase2 created under the same id.
+# Because CYPHER_INGEST_FUNCTION uses MERGE on id and sets code in ON MATCH,
+# phase2 already overwrites stubs — so this query is a safety net that catches
+# the edge case where a stub's id was synthesised differently by the commit
+# path vs the scan path.
+#
+# We match stubs by:
+#   - code IS NULL or code = ''
+#   - their filepath exists as a File with content_scanned = true
+#   - a sibling Function in the same filepath + same name exists with real code
+CYPHER_PATCH_EMPTY_CODE_STUBS = """
+MATCH (stub:Function {repo: $repo_full_name})
+WHERE (stub.code IS NULL OR stub.code = '')
+  AND stub.filepath IS NOT NULL
+MATCH (scanned:File {path: stub.filepath, repo: $repo_full_name, content_scanned: true})
+MATCH (donor:Function {name: stub.name, filepath: stub.filepath, repo: $repo_full_name})
+WHERE donor <> stub
+  AND donor.code IS NOT NULL
+  AND donor.code <> ''
+SET stub.code               = donor.code,
+    stub.embedding          = coalesce(stub.embedding, donor.embedding),
+    stub.qualified_calls    = coalesce(stub.qualified_calls, donor.qualified_calls),
+    stub.return_types       = coalesce(stub.return_types, donor.return_types),
+    stub.accepts_context    = coalesce(stub.accepts_context, donor.accepts_context),
+    stub.lock_sequence      = coalesce(stub.lock_sequence, donor.lock_sequence),
+    stub.channels_sent      = coalesce(stub.channels_sent, donor.channels_sent),
+    stub.channels_received  = coalesce(stub.channels_received, donor.channels_received),
+    stub.propagated_errors  = coalesce(stub.propagated_errors, donor.propagated_errors),
+    stub.is_exported        = coalesce(stub.is_exported, donor.is_exported),
+    stub.is_pointer_receiver = coalesce(stub.is_pointer_receiver, donor.is_pointer_receiver),
+    stub.is_test            = coalesce(stub.is_test, donor.is_test)
+RETURN count(stub) AS stubs_patched
+"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pass A — Step 1: Find distinct filepaths that contain Function nodes with
+# empty or null .code. These files need to be re-fetched from GitHub and
+# re-parsed by phase2_scan_file_contents.
+# ──────────────────────────────────────────────────────────────────────────────
+CYPHER_FIND_EMPTY_CODE_FILES = """
+MATCH (f:Function {repo: $repo_full_name})
+WHERE (f.code IS NULL OR f.code = '')
+  AND f.filepath IS NOT NULL
+  AND f.filepath <> ''
+RETURN DISTINCT f.filepath AS filepath
+ORDER BY filepath
+"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pass A — Step 2: Unmark those files so phase2_scan_file_contents will
+# re-process them. REMOVE removes the property entirely; phase2 re-sets it
+# to true after successful scanning via CYPHER_MARK_FILE_SCANNED.
+# ──────────────────────────────────────────────────────────────────────────────
+CYPHER_UNMARK_FILES_FOR_RESCAN = """
+MATCH (f:File {repo: $repo_full_name})
+WHERE f.path IN $paths
+REMOVE f.content_scanned
+RETURN count(f) AS files_unmarked
+"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pass C — Code-grep fallback for same-package calls.
+# ──────────────────────────────────────────────────────────────────────────────
+CYPHER_RELINK_CALLS_BY_CODE_GREP = """
+MATCH (caller:Function {repo: $repo_full_name})
+WHERE caller.code IS NOT NULL
+  AND size(caller.code) > 20
+MATCH (callee:Function {repo: $repo_full_name})
+WHERE callee.code IS NOT NULL
+  AND caller <> callee
+  AND callee.filepath <> caller.filepath
+  AND split(callee.filepath, '/')[0..-1] = split(caller.filepath, '/')[0..-1]
+  AND caller.code CONTAINS callee.name
+  AND size(callee.name) >= 6
+  AND NOT callee.name IN ['String', 'Error', 'Close', 'Write', 'Read', 'Reset',
+                           'Marshal', 'Unmarshal', 'Format', 'Append', 'Encode', 'Decode']
+  AND NOT (caller)-[:CALLS]->(callee)
+MERGE (caller)-[r:CALLS]->(callee)
+  ON CREATE SET r.call_type = 'SYNC', r.relinked = true, r.via_grep = true
+RETURN count(r) AS edges_created
 """
