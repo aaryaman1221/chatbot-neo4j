@@ -33,8 +33,7 @@ from .query_parser import (
 
 
 def _repo_filter(var: str, selected_repos: Optional[List[str]]) -> str:
-    """Build a repo-scoping Cypher clause for the given variable name.
-    Replaces the old fragile .replace('consumer.', 'entry.') string-patching."""
+    """Build a repo-scoping Cypher clause for the given variable name."""
     if not selected_repos:
         return ""
     return f"AND ({var}.repo IN $selected_repos OR {var}.full_name IN $selected_repos OR {var}.name IN $selected_repos)"

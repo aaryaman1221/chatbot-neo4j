@@ -56,10 +56,16 @@ ALLOWED_ORIGINS = [
 ]
 
 # ── Pydantic Request Models ──────────────────────────────────────────────────
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
 class ChatRequest(BaseModel):
     query: str
     selected_repos: Optional[List[str]] = None
     top_k: int = 5
+    chat_history: Optional[List[ChatMessage]] = None
 
 
 class ConnectionRequest(BaseModel):

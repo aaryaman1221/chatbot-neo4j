@@ -3,9 +3,9 @@
 # =============================================================================
 
 from typing import Optional, List
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
-from .config import logger
+from .config import logger, ChatMessage
 from .retriever import retrieve_code_context
 _CORE_PROMPT = """You are a senior software engineering assistant with deep knowledge of codebases, git history, issues, and repository structure. You have access to a knowledge graph that stores code functions, commits, files, issues, and repository metadata.
 
@@ -52,6 +52,7 @@ _BASE_REASONING_PROTOCOL = """REASONING PROTOCOL (follow for every answer):
 3. DISTINGUISH DIRECT vs TRANSITIVE: If A calls B and B calls C, say "A is transitively affected through B" — not "A calls C".
 4. CITE EVIDENCE INLINE: When referencing a function or file, include its [Source: ...] tag so the user can trace your reasoning back to a specific retrieval stage.
 5. CALL SITE PRECISION: When asked whether call site X does Y, do not substitute evidence from a different call site as if it proves X does Y — state clearly which call site the evidence actually comes from.
+6. CLARIFYING QUESTIONS POLICY: If the retrieved context is ambiguous, if multiple matching symbols/files/functions exist and you cannot determine the correct one, or if you need more information to give a correct answer, DO NOT guess or hallucinate. Instead, respond by directly asking the user a specific, concise clarifying question to resolve the ambiguity. You MUST prefix your response with "[CLARIFICATION_NEEDED]" if you are asking a clarifying question.
 
 General Instructions:
 - Answer ONLY using the information shown in the context above. Never invent evidence.
@@ -60,7 +61,7 @@ General Instructions:
 - Start with a "### Summary" section (or the appropriate specialized heading if a specialized protocol is provided below).
 - Include "### Impact Analysis" ONLY when you can point to specific code that changes.
 - End with "### Evidence" listing every function/commit SHA and file/repo you referenced in the body text above, as bullet points. Evidence must only list sources actually referenced in the body text above — do not list retrieved-but-unused records.
-- If the context truly contains no information relevant to the question (not just no code), say:
+- If the context truly contains no information relevant to the question (not just no code), you can ask the user clarifying questions or state:
   "The graph does not contain sufficient data to answer this question. The relevant data may not have been ingested yet."."""
 
 
@@ -226,6 +227,44 @@ You must validate all constraints solely against the verified Neo4j relations pr
 If the provided graph context is empty or missing an explicit edge type matching the user's query, you MUST state "The ingested graph data does not contain verified structural relationships for this target" rather than reporting a false negative or fabricating compliant facts.
 """
 
+def _rewrite_query(user_query: str, chat_history: List[ChatMessage], llm) -> str:
+    """Rewrite a follow-up query based on chat history to be self-contained for retrieval."""
+    if not chat_history:
+        return user_query
+
+    # Format the last few messages for query rewriting
+    history_lines = []
+    # Keep only the last 5 turns (10 messages) to avoid context blowup
+    for msg in chat_history[-10:]:
+        role = "User" if msg.role == "user" else "Assistant"
+        history_lines.append(f"{role}: {msg.content}")
+    history_text = "\n".join(history_lines)
+
+    rewrite_prompt = f"""Given the following conversation history and a follow-up question from the user, rewrite the follow-up question to be a self-contained search query. 
+The rewritten query must include all implicit context (like function names, variable names, file names, repos, or technologies) from the chat history so that it can be searched in a database independently.
+
+Do not answer the question or output any explanation. Only return the rewritten query text. If the question is already self-contained, return it exactly as is.
+
+Chat History:
+{history_text}
+
+Follow-up Question: {user_query}
+Rewritten Query:"""
+
+    try:
+        messages = [
+            SystemMessage(content="You are a precise search query rewriter. Rewrite the user's follow-up question to make it self-contained for a codebase database lookup."),
+            HumanMessage(content=rewrite_prompt)
+        ]
+        res = llm.invoke(messages)
+        rewritten = res.content.strip()
+        logger.info("[REWRITER] Rewrote query %r -> %r", user_query, rewritten)
+        return rewritten
+    except Exception as exc:
+        logger.warning("[REWRITER] Failed to rewrite query: %s. Using original query.", exc)
+        return user_query
+
+
 def answer_question_hybrid(
     user_input: str,
     llm,
@@ -233,9 +272,15 @@ def answer_question_hybrid(
     google_api_key: str,
     selected_repos: Optional[List[str]] = None,
     top_k: int = 5,
+    chat_history: Optional[List[ChatMessage]] = None,
 ) -> dict:
+    # 1. Rewrite query if we have chat history to make it self-contained for search retrieval
+    search_query = user_input
+    if chat_history:
+        search_query = _rewrite_query(user_input, chat_history, llm)
+
     graph_context, intent = retrieve_code_context(
-        user_input, driver, google_api_key, selected_repos, top_k
+        search_query, driver, google_api_key, selected_repos, top_k
     )
 
     context_is_empty = graph_context.strip() == "No relevant context found in the knowledge graph."
@@ -290,15 +335,32 @@ def answer_question_hybrid(
 
     messages = [
         SystemMessage(content=system_prompt),
-        HumanMessage(content=user_input)
     ]
+
+    # Inject conversation history
+    if chat_history:
+        for msg in chat_history:
+            if msg.role == "user":
+                messages.append(HumanMessage(content=msg.content))
+            elif msg.role == "assistant":
+                messages.append(AIMessage(content=msg.content))
+
+    # Inject current user query
+    messages.append(HumanMessage(content=user_input))
 
     try:
         response = llm.invoke(messages)
-        logger.info("[LLM] ✅ LLM responded — response_chars=%d", len(response.content))
-        logger.debug("[LLM] Response content:\n%s", response.content[:2000])
+        content = response.content
+        needs_clarification = False
+        if content.startswith("[CLARIFICATION_NEEDED]"):
+            needs_clarification = True
+            content = content.replace("[CLARIFICATION_NEEDED]", "").strip()
+
+        logger.info("[LLM] ✅ LLM responded — response_chars=%d, clarification=%s", len(content), needs_clarification)
+        logger.debug("[LLM] Response content:\n%s", content[:2000])
         return {
-            "answer": response.content,
+            "answer": content,
+            "needs_clarification": needs_clarification,
             "usage": response.usage_metadata if hasattr(response, "usage_metadata") else None
         }
     except Exception as exc:

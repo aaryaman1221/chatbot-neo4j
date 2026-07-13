@@ -5,6 +5,7 @@
 import os
 import traceback
 import time as _time
+import uuid
 
 from fastapi import APIRouter, Header, HTTPException
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -22,6 +23,8 @@ from .config import (
 from .llm_service import answer_question_hybrid
 
 api_router = APIRouter()
+SERVER_INSTANCE_ID = str(uuid.uuid4())
+logger.info("[STARTUP] Generated SERVER_INSTANCE_ID = %s", SERVER_INSTANCE_ID)
 
 
 @api_router.get("/api/health")
@@ -94,14 +97,21 @@ def chat(
             google_api_key=google_api_key,
             selected_repos=req.selected_repos,
             top_k=req.top_k,
+            chat_history=req.chat_history,
         )
 
         answer = result["answer"]
         usage = result["usage"]
+        needs_clarification = result.get("needs_clarification", False)
 
         elapsed = _time.perf_counter() - _t0
-        logger.info("[CHAT] ✅ Done in %.2fs — answer_chars=%d", elapsed, len(answer))
-        return {"answer": answer, "usage": usage}
+        logger.info("[CHAT] ✅ Done in %.2fs — answer_chars=%d, clarification=%s", elapsed, len(answer), needs_clarification)
+        return {
+            "answer": answer,
+            "usage": usage,
+            "needs_clarification": needs_clarification,
+            "instance_id": SERVER_INSTANCE_ID
+        }
     except Exception as e:
         elapsed = _time.perf_counter() - _t0
         logger.error("[CHAT] ❌ Failed after %.2fs: %s", elapsed, e)

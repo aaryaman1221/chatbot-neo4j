@@ -20,6 +20,7 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [instanceId, setInstanceId] = useState(null);
 
   const toggleRepo = (repo) => {
     setSelectedRepos(prev => 
@@ -93,18 +94,43 @@ function App() {
     setLoading(true);
 
     try {
+      const formattedHistory = messages.map(m => ({
+        role: m.role,
+        content: m.content
+      }));
+
       const res = await fetch(`${API_BASE}/chat`, {
         method: 'POST',
         headers: getHeaders(),
         body: JSON.stringify({
           query: msgText,
           selected_repos: selectedRepos.length > 0 ? selectedRepos : null,
-          top_k: topK
+          top_k: topK,
+          chat_history: formattedHistory
         })
       });
       const data = await res.json();
       if (res.ok) {
-        setMessages((prev) => [...prev, { role: 'assistant', content: data.answer, usage: data.usage }]);
+        if (instanceId !== null && data.instance_id !== instanceId) {
+          // Server restarted! Clear history and show only the current query and answer.
+          setMessages([
+            newMsg,
+            { 
+              role: 'assistant', 
+              content: `🔄 *[Server Restarted: Conversation reset]*\n\n${data.answer}`, 
+              usage: data.usage,
+              needs_clarification: data.needs_clarification 
+            }
+          ]);
+        } else {
+          setMessages((prev) => [...prev, { 
+            role: 'assistant', 
+            content: data.answer, 
+            usage: data.usage,
+            needs_clarification: data.needs_clarification 
+          }]);
+        }
+        setInstanceId(data.instance_id);
       } else {
         setMessages((prev) => [...prev, { role: 'assistant', content: `❌ Error: ${data.detail}` }]);
       }
@@ -121,8 +147,10 @@ function App() {
     "What files were changed most frequently?",
     "Which commits touched authentication code?",
     "Which parent-repo files import from the helper repo?",
-    "What functions in the parent repo call helper repo functions?",
   ];
+
+  const lastMessage = messages[messages.length - 1];
+  const needsClarification = lastMessage && lastMessage.role === 'assistant' && lastMessage.needs_clarification;
 
   return (
     <div className="app-container">
@@ -287,19 +315,36 @@ function App() {
         </div>
 
         {/* Input Area */}
-        <div className="chat-input-wrapper">
-          <input 
-            className="text-input" 
-            placeholder={connected ? "Ask a question about the repository issues or codebase…" : "Configure Neo4j credentials in the sidebar first…"}
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && sendMessage(input)}
-            disabled={!connected || loading}
-          />
-          <button className="btn" onClick={() => sendMessage(input)} disabled={!connected || loading || !input.trim()}>
-            Send
-          </button>
-        </div>
+        {needsClarification ? (
+          <div className="chat-input-wrapper clarification-input-active" style={{ border: '2px solid #ff9f1a', boxShadow: '0 0 10px rgba(255, 159, 26, 0.25)', padding: '0.25rem 0.5rem 0.25rem 1rem' }}>
+            <span style={{ fontSize: '0.85rem', color: '#ff9f1a', fontWeight: '700', marginRight: '6px', whiteSpace: 'nowrap' }}>⚠️ Clarify:</span>
+            <input 
+              className="text-input" 
+              placeholder="Provide clarifying details to answer the question above…"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && sendMessage(input)}
+              disabled={!connected || loading}
+            />
+            <button className="btn" onClick={() => sendMessage(input)} disabled={!connected || loading || !input.trim()} style={{ background: '#ff9f1a', color: '#fff', borderRadius: '50%' }}>
+              ✓
+            </button>
+          </div>
+        ) : (
+          <div className="chat-input-wrapper">
+            <input 
+              className="text-input" 
+              placeholder={connected ? "Ask a question about the repository issues or codebase…" : "Configure Neo4j credentials in the sidebar first…"}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && sendMessage(input)}
+              disabled={!connected || loading}
+            />
+            <button className="btn" onClick={() => sendMessage(input)} disabled={!connected || loading || !input.trim()}>
+              Send
+            </button>
+          </div>
+        )}
 
         <div style={{ textAlign: 'center', marginTop: '2rem', paddingTop: '1rem', borderTop: '1px solid rgba(255,255,255,0.06)', fontSize: '0.7rem', color: 'rgba(255,255,255,0.2)', letterSpacing: '0.5px' }}>
           GraphRAG Chat &nbsp;·&nbsp; Neo4j + Google Gemini
