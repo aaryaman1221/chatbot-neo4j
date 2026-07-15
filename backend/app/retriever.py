@@ -1053,11 +1053,30 @@ def retrieve_code_context(
                 impact_rows = filtered
 
             if field_hints_s0:
+                # Resolve repo hints to actual Repository.full_name values so each
+                # relevant repo gets its own fair share of the grep results below —
+                # otherwise a generic field name (e.g. "id") can return LIMIT-many
+                # matches from a single repo and starve out every other repo entirely.
+                _field_repo_targets: list[str] = []
+                if _effective_repos:
+                    _field_repo_targets = list(_effective_repos)
+                elif query_repo_hints:
+                    try:
+                        with driver.session() as session:
+                            _all_repo_names = [
+                                r["name"] for r in session.run(
+                                    "MATCH (r:Repository) RETURN r.full_name AS name"
+                                ).data()
+                            ]
+                        for hint in query_repo_hints:
+                            for rn in _all_repo_names:
+                                if hint in rn.lower():
+                                    _field_repo_targets.append(rn)
+                        _field_repo_targets = list(dict.fromkeys(_field_repo_targets))
+                    except Exception as exc:
+                        logger.warning("[RETRIEVE] Stage 0 repo-hint resolution failed: %s", exc)
+
                 for field in field_hints_s0:
-                    repo_filter_fg = (
-                        "AND (fn.repo IN $selected_repos OR fn.full_name IN $selected_repos OR fn.name IN $selected_repos)"
-                        if _effective_repos else ""
-                    )
                     if any(w in _query_lower_s0 for w in ["signature", "param", "arg", "return"]):
                         field_rel_label = f"REFERENCES_SIGNATURE_{field.upper()}"
                     elif any(w in _query_lower_s0 for w in ["method", "func", "function"]):
@@ -1066,40 +1085,98 @@ def retrieve_code_context(
                         field_rel_label = f"REFERENCES_KEY_{field.upper()}"
                     else:
                         field_rel_label = f"REFERENCES_FIELD_{field.upper()}"
-                    # Change the query variable to match the global 'fn' filter token
-                    field_grep_cypher = f"""
-                    MATCH (fn)
-                    WHERE (fn:Function OR fn:Type)
-                    AND fn.code IS NOT NULL
-                    AND (
-                        toLower(fn.code) CONTAINS toLower($field_name)
-                        OR (fn:Type AND $field_name IN fn.field_names)
-                    )
-                    {repo_filter_fg}
-                    RETURN
-                    fn.name                                  AS name,
-                    coalesce(fn.filepath, fn.path, '')       AS filepath,
-                    coalesce(fn.repo, '')                    AS repo,
-                    fn.code                                  AS code,
-                    labels(fn)[0]                            AS seed_label
-                    LIMIT 20
-                    """
-                    try:
-                        with driver.session() as session:
-                            field_rows = session.run(
-                                field_grep_cypher,
-                                field_name=field,
-                                selected_repos=_effective_repos,
-                            ).data()
-                        
-                        for r in field_rows:
-                            r["rel_type"] = field_rel_label
-                            r.setdefault("connected", [])
-                            if r.get("code"):
-                                r["code"] = _extract_relevant_lines(r["code"], field)
-                        impact_rows.extend(field_rows)
-                    except Exception as exc:
-                        logger.warning("[RETRIEVE] Stage 0 symbol-grep '%s' failed: %s", field, exc)
+
+                    # Rank matches that also mention the primary subject above generic
+                    # substring hits, so noise (e.g. "id" matching "valid", "provider")
+                    # doesn't bury the references we actually care about.
+                    field_rows: list[dict] = []
+                    if _field_repo_targets:
+                        per_repo_limit = 10
+                        field_grep_cypher = """
+                        MATCH (fn)
+                        WHERE (fn:Function OR fn:Type)
+                        AND fn.repo = $target_repo
+                        AND fn.code IS NOT NULL
+                        AND (
+                            toLower(fn.code) CONTAINS toLower($field_name)
+                            OR (fn:Type AND $field_name IN fn.field_names)
+                        )
+                        WITH fn, CASE WHEN $subject IS NOT NULL AND toLower(fn.code) CONTAINS toLower($subject)
+                                      THEN 1 ELSE 0 END AS subj_match
+                        RETURN
+                        fn.name                                  AS name,
+                        coalesce(fn.filepath, fn.path, '')       AS filepath,
+                        coalesce(fn.repo, '')                    AS repo,
+                        fn.code                                  AS code,
+                        labels(fn)[0]                            AS seed_label,
+                        subj_match                               AS subj_match
+                        ORDER BY subj_match DESC
+                        LIMIT $per_repo_limit
+                        """
+                        for target_repo in _field_repo_targets:
+                            try:
+                                with driver.session() as session:
+                                    rows = session.run(
+                                        field_grep_cypher,
+                                        field_name=field,
+                                        target_repo=target_repo,
+                                        subject=_primary_subject,
+                                        per_repo_limit=per_repo_limit,
+                                    ).data()
+                                logger.info(
+                                    "[RETRIEVE] Stage 0 field-grep '%s' repo=%s → %d row(s).",
+                                    field, target_repo, len(rows),
+                                )
+                                field_rows.extend(rows)
+                            except Exception as exc:
+                                logger.warning(
+                                    "[RETRIEVE] Stage 0 symbol-grep '%s' repo=%s failed: %s",
+                                    field, target_repo, exc,
+                                )
+                    else:
+                        repo_filter_fg = (
+                            "AND (fn.repo IN $selected_repos OR fn.full_name IN $selected_repos OR fn.name IN $selected_repos)"
+                            if _effective_repos else ""
+                        )
+                        field_grep_cypher = f"""
+                        MATCH (fn)
+                        WHERE (fn:Function OR fn:Type)
+                        AND fn.code IS NOT NULL
+                        AND (
+                            toLower(fn.code) CONTAINS toLower($field_name)
+                            OR (fn:Type AND $field_name IN fn.field_names)
+                        )
+                        {repo_filter_fg}
+                        WITH fn, CASE WHEN $subject IS NOT NULL AND toLower(fn.code) CONTAINS toLower($subject)
+                                      THEN 1 ELSE 0 END AS subj_match
+                        RETURN
+                        fn.name                                  AS name,
+                        coalesce(fn.filepath, fn.path, '')       AS filepath,
+                        coalesce(fn.repo, '')                    AS repo,
+                        fn.code                                  AS code,
+                        labels(fn)[0]                            AS seed_label,
+                        subj_match                               AS subj_match
+                        ORDER BY subj_match DESC
+                        LIMIT 20
+                        """
+                        try:
+                            with driver.session() as session:
+                                field_rows = session.run(
+                                    field_grep_cypher,
+                                    field_name=field,
+                                    selected_repos=_effective_repos,
+                                    subject=_primary_subject,
+                                ).data()
+                        except Exception as exc:
+                            logger.warning("[RETRIEVE] Stage 0 symbol-grep '%s' failed: %s", field, exc)
+
+                    for r in field_rows:
+                        r["rel_type"] = field_rel_label
+                        r.setdefault("connected", [])
+                        r.pop("subj_match", None)
+                        if r.get("code"):
+                            r["code"] = _extract_relevant_lines(r["code"], field)
+                    impact_rows.extend(field_rows)
 
             logger.info(
                 "[RETRIEVE] Stage 0 returned %d impact record(s) (post-filter).", len(impact_rows)
@@ -1829,11 +1906,12 @@ def retrieve_code_context(
 
     # ── Stage 3: Commit retrieval ──────────────────────────────────────────────
     _query_lower = user_query.lower()
+    _needs_recency_sort = intent.wants_recency
     _needs_commit_context = (
         not context_parts
         or intent.wants_commit_files
+        or _needs_recency_sort
     )
-    _needs_recency_sort = intent.wants_recency
 
     lucene_query = _sanitize_lucene_query(user_query)
     fulltext_cypher = """
@@ -2367,7 +2445,7 @@ def retrieve_code_context(
         return "No relevant context found in the knowledge graph.", intent
 
     # Enforce budget limit: MAX_CONTEXT_CHARS
-    MAX_CONTEXT_CHARS = 100000  # approximately 20k-25k tokens
+    MAX_CONTEXT_CHARS = 200000  # approximately 40k-50k tokens
     
     # Calculate current size
     total_len = sum(len(part["content"]) for part in context_parts) + (len(context_parts) - 1) * 2
