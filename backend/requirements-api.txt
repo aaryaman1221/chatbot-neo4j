@@ -4,7 +4,7 @@
 # This is the curated subset needed to RUN the API (backend/Dockerfile → target
 # "api"). It deliberately omits the ingest-pipeline deps (tree-sitter, PyGithub,
 # neo4j-graphrag, langchain, …) which live in ../requirements.txt and are only
-# needed by backend_ingest.py / backfill_embeddings.py / enrich_semantic_edges.py.
+# needed by backend_ingest.py and the one-off scripts under maintenance/.
 # Keep this in sync with the imports under backend/app/.
 # =============================================================================
 

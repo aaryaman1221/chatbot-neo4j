@@ -19,6 +19,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
 
+# This script lives in maintenance/ — make the repo root importable so `ingest.*` resolves.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from ingest.queries import (
     CYPHER_LINK_REPO_DEPENDENCY,
     CYPHER_LINK_MODULE_TO_REPO,
@@ -234,7 +239,7 @@ def main():
     parser.add_argument("--scan-github", type=str, help="Scan remote repositories via GitHub zipball stream.")
     args = parser.parse_args()
 
-    _env_path = Path(__file__).resolve().parent / ".env"
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
     load_dotenv(_env_path if _env_path.exists() else None)
 
     uri = os.environ.get("NEO4J_URI", "neo4j://localhost:7687")

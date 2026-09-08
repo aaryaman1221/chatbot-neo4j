@@ -14,7 +14,7 @@ import sys
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
 
-# Re-exported for backward compatibility with migrate_calls_edges.py and other scripts
+# Re-exported for backward compatibility with older scripts (see maintenance/)
 from ingest.queries import (
     CYPHER_LINK_REPO_DEPENDENCY,
     CYPHER_LINK_MODULE_TO_REPO,

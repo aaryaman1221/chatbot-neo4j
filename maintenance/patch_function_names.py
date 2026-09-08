@@ -34,6 +34,11 @@ from dotenv import load_dotenv
 from neo4j import GraphDatabase
 from tqdm import tqdm
 
+# This script lives in maintenance/ — make the repo root importable so `ingest.*` resolves.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from ingest.config import logger, GITHUB_API_BASE
 from ingest.parser import parse_go_ast, parse_python_ast
 
@@ -62,7 +67,7 @@ RETURN count(fn) AS updated
 
 def patch_graph():
     from pathlib import Path
-    _env_path = Path(__file__).resolve().parent / ".env"
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
     if _env_path.exists():
         load_dotenv(_env_path)
     else:

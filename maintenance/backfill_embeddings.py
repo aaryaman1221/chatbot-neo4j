@@ -10,11 +10,14 @@ from dotenv import load_dotenv
 from neo4j import GraphDatabase
 from tqdm import tqdm
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# This script lives in maintenance/ — make the repo root importable so `ingest.*` resolves.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 from ingest.ai_service import get_embeddings_batch
 
 def main():
-    load_dotenv()
+    load_dotenv(os.path.join(_REPO_ROOT, ".env"))
 
     NEO4J_URI      = os.environ.get("NEO4J_URI",      "neo4j://localhost:7687")
     NEO4J_USER     = os.environ.get("NEO4J_USER",     "neo4j")

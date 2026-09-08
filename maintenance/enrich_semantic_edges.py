@@ -507,7 +507,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    _env_path = Path(__file__).resolve().parent / ".env"
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
     load_dotenv(_env_path if _env_path.exists() else None)
 
     uri = os.environ.get("NEO4J_URI", "neo4j://localhost:7687")

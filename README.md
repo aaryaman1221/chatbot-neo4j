@@ -133,6 +133,7 @@ frontend however you like. Full cloud deployment steps are in
 backend/            FastAPI app (app/) + entry point (main.py)
 ingest/             GitHub → Neo4j pipeline (AST parsing, embeddings, graph writes)
 frontend/           React + Vite chat UI
+maintenance/        One-off scripts to repair/upgrade an existing graph
 backend_ingest.py   CLI wrapper for the ingestion pipeline
 docker-compose.yml  One-command local stack
 docs/deploy/        Cloud deployment runbook

@@ -36,6 +36,6 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY backend/ ./backend/
 COPY ingest/ ./ingest/
-COPY backend_ingest.py backfill_embeddings.py enrich_semantic_edges.py \
-     migrate_calls_edges.py patch_function_names.py ./
+COPY maintenance/ ./maintenance/
+COPY backend_ingest.py ./
 CMD ["python", "backend_ingest.py", "--help"]
