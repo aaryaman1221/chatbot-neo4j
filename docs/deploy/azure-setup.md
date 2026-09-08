@@ -295,8 +295,10 @@ az identity federated-credential create \
 MI_PRINCIPAL=$(az identity show -n id-graphrag -g rg-graphrag --query principalId -o tsv)
 az role assignment create --assignee-object-id "$MI_PRINCIPAL" --assignee-principal-type ServicePrincipal \
   --role AcrPush --scope $(az acr show -n <acr> --query id -o tsv)
+# Contributor at RESOURCE-GROUP scope — an app-scoped grant is lost if the
+# Container App is ever deleted/recreated (e.g. a region move).
 az role assignment create --assignee-object-id "$MI_PRINCIPAL" --assignee-principal-type ServicePrincipal \
-  --role Contributor --scope $(az containerapp show -n ca-graphrag-api -g rg-graphrag --query id -o tsv)
+  --role Contributor --scope $(az group show -n rg-graphrag --query id -o tsv)
 ```
 
 > Add one federated credential per branch/subject you deploy from. For PR builds:
