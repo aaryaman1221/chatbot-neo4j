@@ -1,227 +1,140 @@
-# GraphRAG Explorer: Neo4j + Gemini
+# GraphRAG Explorer
 
-A powerful Python-based application that ingests GitHub repository data into a Neo4j knowledge graph and provides a highly interactive Streamlit chat interface. It leverages an Agentic Workflow using LangChain and Google's Gemini models to answer complex queries about your codebase.
+**Ask plain-English questions about a codebase and get answers grounded in its real structure and history — not guesses.**
 
-## Features
+🔗 **Live demo:** https://brave-grass-004b25000.3.azurestaticapps.net
 
-- **One-Click Bootstrap** (`run.sh`):
-  - Automated setup script that creates a template `.env`, starts a Dockerized Neo4j instance with APOC enabled, installs requirements, and runs the ingestion pipeline (password set to password123 by default).
-- **Backend Ingestion Pipeline** (`backend_ingest.py`): 
-  - Pure Python CLI to bootstrap a GitHub repository into a Neo4j graph.
-  - Parses code structure using Tree-sitter (AST). *(Note: Currently supports only Python and Go code)*
-  - Uses Google Gemini for LLM-powered summarization of code and commits.
-  - Models repositories, files, functions, commits, modules, interfaces and their dependencies in Neo4j.
-- **Graph Restoration & Enrichment Scripts** (For existing ingestions):
-  - `patch_function_names.py`: Zero-token in-place restoration that fixes AST UTF-8 byte-slicing function truncation without re-running embeddings or LLM summarization.
-  - `migrate_calls_edges.py`: Cleans up ambiguous intra-repository call edges and establishes cross-repository symbol links.
-  - `enrich_semantic_edges.py`: Automated code intelligence engine that adds 10 high-level semantic relationship layers (e.g., `DECLARES_METHOD`, `IMPLEMENTS`, `WRAPS`, `MUTATES_STATE_OF`).
-  - `backfill_embeddings.py`: Some embeddings of certain functions were skipped due to api call timeout, this file creates missing code embeddings.
-- **Backend API & Hybrid RAG Agent** (`backend/main.py` & `backend/app/`):
-  - FastAPI server providing endpoints for agentic chat and code intelligence.
-  - Powered by a LangChain Tool-Calling Agent and a Hybrid Retrieval Pipeline (combining vector similarity, full-text commit fallback, structural path hints, and blame traversal).
-  - Specialized reasoning protocols for migration impact analysis, ownership/blame, and modification frequency.
-- **Frontend UI** (`frontend/`):
-  - Modern, responsive React application built with Vite.
+---
 
-## Prerequisites
+## What it does
 
-- Python 3.9+
-- Docker (for easily running Neo4j)
-- A GitHub Personal Access Token
-- A Google Gemini API Key
+Point it at one or more GitHub repositories. It reads the code, the commit
+history, and how everything connects — which function calls which, which file
+changed in which commit, who wrote it — and stores all of that as a **knowledge
+graph** in Neo4j.
 
-## Installation
+Then you can ask things like:
 
-1. **Clone the repository** (if you haven't already):
-   ```bash
-   git clone <your-repo-url>
-   cd neo4j-testing
-   ```
+- *"What does `resolve_cross_repo_edges` do, and what calls it?"*
+- *"Which files tend to change together?"*
+- *"If I change this function in the shared library, what breaks downstream?"*
+- *"Which commits touched authentication code, and who wrote them?"*
 
-2. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+Each answer is assembled from the graph plus semantic search over the code, then
+written up by Google Gemini — with the sources it used.
 
-3. **Set up Environment Variables**:
-   Create a `.env` file in the root directory with the following variables:
-   ```env
-   GITHUB_TOKEN=your_github_personal_access_token
-   GOOGLE_API_KEY=your_gemini_api_key
-   NEO4J_URI=neo4j://localhost:7687
-   NEO4J_USER=neo4j
-   NEO4J_PASSWORD=password123
-   TARGET_REPO=owner/repo # e.g., neo4j/neo4j-graphrag-python
-   MAX_COMMITS=200
-   FORCE_LLM_UPDATE=false
-   ```
+## Why a graph instead of "just embeddings"
 
-## Usage
+Most code chatbots paste big chunks of files into the prompt and hope the model
+connects the dots. This one looks up the *specific* things your question is about
+and follows their real relationships.
 
-### 1. Start Neo4j Database
+| | Plain vector RAG | GraphRAG Explorer |
+|---|---|---|
+| Context sent to the model | Large blobs of nearby code | Just the relevant functions/commits + their direct neighbours |
+| Multi-file / multi-repo questions | Often misses the link | Follows real call edges and cross-repo references |
+| Cost per question | High (many tokens) | Low (targeted lookup) |
+| *"Who introduced this?"* | Can't answer | Traces the commit and author |
 
-You can easily start a Neo4j instance with the APOC plugin using Docker:
+## How a question gets answered
 
-```bash
-docker run --name neo4j-graphrag \
-  -p 7474:7474 -p 7687:7687 \
-  -e NEO4J_AUTH=neo4j/password123 \
-  -e NEO4J_PLUGINS='["apoc"]' \
-  -e NEO4J_apoc_export_file_enabled=true \
-  -e NEO4J_apoc_import_file_enabled=true \
-  -e NEO4J_dbms_security_procedures_unrestricted="apoc.*" \
-  neo4j:5.20
+1. **Understand it** — an LLM pass extracts what you're asking about (function
+   names, files, intent).
+2. **Look it up in the graph** — find those nodes, then walk to their direct
+   neighbours: callers, callees, the file they live in, recent commits.
+3. **Semantic search** — vector search over code and commit embeddings catches
+   anything named differently than you phrased it.
+4. **Build a tight context** — merge both, capped per node type so the prompt
+   stays small.
+5. **Answer** — Gemini writes the response and cites the graph and search hits.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    U[User] --> SWA[Static Web App<br/>React + Vite]
+    SWA -->|HTTPS| API[Container App<br/>FastAPI]
+    API --> AURA[(Neo4j AuraDB<br/>knowledge graph)]
+    API --> GEM[Google Gemini<br/>answers + embeddings]
+    KV[Key Vault] -. secrets .-> API
+    GH[GitHub Actions] -. build & deploy .-> SWA
+    GH -. build & deploy .-> API
 ```
 
-### 2. Run the Backend Ingestion
+The graph runs in two places, switched by a single environment variable
+(`NEO4J_URI`):
 
-Ingest the target GitHub repository into your Neo4j graph database. This step will extract files, AST structures, and commits, enriching them with LLM-generated summaries.
+| Layer | Local development | Cloud (Azure) |
+|---|---|---|
+| Frontend | Vite dev server | Static Web Apps |
+| Backend API | `uvicorn` | Container Apps (autoscale 1–3, HTTPS) |
+| Graph database | Neo4j 5 in Docker | Neo4j AuraDB (managed) |
+| Secrets | `.env` file | Key Vault |
+| Language model | Google Gemini | Google Gemini |
+
+**CI/CD (GitHub Actions).** On every push to `main`: the backend image is built,
+pushed to Azure Container Registry, and the Container App is rolled to it; the
+frontend is built and deployed to Static Web Apps. Azure auth uses OIDC federated
+identity — no cloud passwords are stored anywhere.
+
+## Tech stack
+
+- **Graph:** Neo4j 5 with native vector indexes (3072-dim Gemini embeddings)
+- **Backend:** Python, FastAPI, LangChain, Neo4j driver
+- **Frontend:** React 19, Vite
+- **AI:** Google Gemini — `gemini-2.5-flash` for answers, Gemini embeddings for search
+- **Ingestion:** Tree-sitter (AST parsing for Python and Go), PyGitHub
+- **Cloud:** Azure Container Apps, Static Web Apps, Container Registry, Key Vault; Neo4j AuraDB
+- **CI/CD:** GitHub Actions with OIDC federated identity
+
+## Run it locally
 
 ```bash
+cp .env.example .env            # add your GITHUB_TOKEN and GOOGLE_API_KEY
+docker compose up -d --build    # Neo4j + backend + frontend
+open http://localhost:5173
+```
+
+Load a repository into the graph:
+
+```bash
+# set TARGET_REPO=owner/name in .env, then:
 python backend_ingest.py
 ```
 
-### 3. Start the Backend API
+Want just the database? `docker compose up -d neo4j` and run the backend and
+frontend however you like. Full cloud deployment steps are in
+[`docs/deploy/azure-setup.md`](docs/deploy/azure-setup.md).
 
-Start the FastAPI backend server which handles agent interactions and graph queries.
+## What's in the demo graph
 
-```bash
-cd backend
-uvicorn main:app --reload
+**6 repositories · ~20,000 nodes · ~173,000 relationships**
+
+`aaryaman1221/Ripple` · `aaryaman1221/SecureBank` · `charmbracelet/bubbles` ·
+`charmbracelet/lipgloss` · `gohugoio/hugo` · `spf13/cobra`
+
+## Notes from building it
+
+- **Gemini is geo-blocked in some regions.** The Azure backend had to move from
+  Hong Kong to Korea Central because Gemini's API refuses requests originating in
+  Hong Kong. The frontend stayed put — it never calls Gemini directly.
+- **Context budgeting.** Early versions blew the token budget by sending too much
+  graph context; there's now a per-node-type cap on how much gets pulled in.
+- **Managed identity for CI.** The Azure tenant blocks service-principal
+  creation, so GitHub Actions authenticates through a federated credential on a
+  user-assigned managed identity instead.
+- **Automatic credential fallback.** The backend uses server-side Neo4j
+  credentials when a request doesn't carry its own, so the deployed site connects
+  with no user input while local development can still point anywhere.
+
+## Repository layout
+
 ```
-
-### 4. Start the React Frontend
-
-Start the React development server to interactively explore and chat with your codebase.
-
-```bash
-cd frontend
-npm install
-npm run dev
+backend/            FastAPI app (app/) + entry point (main.py)
+ingest/             GitHub → Neo4j pipeline (AST parsing, embeddings, graph writes)
+frontend/           React + Vite chat UI
+backend_ingest.py   CLI wrapper for the ingestion pipeline
+docker-compose.yml  One-command local stack
+docs/deploy/        Cloud deployment runbook
+.github/workflows/  CI/CD (backend, frontend, AuraDB keep-alive)
 ```
-
-### 5. Graph Migration & Restoration (For Existing Ingestions)
-
-If you have already ingested a repository into Neo4j before the recent AST bug fixes and semantic enrichment upgrades, you **do not need to re-run the full LLM ingestion**. Instead, run these helper scripts in order to upgrade your knowledge graph in-place:
-
-1. **Restore Function Names & Code Blocks** (Fixes UTF-8 byte-slicing truncation without consuming LLM tokens or regenerating embeddings):
-   ```bash
-   python3 patch_function_names.py
-   ```
-
-2. **Migrate & Clean Up Call Edges** (Resolves ambiguous function calls and links cross-repository dependencies):
-   ```bash
-   python3 migrate_calls_edges.py
-   ```
-
-3. **Enrich Semantic Graph Layers** (Generates 10 high-level code intelligence layers like `IMPLEMENTS`, `WRAPS`, `EMBEDS`, and `MUTATES_STATE_OF`):
-   ```bash
-   python3 enrich_semantic_edges.py
-   ```
-
-4. **Backfill Embeddings** Some embeddings weren't ingested in previous versions, File for backwards compatibility:
-   ```bash
-   python3 backfill_embeddings.py
-   ```
-
-## Architecture Overview
-
-### Graph Schema (Nodes & Relationships)
-
-The knowledge graph models the entire software lifecycle and codebase structure. It contains the following node types and relationship layers:
-
-#### Core Nodes
-- **Repository**: Represents the GitHub repository.
-- **Directory**: Represents the folder hierarchy within the repository.
-- **File**: Represents source code files (supports Python and Go).
-- **Function**: Represents declared functions and methods (including interface method declarations).
-- **Type**: Represents structured types, classes, and interfaces (e.g., structs and interfaces in Go, classes in Python).
-- **Variable**: Represents package-level variables and typed channels (e.g., Go `CHAN` variables).
-- **Directive**: Represents compiler or code-generation instructions (e.g., `go:generate`).
-- **Commit**: Represents git commits parsed from repository history.
-- **User**: Represents git authors/committers.
-- **Module**: Represents imported third-party modules or external packages.
-
-#### Relationships & Semantic Layers
-The pipeline builds explicit structural and semantic links between nodes, categorized into:
-- **Structural AST Edges**:
-  - `CONTAINS` (Directory -> Directory/File): Models filesystem nesting.
-  - `CONTAINS_FILE`/`CONTAINS_DIR` (Repository -> File/Directory).
-  - `DECLARES` (File/Repository -> Function).
-  - `DECLARES_TYPE` (File/Repository -> Type).
-  - `DECLARES_VAR` (File/Repository -> Variable).
-  - `DECLARES_METHOD` (Type -> Function): Binds receiver methods to their parent structs/classes.
-  - `HAS_DIRECTIVE` (File -> Directive).
-  - `DEPENDS_ON` (File -> Module): Represents dependency imports.
-- **Semantic Code Intelligence Edges**:
-  - `EMBEDS` (Type -> Type): Represents struct composition or subclass inheritance.
-  - `IMPLEMENTS` (Type -> Type): Connects structs to structural interfaces they satisfy (Go duck-typing resolution).
-  - `RETURNS` (Function -> Type): Maps functions/methods to their returned types.
-  - `MUTATES_STATE_OF` (Function -> Type): Identifies functions/methods that modify receiver state (e.g., pointer receivers, setter methods).
-  - `TESTS` (Function -> Function): Connects test functions to the units they cover (e.g., `TestFoo` -> `Foo`).
-  - `PROPAGATES_ERROR` (Function -> Function): Traces error handling and bubble-up flows.
-  - `CONSTRAINED_BY` (Function/Type -> Type): Binds generic type parameters to their constraints.
-  - `CHAN_ELEM_TYPE` (Variable -> Type): Identifies elements transmitted over channels.
-  - `GENERATES_TYPE`/`GENERATES_FILE` (Directive -> Type/File): Tracks generated assets.
-  - `LIFECYCLE_HOOK` (Type/Function -> Function): Flags lifecycle callbacks and handlers.
-  - `REGISTERS_WITH` (Function -> Function): Captures callback registration events.
-  - `DISPATCHES_TO`/`FORWARDS_TO` (Function -> Function): Maps message dispatching and proxy forwarding.
-- **Git History & Blame Edges**:
-  - `AUTHORED` (User -> Commit).
-  - `BELONGS_TO` (Commit -> Repository).
-  - `MODIFIED` (Commit -> File/Function).
-
-### Cross-Repository Functionality
-
-When multiple interconnected repositories are ingested into the same Neo4j database, the graph links them at both the dependency and call levels. This cross-repository architecture enables multi-repo impact analysis and cross-module tracking via the following pipeline stages:
-
-1. **Dependency Ingest (`DEPENDS_ON`):**
-   When files are parsed, their external imports are saved as `Module` nodes with a `DEPENDS_ON` relationship from the importing `File`.
-2. **Module-to-Repo Mapping (`REPRESENTS`):**
-   The migration engine maps imported `Module` packages to concrete ingested `Repository` nodes using fuzzy suffix matching:
-   $$\text{Module(name: "github.com/org/helper")} \xrightarrow{\text{REPRESENTS}} \text{Repository(full\_name: "org/helper")}$$
-3. **Cross-Repo File Coupling (`USES_REPO`):**
-   If a parent file's `DEPENDS_ON` module represents another repository in the database, a `USES_REPO` edge is created directly from the parent `File` to that `Repository`.
-4. **Cross-Repo Call Edge Resolution (`CALLS {cross_repo: true}`):**
-   The engine scans AST-parsed qualified calls (e.g., `helper.ComputeData()`) inside a function:
-   - If the package prefix (`helper`) matches a resolved `USES_REPO` repository, and that target repository declares a function named `ComputeData`, a cross-repo `CALLS` edge is established:
-     $$(\text{Function}_{\text{parent}}) \xrightarrow{\text{CALLS } \{\text{cross\_repo: true}\}} (\text{Function}_{\text{helper}})$$
-5. **Transitive Call Propagation (`CALLS {cross_repo: true, via: ...}`):**
-   If local function `A` calls local function `B`, and `B` has a cross-repo call to `C` in the external repository, a transitive edge `(A)-[:CALLS {cross_repo: true, via: B.name}]->(C)` is established to simplify deep upstream query traversals.
-6. **Cross-Repo Impact Analysis:**
-   Using the `CYPHER_CROSS_REPO_IMPACT` logic, users can query downstream impacts of a commit in a dependency repo. For example:
-   ```cypher
-   // Trace from a modified function in the helper repo back to the callers in the parent repo
-   MATCH (c:Commit {sha: $sha})-[:MODIFIED]->(helperFunc:Function)
-   MATCH (parentFunc:Function)-[:CALLS {cross_repo: true}]->(helperFunc)
-   RETURN parentFunc.filepath, parentFunc.name
-   ```
-
-### LLM Agent Workflow
-The UI utilizes a LangChain Tool-Calling Agent equipped with specific tools to perform impact analysis, search commit history, trace git blame ownership, and execute generic Cypher queries against the graph.
-
-## Token Optimization & Graph Retrieval
-
-Unlike standard vector DB-based retrieval that relies solely on text chunk similarity, this application leverages **GraphRAG** via Neo4j. This results in significant token optimization:
-- **Targeted Context**: Instead of padding the prompt with entire files or disjointed text chunks, the system retrieves precise subgraphs (e.g., a function, its direct dependencies, and recent commits).
-- **Reduced Token Costs**: By filtering out irrelevant code and returning highly structured context, the LLM prompt remains small and dense with useful information, drastically reducing token usage per query.
-
-## GraphRAG Explorer vs. GitHub Copilot CLI
-
-While standard tools like GitHub Copilot CLI excel at autocomplete and local file edits, GraphRAG Explorer is built for deep, repository-scale analytical queries with several key advantages:
-
-1. **Much Less Token Usage**: Copilot often sends large portions of your active workspace to the LLM context. GraphRAG queries the Neo4j database first, extracting only the exact relationships and feeding minimal, precise context to Gemini.
-2. **Reliable Cross-Repo Analysis**: Copilot's context window struggles with deep dependencies spanning multiple files or repositories. GraphRAG naturally connects these entities via explicit graph edges (`DEPENDS_ON`, `CALLS`), enabling highly accurate cross-repo and cross-module reasoning.
-3. **Commit History Integration**: GraphRAG models git history natively. You can ask *why* a piece of code changed or *who* introduced a bug, leveraging `MODIFIED` and `AUTHORED` relationships.
-4. **Transparent Reasoning**: The retrieved context is based on explicit graph traversal. You can verify exactly which files, functions, and commits were used to generate the answer, minimizing black-box hallucinations.
-
-## Dependencies
-
-Major dependencies include:
-- `neo4j` and `neo4j-graphrag`: For graph database interaction.
-- `google-genai` and `langchain-google-genai`: For Gemini LLM capabilities.
-- `langchain` and `langchain-neo4j`: For the agentic workflow and Cypher QA chains.
-- `fastapi` & `uvicorn`: For the backend REST API.
-- React & Vite: For the frontend UI.
-- `PyGithub`: For fetching repository data.
-- `tree-sitter` (optional but recommended): For precise code parsing.
