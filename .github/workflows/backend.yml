@@ -1,0 +1,53 @@
+name: Deploy backend
+
+# ACR Tasks (az acr build) are disabled on this subscription, so the image is
+# built on the runner and pushed. Azure auth is OIDC federated to the
+# user-assigned managed identity `id-graphrag` (the tenant blocks app
+# registrations, so a managed identity carries the federated credential).
+#
+# Repo VARIABLES:  ACR_NAME, ACR_LOGIN_SERVER, CONTAINERAPP_NAME, RESOURCE_GROUP
+# Repo SECRETS:    AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "ingest/**"
+      - "requirements.txt"
+      - "backend/requirements-api.txt"
+      - ".github/workflows/backend.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC → managed identity)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build & push API image
+        run: |
+          set -euo pipefail
+          IMAGE="${{ vars.ACR_LOGIN_SERVER }}/graphrag-api"
+          az acr login -n "${{ vars.ACR_NAME }}"
+          docker build -f backend/Dockerfile --target api \
+            -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" .
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"
+
+      - name: Roll Container App to the new image
+        run: |
+          az containerapp update \
+            -n "${{ vars.CONTAINERAPP_NAME }}" -g "${{ vars.RESOURCE_GROUP }}" \
+            --image "${{ vars.ACR_LOGIN_SERVER }}/graphrag-api:${{ github.sha }}"

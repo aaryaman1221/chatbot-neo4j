@@ -1,0 +1,27 @@
+# Backend build context (repo root). Keep backend/, ingest/, and the root
+# *_ingest / *_embeddings scripts + requirements*.txt — exclude everything else.
+.git
+.gitignore
+.dockerignore
+.env
+.env.*
+!.env.example
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.DS_Store
+**/.DS_Store
+
+frontend/
+graphify-out/
+docs/
+dump/
+*.md
+demo_response.txt
+questions.txt
+testing.py
+.github/
+.claude/

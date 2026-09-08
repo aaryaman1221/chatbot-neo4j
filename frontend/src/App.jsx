@@ -3,13 +3,14 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import './index.css';
 
-const API_BASE = 'http://localhost:8000/api';
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000/api';
 
 function App() {
   const [uri, setUri] = useState('neo4j://localhost:7687');
   const [user, setUser] = useState('neo4j');
   const [password, setPassword] = useState('');
-  
+  const [preconfigured, setPreconfigured] = useState(false);
+
   const [connected, setConnected] = useState(false);
   const [stats, setStats] = useState(null);
   const [repos, setRepos] = useState([]);
@@ -33,12 +34,43 @@ function App() {
 
   const filteredRepos = repos.filter(r => r.toLowerCase().includes(repoSearch.toLowerCase()));
 
-  const getHeaders = () => ({
-    'Content-Type': 'application/json',
-    'x-neo4j-uri': uri,
-    'x-neo4j-user': user,
-    'x-neo4j-password': password
-  });
+  // Only send X-Neo4j-* headers we actually have. When the server is
+  // preconfigured (deployed site), the fields are blank and the backend
+  // falls back to its own NEO4J_* env credentials.
+  const getHeaders = () => {
+    const h = { 'Content-Type': 'application/json' };
+    if (uri) h['x-neo4j-uri'] = uri;
+    if (user) h['x-neo4j-user'] = user;
+    if (password) h['x-neo4j-password'] = password;
+    return h;
+  };
+
+  // On load, ask the backend whether Neo4j credentials are baked in. If so,
+  // hide the connection form, clear the local fields, and auto-connect.
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/config`);
+        if (!res.ok) return;
+        const cfg = await res.json();
+        if (cfg.neo4j_preconfigured) {
+          setUri('');
+          setUser('');
+          setPassword('');
+          setPreconfigured(true);
+        }
+      } catch (e) {
+        console.error('Failed to fetch server config', e);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (preconfigured && !connected) {
+      checkConnection();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preconfigured]);
 
   const checkConnection = async () => {
     try {
@@ -163,19 +195,29 @@ function App() {
         </div>
 
         <div className="section-header">🗄️ Neo4j Connection</div>
-        <div className="input-group">
-          <label className="input-label">Neo4j URI</label>
-          <input className="text-input" value={uri} onChange={e => setUri(e.target.value)} />
-        </div>
-        <div className="input-group">
-          <label className="input-label">Username</label>
-          <input className="text-input" value={user} onChange={e => setUser(e.target.value)} />
-        </div>
-        <div className="input-group">
-          <label className="input-label">Password</label>
-          <input className="text-input" type="password" value={password} onChange={e => setPassword(e.target.value)} />
-        </div>
-        <button className="btn" onClick={checkConnection} style={{ marginTop: '0.5rem' }}>Connect</button>
+        {preconfigured ? (
+          <div style={{ fontSize: '0.78rem', color: 'rgba(255,255,255,0.55)', padding: '0.25rem 0 0.5rem 0' }}>
+            {connected
+              ? '🟢 Connected to the managed graph'
+              : '⏳ Connecting to the managed graph…'}
+          </div>
+        ) : (
+          <>
+            <div className="input-group">
+              <label className="input-label">Neo4j URI</label>
+              <input className="text-input" value={uri} onChange={e => setUri(e.target.value)} />
+            </div>
+            <div className="input-group">
+              <label className="input-label">Username</label>
+              <input className="text-input" value={user} onChange={e => setUser(e.target.value)} />
+            </div>
+            <div className="input-group">
+              <label className="input-label">Password</label>
+              <input className="text-input" type="password" value={password} onChange={e => setPassword(e.target.value)} />
+            </div>
+            <button className="btn" onClick={checkConnection} style={{ marginTop: '0.5rem' }}>Connect</button>
+          </>
+        )}
 
         {connected && stats && (
           <>

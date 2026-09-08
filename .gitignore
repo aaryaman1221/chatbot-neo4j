@@ -1,4 +1,7 @@
 .env
+.env.local
+frontend/.env
+frontend/.env.local
 __pycache__/
 *.pyc
 *.pyo
@@ -8,3 +11,8 @@ frontend/dist/
 *.egg-info/
 .venv/
 venv/
+
+# Neo4j → AuraDB migration artifacts (see docs/deploy/azure-setup.md)
+dump/
+.azure-deploy.env
+.swa-token

@@ -1,0 +1,92 @@
+# =============================================================================
+# docker-compose.yml — one-command local stack for GraphRAG.
+#
+#   docker compose up -d --build            # neo4j + backend + frontend
+#   docker compose up -d neo4j              # just the graph (host-run backend)
+#   docker compose --profile tools run --rm ingest python backend_ingest.py
+#
+# Named volume is graphrag_neo4j_data (project name below + "_neo4j_data").
+# =============================================================================
+name: graphrag
+
+services:
+  neo4j:
+    image: neo4j:5.20
+    container_name: graphrag-neo4j
+    ports:
+      - "7474:7474"   # Neo4j Browser
+      - "7687:7687"   # Bolt
+    environment:
+      NEO4J_AUTH: neo4j/password123
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p password123 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: api
+    container_name: graphrag-backend
+    env_file:
+      - .env
+    environment:
+      # Overrides whatever is in .env — inside the compose network the graph
+      # is reachable as "neo4j", not localhost.
+      NEO4J_URI: neo4j://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: password123
+      ALLOWED_ORIGINS: http://localhost:5173,http://localhost:3000
+    ports:
+      - "8000:8000"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE: /api
+    container_name: graphrag-frontend
+    environment:
+      BACKEND_ORIGIN: http://backend:8000
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+  # One-off pipeline runner. Not started by `up`; invoke explicitly:
+  #   docker compose --profile tools run --rm ingest python backend_ingest.py
+  ingest:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: ingest
+    profiles: ["tools"]
+    env_file:
+      - .env
+    environment:
+      NEO4J_URI: neo4j://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: password123
+    depends_on:
+      neo4j:
+        condition: service_healthy
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
