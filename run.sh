@@ -35,37 +35,28 @@ EOF
     exit 1
 fi
 
-# 2. Check and start Neo4j Docker container if needed
-if command -v docker >/dev/null 2>&1; then
-    if docker info >/dev/null 2>&1; then
-        if ! docker ps | grep -q neo4j-graphrag; then
-            if docker ps -a | grep -q neo4j-graphrag; then
-                echo "[DOCKER] Starting existing neo4j-graphrag container..."
-                docker start neo4j-graphrag
-            else
-                echo "[DOCKER] Starting new Neo4j Docker container (neo4j-graphrag)..."
-                docker run -d --name neo4j-graphrag \
-                  -p 7474:7474 -p 7687:7687 \
-                  -e NEO4J_AUTH=neo4j/password123 \
-                  -e NEO4J_PLUGINS='["apoc"]' \
-                  -e NEO4J_apoc_export_file_enabled=true \
-                  -e NEO4J_apoc_import_file_enabled=true \
-                  -e NEO4J_dbms_security_procedures_unrestricted=apoc.* \
-                  -e NEO4J_dbms_memory_heap_initial__size=512m \
-                  -e NEO4J_dbms_memory_heap_max__size=1G \
-                  neo4j:5.20
-                echo "[DOCKER] Waiting 15 seconds for Neo4j to initialize..."
-                sleep 15
-            fi
+# 2. Start the local Neo4j graph via docker compose (skip if NEO4J_URI is remote,
+#    e.g. an AuraDB neo4j+s:// endpoint, or if Docker is unavailable).
+NEO4J_URI_VALUE="$(grep -E '^NEO4J_URI=' .env | head -1 | cut -d= -f2-)"
+case "$NEO4J_URI_VALUE" in
+    neo4j+s://*|neo4j+ssc://*|bolt+s://*)
+        echo "[DOCKER] NEO4J_URI points at a managed/remote graph — skipping local Neo4j."
+        ;;
+    *)
+        if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+            echo "[DOCKER] Ensuring local Neo4j is up (docker compose up -d neo4j)..."
+            docker compose up -d neo4j
+            echo "[DOCKER] Waiting for Neo4j to become healthy..."
+            for _ in $(seq 1 30); do
+                status="$(docker inspect -f '{{.State.Health.Status}}' graphrag-neo4j 2>/dev/null || echo starting)"
+                [ "$status" = "healthy" ] && { echo "[DOCKER] Neo4j is healthy ✓"; break; }
+                sleep 2
+            done
         else
-            echo "[DOCKER] Neo4j container is already running ✓"
+            echo "[WARN] Docker not available. Assuming Neo4j is running externally (check NEO4J_URI)."
         fi
-    else
-        echo "[WARN] Docker daemon is not running. Assuming Neo4j is running externally."
-    fi
-else
-    echo "[WARN] Docker is not installed. Assuming Neo4j is running externally."
-fi
+        ;;
+esac
 
 echo
 echo "[SETUP] Verifying Python requirements..."

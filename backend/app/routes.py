@@ -6,6 +6,7 @@ import os
 import traceback
 import time as _time
 import uuid
+from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -15,10 +16,12 @@ from .config import (
     ChatRequest,
     ConnectionRequest,
     get_neo4j_driver,
+    resolve_neo4j_creds,
     _check_neo4j,
     _query_graph_stats,
     _fetch_available_repos,
     get_google_api_key,
+    NEO4J_PRECONFIGURED,
 )
 from .llm_service import answer_question_hybrid
 
@@ -33,11 +36,17 @@ def health_check():
     return {"status": "ok"}
 
 
+@api_router.get("/api/config")
+def get_config():
+    """Non-sensitive server config so the UI can decide whether to show the connection form."""
+    return {"neo4j_preconfigured": NEO4J_PRECONFIGURED}
+
+
 @api_router.get("/api/stats")
 def get_stats(
-    x_neo4j_uri: str = Header(...),
-    x_neo4j_user: str = Header(...),
-    x_neo4j_password: str = Header(...)
+    x_neo4j_uri: Optional[str] = Header(default=None),
+    x_neo4j_user: Optional[str] = Header(default=None),
+    x_neo4j_password: Optional[str] = Header(default=None),
 ):
     try:
         drv = get_neo4j_driver(x_neo4j_uri, x_neo4j_user, x_neo4j_password)
@@ -48,9 +57,9 @@ def get_stats(
 
 @api_router.get("/api/repos")
 def get_repos(
-    x_neo4j_uri: str = Header(...),
-    x_neo4j_user: str = Header(...),
-    x_neo4j_password: str = Header(...)
+    x_neo4j_uri: Optional[str] = Header(default=None),
+    x_neo4j_user: Optional[str] = Header(default=None),
+    x_neo4j_password: Optional[str] = Header(default=None),
 ):
     try:
         drv = get_neo4j_driver(x_neo4j_uri, x_neo4j_user, x_neo4j_password)
@@ -61,7 +70,8 @@ def get_repos(
 
 @api_router.post("/api/check-connection")
 def check_connection(req: ConnectionRequest):
-    ok, msg = _check_neo4j(req.uri, req.user, req.password)
+    uri, user, password = resolve_neo4j_creds(req.uri, req.user, req.password)
+    ok, msg = _check_neo4j(uri, user, password)
     if not ok:
         raise HTTPException(status_code=400, detail=msg)
     return {"status": "ok", "message": msg}
@@ -70,9 +80,9 @@ def check_connection(req: ConnectionRequest):
 @api_router.post("/api/chat")
 def chat(
     req: ChatRequest,
-    x_neo4j_uri: str = Header(...),
-    x_neo4j_user: str = Header(...),
-    x_neo4j_password: str = Header(...),
+    x_neo4j_uri: Optional[str] = Header(default=None),
+    x_neo4j_user: Optional[str] = Header(default=None),
+    x_neo4j_password: Optional[str] = Header(default=None),
 ):
     google_api_key = get_google_api_key()
     if not google_api_key:

@@ -55,6 +55,14 @@ ALLOWED_ORIGINS = [
     if o.strip()
 ]
 
+# ── Neo4j Connection Defaults (server-side fallback) ─────────────────────────
+# When the frontend omits the X-Neo4j-* headers — e.g. the deployed site, where
+# credentials are injected from Key Vault — the API falls back to these env vars.
+NEO4J_URI = os.getenv("NEO4J_URI", "")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
+NEO4J_PRECONFIGURED = bool(NEO4J_URI and NEO4J_PASSWORD)
+
 # ── Pydantic Request Models ──────────────────────────────────────────────────
 class ChatMessage(BaseModel):
     role: str
@@ -69,9 +77,9 @@ class ChatRequest(BaseModel):
 
 
 class ConnectionRequest(BaseModel):
-    uri: str
-    user: str
-    password: str
+    uri: Optional[str] = None
+    user: Optional[str] = None
+    password: Optional[str] = None
 
 # ── Neo4j Database Helpers & Connection Pooling ──────────────────────────────
 @lru_cache(maxsize=16)
@@ -81,9 +89,27 @@ def _get_cached_driver(uri: str, user: str, password: str):
     return GraphDatabase.driver(uri, auth=(user, password))
 
 
+def resolve_neo4j_creds(uri: Optional[str], user: Optional[str], password: Optional[str]):
+    """Merge caller-supplied Neo4j credentials with the server-side env defaults.
+
+    Each field falls back to its ``NEO4J_*`` environment value when the caller
+    passes nothing (blank header or missing request-body field). This lets the
+    deployed site work with zero user input while local dev can still override
+    per request via the X-Neo4j-* headers.
+    """
+    resolved_uri = (uri or "").strip() or NEO4J_URI
+    resolved_user = (user or "").strip() or NEO4J_USER
+    resolved_password = (password or "") or NEO4J_PASSWORD
+    return resolved_uri, resolved_user, resolved_password
+
+
 def get_neo4j_driver(uri: str, user: str, password: str):
+    uri, user, password = resolve_neo4j_creds(uri, user, password)
     if not all([uri, user, password]):
-        raise HTTPException(status_code=400, detail="Neo4j credentials are required in headers")
+        raise HTTPException(
+            status_code=400,
+            detail="Neo4j credentials are required (via X-Neo4j-* headers or server configuration)",
+        )
     return _get_cached_driver(uri, user, password)
 
 
